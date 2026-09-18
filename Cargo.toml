@@ -1,0 +1,36 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/grove-domain",
+    "crates/grove-proto",
+    "crates/grove-lua",
+    "crates/grove-git",
+    "crates/grove-state",
+    "crates/grove-fakedaemon",
+    "crates/groved",
+    "crates/grove",
+]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/zo-ll/grove"
+
+[workspace.dependencies]
+grove-domain = { path = "crates/grove-domain" }
+grove-proto = { path = "crates/grove-proto" }
+grove-lua = { path = "crates/grove-lua" }
+grove-git = { path = "crates/grove-git" }
+grove-state = { path = "crates/grove-state" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+todo = "warn"
+dbg_macro = "warn"
