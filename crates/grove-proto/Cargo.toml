@@ -12,3 +12,4 @@ workspace = true
 [dependencies]
 grove-domain = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
