@@ -93,3 +93,7 @@ Each exclusion and its reasoning is recorded in [SPEC.md](SPEC.md#10-not-in-v1).
 |---|---|
 | [SPEC.md](SPEC.md) | the v1 specification — domain model, keymap, screens, git operations, architecture |
 | [docs/design-brief.md](docs/design-brief.md) | brief for realigning the UI mock to the spec |
+
+## License
+
+[MIT](LICENSE) © Andrea Zollini
