@@ -64,6 +64,18 @@ members() {
     jq -r '.packages[].name' <<<"$METADATA" 2>/dev/null | sort
 }
 
+# Every rule registers the crate it targets, so coverage can be checked in both
+# directions from one source of truth rather than a hand-maintained list.
+RULED=""
+target() {
+    local pkg="$1"
+    if ! grep -qxF -- "$pkg" <<<"$(members)"; then
+        die "a rule targets $pkg, which is not a workspace member (typo?)"
+        return 1
+    fi
+    RULED="$RULED$pkg"$'\n'
+}
+
 # name<TAB>kind for every declared dependency of a member, every section,
 # optional or not.
 declared_of() {
@@ -76,6 +88,7 @@ declared_of() {
 
 deny_declared() {
     local pkg="$1" why="$2"; shift 2
+    target "$pkg" || return
     local rows name kind f
     rows="$(declared_of "$pkg")" || { die "could not read declared deps of $pkg"; return; }
     while IFS=$'\t' read -r name kind; do
@@ -92,6 +105,7 @@ deny_declared() {
 # the runbook for a legitimate change.
 allow_declared() {
     local pkg="$1" why="$2"; shift 2
+    target "$pkg" || return
     local rows name kind f ok
     rows="$(declared_of "$pkg")" || { die "could not read declared deps of $pkg"; return; }
     while IFS=$'\t' read -r name kind; do
@@ -132,6 +146,7 @@ deps_of() {
 
 deny_reach() {
     local pkg="$1" why="$2"; shift 2
+    target "$pkg" || return
     local deps f
     if ! deps="$(deps_of "$pkg")"; then fail=1; return; fi
     for f in "$@"; do
@@ -152,6 +167,9 @@ load_metadata || exit 1
 # Note: this constrains crate choices only. Std-only I/O (std::fs, std::net,
 # std::process) is invisible to any dependency audit and must be caught in
 # review.
+# serde_json is permitted deliberately: it is in-memory value formatting with
+# no I/O of its own, and grove-domain uses it only in round-trip tests. An
+# earlier revision denied it by name; this is the considered position.
 allow_declared grove-domain "domain types must stay I/O-free" \
     serde serde_json
 
@@ -177,12 +195,13 @@ deny_declared grove-fakedaemon "UI-lane tooling must not reach backend concerns"
     $BACKEND_CRATES $GIT_CRATES $PTY_CRATES
 }
 
-# Every member must carry a declared rule. A new crate added without one would
-# otherwise be silently unchecked.
-COVERED=$'grove-domain\ngrove-proto\ngrove-lua\ngrove-git\ngrove-state\ngrove\ngrove-fakedaemon\ngroved'
+# Coverage, both directions. members -> rules catches a new crate arriving with
+# no rule; rules -> members is enforced by target() at each call site and catches
+# a typo'd rule target, which would otherwise no-op silently and drop that
+# crate's rule while the script still exited 0.
 while read -r m; do
     [ -n "$m" ] || continue
-    grep -qxF -- "$m" <<<"$COVERED" || die "$m has no declared boundary rule — add one"
+    grep -qxF -- "$m" <<<"$RULED" || die "$m has no declared boundary rule — add one"
 done < <(members)
 
 # --- transitive rules, for reach through allowed crates ---------------------
