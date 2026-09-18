@@ -168,8 +168,9 @@ load_metadata || exit 1
 # std::process) is invisible to any dependency audit and must be caught in
 # review.
 # serde_json is permitted deliberately: it is in-memory value formatting with
-# no I/O of its own, and grove-domain uses it only in round-trip tests. An
-# earlier revision denied it by name; this is the considered position.
+# no I/O of its own, intended for round-trip serialization tests. An earlier
+# revision denied it by name; this is the considered position. (grove-domain
+# does not declare it yet — the allowance is prospective.)
 allow_declared grove-domain "domain types must stay I/O-free" \
     serde serde_json
 
