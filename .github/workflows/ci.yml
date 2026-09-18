@@ -31,6 +31,9 @@ jobs:
       - name: crate boundaries
         run: ./scripts/check-boundaries.sh
 
+      - name: shellcheck the boundary script
+        run: shellcheck scripts/check-boundaries.sh
+
   msrv:
     runs-on: ubuntu-latest
     steps:
@@ -38,4 +41,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.85.0
       - uses: Swatinem/rust-cache@v2
       - name: build on the pinned MSRV
-        run: cargo build --workspace
+        # --all-features so feature-gated code is compile-checked against the
+        # MSRV too, --locked so the lockfile cannot drift silently in CI.
+        run: cargo build --workspace --all-features --locked
