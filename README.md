@@ -61,6 +61,25 @@ one terminal per worktree that survives you closing the app.
 - **Safe cleanup.** Prune pre-selects a worktree only when it is merged-or-gone, clean,
   fully pushed, and unowned. Everything else is listed with the reason it was skipped.
 
+## Extensible in Lua
+
+`~/.config/grove/config.lua` is both configuration and extension mechanism. The
+highest-value hook is worktree bootstrap — a fresh worktree is unusable until set up,
+and that setup is per-repo and per-person, so no template can express it:
+
+```lua
+grove.on("worktree_created", function(wt)
+  -- gitignored files don't exist in a fresh worktree
+  grove.copy(wt.clone .. "/.env.local", wt.path .. "/.env.local")
+  grove.run(wt.path, "pnpm install --prefer-offline")
+  grove.run(wt.path, "direnv allow")
+end)
+```
+
+Also: custom palette commands, extra worktree columns, keymaps, per-repo rules and
+computed paths. This is how forge data gets in without Grove knowing what a forge is —
+you register a `grove.column`, and it renders as yours.
+
 ## Design rules
 
 Two constraints do most of the work in the spec:

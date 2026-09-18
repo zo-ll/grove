@@ -18,7 +18,9 @@ resolve it with these.
 
 1. **Grove displays only what git — plus the filesystem, for sizes — can actually
    answer.** No inferred progress, no scraped output, no invented metadata. If git
-   cannot produce it, grove does not show it.
+   cannot produce it, grove does not show it. The one carve-out is a column the user
+   registers themselves in Lua (§10): grove still doesn't know what a PR is, the user
+   opted in, and the column is visibly theirs.
 2. **Git is authoritative and read live.** Worktree paths, branches, ahead/behind,
    dirty state and merge status are computed on demand, never cached to disk. Grove's
    own state file can never contradict git, because it does not store anything git
@@ -369,7 +371,7 @@ Prune fetches its candidate repos first, so "merged" reflects the remote.
 ## 6. Persistence
 
 ```
-~/.config/grove/config.toml                      user settings, hand-edited
+~/.config/grove/config.lua                       user settings + extensions
 ~/.local/state/grove/<workspace-hash>/
     sessions.json                                written automatically
     snapshots/<session>.json                     written only by ^g S
@@ -435,10 +437,17 @@ grove (TUI)  <──unix socket──>  groved (daemon)
   tui-term  ─ widget              ├─ pty  sdk-js @ feat/ABC-4471
   vt100     ─ screen + scrollback └─ pty  scratch
   portable-pty ─ spawn
+  mlua ─ UI-side VM               mlua ─ daemon-side VM
 ```
 
-Crates: `ratatui`, `crossterm`, `tui-term`, `vt100`, `portable-pty`, plus `gix` or
-shelling out to `git`.
+Crates: `ratatui`, `crossterm`, `tui-term`, `vt100`, `portable-pty`, `mlua`, plus `gix`
+or shelling out to `git`.
+
+**Two Lua VMs, one config file.** A Lua value cannot cross a process boundary, so each
+binary evaluates `config.lua` in its own VM and each exposes a *different* `grove`
+module — see §10.4. This is what makes the config split structural rather than a
+convention: the TUI's VM has no `grove.on("worktree_created")` to call, because the TUI
+does not create worktrees.
 
 `tui-term` abstracts the terminal backend behind traits, with `vt100` as the default
 implementation — so the backend can be swapped for `alacritty_terminal` or `avt` later
@@ -457,37 +466,146 @@ budget for it accordingly.
 
 ## 9. Configuration
 
-```toml
-# ~/.config/grove/config.toml
+One file, `~/.config/grove/config.lua`, evaluated by both binaries in separate VMs.
 
-shell           = "/usr/bin/fish"          # default: $SHELL
-editor          = "$EDITOR"                # or e.g. "cursor {path}"
-scratch_cwd     = "~"
-scrollback      = 10000                    # lines per pty
-worktree_path   = "~/grove/{repo}/{branch_slug}"
-branch_template = "{type}/{ticket}-{slug}" # prefills `new`, never enforced
-stale_after     = "4h"                     # when to mark refs stale
-ignore          = ["**/node_modules", "**/.cache"]
+```lua
+local grove = require("grove")
 
-[theme]
-accent  = "#fab387"
-clean   = "#a6e3a1"
-dirty   = "#f9e2af"
-error   = "#f38ba8"
-muted   = "#7f849c"
-corners = "rounded"   # rounded ╭ · square ┌
-density = "airy"      # airy · compact
+grove.setup({
+  shell           = "/usr/bin/fish",            -- default: $SHELL
+  editor          = os.getenv("EDITOR"),        -- or "cursor {path}"
+  scratch_cwd     = "~",
+  scrollback      = 10000,                      -- lines per pty
+  worktree_path   = "~/grove/{repo}/{branch_slug}",
+  branch_template = "{type}/{ticket}-{slug}",   -- prefills `new`, never enforced
+  stale_after     = "4h",                       -- when to mark refs stale
+  ignore          = { "**/node_modules", "**/.cache" },
+
+  theme = {
+    accent  = "#fab387",
+    clean   = "#a6e3a1",
+    dirty   = "#f9e2af",
+    error   = "#f38ba8",
+    muted   = "#7f849c",
+    corners = "rounded",   -- rounded ╭ · square ┌
+    density = "airy",      -- airy · compact
+  },
+})
 ```
 
 Truecolor when the terminal supports it, degrading to the nearest ANSI colour when it
 does not. Defaults are Catppuccin Mocha, matching the source design.
 
-`worktree_path` placeholders: `{repo}`, `{branch}`, `{branch_slug}`, `{session}`,
-`{clone_parent}`. Using `{session}` disables adopt and release — see §2.4.
+`worktree_path` accepts a template string with `{repo}`, `{branch}`, `{branch_slug}`,
+`{session}`, `{clone_parent}` — or a function, see §10.2. Using `{session}` disables
+adopt and release; see §2.4.
+
+**A broken config must never brick grove.** If `config.lua` throws, grove falls back to
+defaults entirely, reports the error on the status bar, and keeps running. It does not
+exit and it does not half-apply.
 
 ---
 
-## 10. Not in v1
+## 10. Extension API
+
+Lua is Grove's extension mechanism, not merely its config format. The API is public
+from v1, which means renaming a domain field is a breaking change — budget for that.
+
+### 10.1 Events
+
+```lua
+grove.on("worktree_created", function(wt)
+  -- gitignored files do not exist in a fresh worktree
+  grove.copy(wt.clone .. "/.env.local", wt.path .. "/.env.local")
+  if grove.exists(wt.path .. "/pnpm-lock.yaml") then
+    grove.run(wt.path, "pnpm install --prefer-offline")
+  end
+  grove.run(wt.path, "direnv allow")
+end)
+```
+
+This is the highest-value hook in the API. A fresh worktree is unusable until
+bootstrapped, and bootstrapping is per-repo and per-person — a template cannot express
+it. Without this, every `new` is followed by the same handful of commands typed by hand.
+
+Events: `worktree_created`, `worktree_removed`, `worktree_adopted`, `terminal_spawned`,
+`terminal_exited`, `session_opened`, `session_closed`, `session_ended`.
+
+### 10.2 Computed values
+
+Any setting that takes a string may instead take a function.
+
+```lua
+grove.setup({
+  worktree_path = function(repo, branch)
+    if repo == "monorepo" then
+      return "/mnt/nvme/" .. repo .. "/" .. branch   -- 8 GB checkouts
+    end
+    return "~/grove/" .. repo .. "/" .. branch
+  end,
+})
+```
+
+### 10.3 Registration
+
+```lua
+grove.keymap("^g w", function() grove.palette("new ") end)
+
+grove.command("review", function(pr)
+  local branch = grove.sh("gh pr view "..pr.." --json headRefName -q .headRefName")
+  grove.new_worktree({ repo = grove.current_repo(), branch = branch })
+end)
+
+grove.column("pr", function(wt)
+  return grove.sh("gh pr view " .. wt.branch .. " --json state -q .state")
+end)
+
+grove.repo("monorepo", {
+  base  = "origin/develop",
+  setup = function(wt) grove.run(wt.path, "make bootstrap") end,
+})
+
+grove.session_template("frontend", { repos = { "web-app", "design-system" } })
+```
+
+`grove.column` is how forge data gets into Grove without Grove knowing what a forge is
+(§11). The column is the user's, and renders as theirs.
+
+### 10.4 Which VM owns what
+
+Both binaries evaluate the same file. Each exposes only the API it can honour, and
+silently accepts registrations belonging to the other — so one file works for both
+without guards.
+
+| Surface | TUI VM | Daemon VM |
+|---|---|---|
+| `theme`, `corners`, `density` | ✓ | — |
+| `keymap`, `command`, `column`, `session_template` | ✓ | — |
+| `shell`, `scrollback`, `scratch_cwd` | — | ✓ |
+| `worktree_path`, `branch_template`, `ignore`, `stale_after` | — | ✓ |
+| `on(...)` lifecycle events | — | ✓ |
+| `repo(...)` overrides | theme parts | the rest |
+
+Helpers: `grove.run`, `grove.sh`, `grove.copy`, `grove.exists`, `grove.send`,
+`grove.palette`, `grove.new_worktree`, `grove.open_session`, `grove.current_repo`.
+Stateful helpers called from the TUI VM proxy to the daemon over the protocol.
+
+### 10.5 Safety
+
+- **User code must not hang the UI.** `grove.column` and `grove.keymap` callbacks run
+  under a timeout; on expiry the column renders empty and the error surfaces once.
+- **Errors are contained.** A throwing callback disables that one registration and
+  reports it. It never unwinds into a render.
+- **Long work belongs to the daemon.** `grove.run` in a lifecycle hook is async and
+  reports completion; it does not block worktree creation.
+- **No repo-local config in v1.** A `.grove.lua` committed to a repository would mean
+  cloning and opening a repo executes its code. Neovim hit exactly this with `exrc` and
+  now demands explicit per-file trust. If repo-local config is ever added, the trust
+  prompt ships with it, not after.
+
+---
+
+## 11. Not in v1
 
 Deliberately excluded, with the reasoning, so these don't get relitigated by accident.
 
@@ -495,15 +613,16 @@ Deliberately excluded, with the reasoning, so these don't get relitigated by acc
 |---|---|
 | Bulk git (push / rebase / stage across repos) | every worktree already has a shell; partial-failure UI is large |
 | Progress percentages per worktree | git cannot answer it; the source mock faked it |
-| Any GitHub or forge integration | needs auth, rate limits, offline states; prune's safety rule does not require it |
+| Any GitHub or forge integration **built in** | needs auth, rate limits, offline states. Available as a user `grove.column` instead — see §10.3 |
 | Multiple terminals per worktree, splits, zoom | a full multiplexer; one pty per worktree covers the use case |
 | Two sessions open simultaneously | one open, many stored |
 | Kanban board, outline tree, tiled-terminal, worktree-detail screens | already cut between mock v5 and v6; redundant with the dash |
 | Automatic snapshots or timed writes | snapshots are manual, as in tmux-resurrect |
+| Repo-local `.grove.lua` | executing code from a cloned repo needs a trust model; see §10.5 |
 
 ---
 
-## 11. Risks
+## 12. Risks
 
 **The daemon is the bulk of v1.** Declining tmux means pty multiplexing, resize,
 reflow, detach/reattach and scrollback are grove's own. `tui-term` and `vt100` cover
