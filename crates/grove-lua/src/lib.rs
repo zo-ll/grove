@@ -929,17 +929,25 @@ fn install_daemon_module(
                 }
             };
 
-            // One last window each, so output written just before the signal
-            // still counts. Past it the read is abandoned rather than waited
-            // on: the whole point of the group signal is that the caller is
-            // already free, and a pipe-holder that ignored the signal — or a
-            // signal that never landed — must not be able to take that back.
-            let out = out_buf
-                .or_else(|| out_rx.recv_timeout(SH_DRAIN).ok())
-                .unwrap_or_default();
-            let err = err_buf
-                .or_else(|| err_rx.recv_timeout(SH_DRAIN).ok())
-                .unwrap_or_default();
+            // One last window — shared, not one each, so the two waits cannot
+            // add up. Output written just before the signal still counts; past
+            // the window the read is abandoned rather than waited on, because
+            // the whole point of the group signal is that the caller is already
+            // free, and a pipe-holder that ignored the signal — or a signal that
+            // never landed — must not be able to take that back.
+            //
+            // So the bound on grove.sh is SH_TIMEOUT plus two drain windows:
+            // the in-loop one that decides the shell's children are outliving
+            // it, and this one.
+            let drain_until = Instant::now() + SH_DRAIN;
+            let take = |buf: Option<Vec<u8>>, rx: &mpsc::Receiver<Vec<u8>>| match buf {
+                Some(buf) => buf,
+                None => rx
+                    .recv_timeout(drain_until.saturating_duration_since(Instant::now()))
+                    .unwrap_or_default(),
+            };
+            let out = take(out_buf, &out_rx);
+            let err = take(err_buf, &err_rx);
             if !status.success() {
                 return Err(mlua::Error::runtime(
                     String::from_utf8_lossy(&err).trim().to_owned(),
