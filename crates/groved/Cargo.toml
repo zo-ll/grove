@@ -10,8 +10,10 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+fs2 = "0.4"
 grove-domain = { workspace = true }
 grove-proto = { workspace = true }
 grove-lua = { workspace = true }
 grove-git = { workspace = true }
 grove-state = { workspace = true }
+thiserror = { workspace = true }
