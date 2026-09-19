@@ -68,10 +68,10 @@ impl DaemonSocket {
         fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
             .map_err(|source| socket_error(parent, source))?;
 
-        if socket_path.exists() {
-            if let Ok(stream) = configured_stream(&socket_path) {
-                return Ok(BindOutcome::Existing(stream));
-            }
+        if socket_path.exists()
+            && let Ok(stream) = configured_stream(&socket_path)
+        {
+            return Ok(BindOutcome::Existing(stream));
         }
 
         let lock_path = socket_path.with_extension("lock");

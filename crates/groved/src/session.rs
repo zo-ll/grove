@@ -492,15 +492,14 @@ impl SessionOrchestrator {
         if !self.store.ownership_movable() {
             return Err(grove_state::Error::SessionPathTemplate.into());
         }
-        if let Some(terminals) = self.live.get_mut(session) {
-            if let Some(index) = terminals
+        if let Some(terminals) = self.live.get_mut(session)
+            && let Some(index) = terminals
                 .iter()
                 .position(|entry| &entry.worktree == worktree)
-            {
-                let terminal = terminals[index].clone();
-                self.terminals.kill(terminal.id)?;
-                terminals.remove(index);
-            }
+        {
+            let terminal = terminals[index].clone();
+            self.terminals.kill(terminal.id)?;
+            terminals.remove(index);
         }
         self.store.release(session, worktree)?;
         Ok(())
