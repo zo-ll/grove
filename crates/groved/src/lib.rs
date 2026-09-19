@@ -10,6 +10,7 @@ use std::fs::{self, OpenOptions};
 use std::io;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -110,13 +111,17 @@ impl DaemonSocket {
     }
 
     pub fn run(self) -> Result<(), LifecycleError> {
-        for connection in self.listener.incoming() {
-            let stream = connection.map_err(|source| socket_error(&self.socket_path, source))?;
-            thread::spawn(move || {
-                let _ = serve_client(stream);
-            });
+        loop {
+            match self.listener.accept() {
+                Ok((stream, _)) => {
+                    thread::spawn(move || {
+                        let _ = serve_client(stream);
+                    });
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => thread::sleep(Duration::from_millis(50)),
+            }
         }
-        Ok(())
     }
 }
 
@@ -175,12 +180,14 @@ pub fn connect_or_spawn(
             ) => {}
         Err(error) => return Err(error),
     }
-    Command::new(daemon_executable)
+    let mut command = Command::new(daemon_executable);
+    command
         .arg("--workspace")
         .arg(workspace)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
+        .process_group(0)
         .spawn()
         .map_err(|source| LifecycleError::Spawn {
             path: daemon_executable.to_owned(),
@@ -191,8 +198,18 @@ pub fn connect_or_spawn(
     loop {
         match connect(workspace) {
             Ok(stream) => return Ok(stream),
-            Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
-            Err(_) => return Err(LifecycleError::StartupTimeout(timeout)),
+            Err(LifecycleError::Socket { source, .. })
+                if matches!(
+                    source.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                ) && Instant::now() < deadline =>
+            {
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(LifecycleError::Socket { .. }) => {
+                return Err(LifecycleError::StartupTimeout(timeout));
+            }
+            Err(error) => return Err(error),
         }
     }
 }
