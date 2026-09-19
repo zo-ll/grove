@@ -122,7 +122,7 @@ impl Workspace {
         let matcher = ignore_matcher(&self.root, &self.ignores)?;
         let mut paths = Vec::new();
         let mut seen = HashSet::new();
-        walk_for_repos(&self.root, &matcher, &mut seen, &mut paths)?;
+        walk_for_repos(&self.root, &matcher, &mut seen, &mut paths, true)?;
         paths.sort();
         self.repos = paths
             .into_iter()
@@ -153,16 +153,22 @@ fn walk_for_repos(
     matcher: &Gitignore,
     seen: &mut HashSet<PathBuf>,
     repos: &mut Vec<PathBuf>,
+    fail_if_unreadable: bool,
 ) -> Result<(), Error> {
-    let entries = fs::read_dir(dir).map_err(|source| Error::Walk {
-        path: dir.to_owned(),
-        source,
-    })?;
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(source) if fail_if_unreadable => {
+            return Err(Error::Walk {
+                path: dir.to_owned(),
+                source,
+            });
+        }
+        Err(_) => return Ok(()),
+    };
     for entry in entries {
-        let entry = entry.map_err(|source| Error::Walk {
-            path: dir.to_owned(),
-            source,
-        })?;
+        let Ok(entry) = entry else {
+            continue;
+        };
         let path = entry.path();
         let file_type = entry.file_type().map_err(|source| Error::Walk {
             path: path.clone(),
@@ -183,7 +189,7 @@ fn walk_for_repos(
         }
         // Do not follow symlinks: a workspace walk must remain beneath its root.
         if is_dir {
-            walk_for_repos(&path, matcher, seen, repos)?;
+            walk_for_repos(&path, matcher, seen, repos, false)?;
         }
     }
     Ok(())
@@ -656,6 +662,58 @@ mod tests {
         assert!(!is_dirty(&temp.0).unwrap());
         fs::write(temp.0.join("untracked"), "work").unwrap();
         assert!(is_dirty(&temp.0).unwrap());
+    }
+
+    #[test]
+    fn missing_origin_and_configured_origin_head_are_both_data() {
+        let temp = TempDir::new("base-branch");
+        repo(&temp.0);
+        assert_eq!(base_branch(&temp.0).unwrap(), None);
+        git(
+            &temp.0,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+        assert_eq!(
+            base_branch(&temp.0).unwrap().as_deref(),
+            Some("origin/main")
+        );
+    }
+
+    #[test]
+    fn deleted_remote_tracking_ref_reports_upstream_gone() {
+        let temp = TempDir::new("gone-upstream");
+        let remote = temp.0.join("remote.git");
+        fs::create_dir_all(&remote).unwrap();
+        git(&remote, &["init", "--bare", "-q"]);
+        let clone = temp.0.join("clone");
+        repo(&clone);
+        git(
+            &clone,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&clone, &["push", "-qu", "origin", "main"]);
+        git(&clone, &["update-ref", "-d", "refs/remotes/origin/main"]);
+        assert_eq!(ahead_behind(&clone).unwrap(), Tracking::UpstreamGone);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_nested_directory_does_not_hide_other_repositories() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new("unreadable");
+        let blocked = temp.0.join("blocked");
+        fs::create_dir_all(&blocked).unwrap();
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o000)).unwrap();
+        repo(&temp.0.join("visible"));
+        let workspace = Workspace::discover(&temp.0, Vec::new()).unwrap();
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(workspace.repositories().len(), 1);
+        assert_eq!(workspace.repositories()[0].id.0, "visible");
     }
 
     #[test]
