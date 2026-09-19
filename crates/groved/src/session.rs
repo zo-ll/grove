@@ -782,9 +782,9 @@ impl SessionOrchestrator {
         let mut rows = Vec::new();
         for repository in &repositories {
             // A repo whose inspection fails contributes no rows rather than
-            // blanking the whole picker: its rows would be all-FetchFailed
-            // anyway, and the pane rows omit an unreadable repo for the same
-            // reason.
+            // blanking the whole picker: there is nothing honest to say
+            // about its rows, and the pane rows omit an unreadable repo for
+            // the same reason.
             let Ok(batch) = crate::prune::prune_candidates_against(
                 repository,
                 &sessions,
