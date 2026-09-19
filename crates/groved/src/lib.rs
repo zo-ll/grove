@@ -17,6 +17,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
+pub mod prune;
 pub mod terminal;
 
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
