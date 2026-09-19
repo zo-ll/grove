@@ -35,8 +35,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("groved: {error}; using defaults");
             }
             let runtime = loaded.runtime;
+            let session_paths = runtime.contains_session_path_placeholder();
             let config = runtime.config();
-            let session_paths = config.worktree_path.contains_session_placeholder();
             let shell = PathBuf::from(&config.shell);
             let scratch_cwd = expand_home(&config.scratch_cwd);
             let scrollback = config.scrollback;

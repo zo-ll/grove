@@ -139,6 +139,41 @@ pub struct ColumnRegistration {
     callback: RegistryKey,
 }
 
+/// Theme keys a repo override may set, layered over the global theme.
+///
+/// A key left unset keeps the global value at use time, so a repo may
+/// override a single color without restating the rest.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RepoTheme {
+    /// Accent color replacing the global one for this repo.
+    pub accent: Option<String>,
+    /// Clean color replacing the global one for this repo.
+    pub clean: Option<String>,
+    /// Dirty color replacing the global one for this repo.
+    pub dirty: Option<String>,
+    /// Error color replacing the global one for this repo.
+    pub error: Option<String>,
+    /// Muted color replacing the global one for this repo.
+    pub muted: Option<String>,
+    /// Border style replacing the global one for this repo.
+    pub corners: Option<Corners>,
+    /// Row spacing replacing the global one for this repo.
+    pub density: Option<Density>,
+}
+
+/// A per-repo theme override owned and applied by the TUI VM.
+///
+/// Registered with `grove.repo(name, { theme = ... })`, where `theme` takes
+/// the same keys as `grove.setup`'s `theme` table. Non-theme keys (`base`,
+/// `setup`, `worktree_path`) belong to the daemon VM and are silently ignored
+/// here, so one config file works for both processes without guards.
+pub struct TuiRepoOverride {
+    /// Repository display name the override applies to.
+    pub name: String,
+    /// Theme keys layered over the global theme for this repo.
+    pub theme: RepoTheme,
+}
+
 /// A reusable set of repositories offered when creating a session.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionTemplate {
@@ -159,6 +194,8 @@ pub struct TuiRegistrations {
     pub columns: Vec<ColumnRegistration>,
     /// User-defined starting repository sets.
     pub session_templates: Vec<SessionTemplate>,
+    /// User-defined per-repo theme overrides.
+    pub repo_overrides: Vec<TuiRepoOverride>,
 }
 
 /// A TUI-owned Lua VM with only TUI settings and registrations exposed in Rust.
@@ -317,6 +354,38 @@ pub struct WorktreePathContext<'a> {
     pub clone_parent: &'a str,
 }
 
+/// A per-repo rule owned and applied by the daemon VM.
+///
+/// Registered with `grove.repo(name, opts)`; see SPEC.md §10.3. For the repo
+/// named by the override:
+///
+/// - `worktree_path` (string template or `function(repo, branch)`) replaces
+///   the global `worktree_path` for that repo only; other repos keep the
+///   global rule.
+/// - `base` is the branch new worktrees start from, replacing the default
+///   branch git advertises (`origin/HEAD`) for that repo only.
+/// - `setup(wt)` runs when a worktree of that repo is created, after every
+///   global `worktree_created` hook. Global hooks run first in registration
+///   order, then the repo's setup; a throwing setup disables itself without
+///   touching any other registration.
+///
+/// Registering the same name again layers the new keys over the previous
+/// override, and keys left unspecified keep falling back to the global
+/// setting — the same precedence as the override itself has over globals.
+/// Theme keys (`theme`, `corners`, `density`) belong to the TUI VM and are
+/// silently ignored here.
+pub struct RepoOverride {
+    /// Repository display name the override applies to.
+    pub name: String,
+    /// Path rule replacing the global one for this repo, when set.
+    pub worktree_path: Option<WorktreePath>,
+    /// Base branch replacing the discovered default for this repo, when set.
+    pub base: Option<String>,
+    /// Worktree bootstrap hook for this repo, when set.
+    pub setup: Option<RegistryKey>,
+    setup_disabled: bool,
+}
+
 /// A daemon lifecycle notification accepted by `grove.on`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LifecycleEvent {
@@ -410,6 +479,10 @@ pub enum HookReport {
         registration: usize,
         message: String,
     },
+    RepoSetupDisabled {
+        repo: String,
+        message: String,
+    },
     CommandFinished {
         job: u64,
         command: String,
@@ -424,6 +497,7 @@ type TerminalSender = Arc<dyn Fn(u64, &[u8]) -> Result<(), String> + Send + Sync
 pub struct DaemonRuntime {
     config: DaemonConfig,
     lifecycle: Vec<LifecycleRegistration>,
+    repo_overrides: Vec<RepoOverride>,
     lua: Lua,
     reports: mpsc::Receiver<HookReport>,
     terminal_sender: Arc<Mutex<Option<TerminalSender>>>,
@@ -469,6 +543,30 @@ impl DaemonRuntime {
         &self.lifecycle
     }
 
+    /// Returns the per-repo rules owned by the daemon.
+    pub fn repo_overrides(&self) -> &[RepoOverride] {
+        &self.repo_overrides
+    }
+
+    /// Returns the rule registered for a repo by name, if any.
+    pub fn repo_override(&self, repo: &str) -> Option<&RepoOverride> {
+        self.repo_overrides.iter().find(|rule| rule.name == repo)
+    }
+
+    /// Reports whether any configured path rule — the global one or a repo
+    /// override — names a session placeholder.
+    ///
+    /// A session-scoped path makes worktree location depend on the owning
+    /// session, which is what the store needs to know to forbid adopt/release.
+    pub fn contains_session_path_placeholder(&self) -> bool {
+        self.config.worktree_path.contains_session_placeholder()
+            || self.repo_overrides.iter().any(|rule| {
+                rule.worktree_path
+                    .as_ref()
+                    .is_some_and(WorktreePath::contains_session_placeholder)
+            })
+    }
+
     /// Retrieves a lifecycle callback from this runtime's VM.
     pub fn lifecycle_callback(&self, index: usize) -> mlua::Result<Function> {
         self.lua.registry_value(&self.lifecycle[index].callback)
@@ -485,7 +583,8 @@ impl DaemonRuntime {
             .expect("terminal sender lock poisoned") = Some(Arc::new(sender));
     }
 
-    /// Runs matching hooks in registration order. A failing hook is disabled
+    /// Runs matching hooks in registration order, then the repo's `setup`
+    /// hook when the event is `worktree_created`. A failing hook is disabled
     /// before the next event, while later registrations still run.
     pub fn fire(&mut self, event: LifecycleEvent, payload: &LifecyclePayload) -> Vec<HookReport> {
         let mut reports = Vec::new();
@@ -506,7 +605,39 @@ impl DaemonRuntime {
                 });
             }
         }
+        if event == LifecycleEvent::WorktreeCreated
+            && let Some(repo) = payload_repo(payload)
+        {
+            reports.extend(self.fire_repo_setup(repo, payload));
+        }
         reports
+    }
+
+    /// Runs one repo's bootstrap hook, disabling it on its first throw.
+    fn fire_repo_setup(&mut self, repo: &str, payload: &LifecyclePayload) -> Vec<HookReport> {
+        let Some(index) = self
+            .repo_overrides
+            .iter()
+            .position(|rule| rule.name == repo && rule.setup.is_some() && !rule.setup_disabled)
+        else {
+            return Vec::new();
+        };
+        let key = self.repo_overrides[index]
+            .setup
+            .as_ref()
+            .expect("setup key exists on the selected override");
+        let result = self
+            .lua
+            .registry_value::<Function>(key)
+            .and_then(|callback| callback.call::<()>(payload_table(&self.lua, payload)?));
+        if let Err(error) = result {
+            self.repo_overrides[index].setup_disabled = true;
+            return vec![HookReport::RepoSetupDisabled {
+                repo: repo.to_owned(),
+                message: error.to_string(),
+            }];
+        }
+        Vec::new()
     }
 
     /// Returns completed asynchronous command reports without waiting.
@@ -514,9 +645,14 @@ impl DaemonRuntime {
         self.reports.try_iter().collect()
     }
 
-    /// Expands the configured template or invokes its Lua function.
+    /// Expands the configured template or invokes its Lua function, using the
+    /// repo's own override when one is registered for it.
     pub fn worktree_path(&self, context: WorktreePathContext<'_>) -> mlua::Result<String> {
-        match &self.config.worktree_path {
+        let rule = self
+            .repo_override(context.repo)
+            .and_then(|rule| rule.worktree_path.as_ref())
+            .unwrap_or(&self.config.worktree_path);
+        match rule {
             WorktreePath::Template(template) => Ok(expand_worktree_template(template, &context)),
             WorktreePath::Function(key) => self
                 .lua
@@ -530,6 +666,7 @@ impl DaemonRuntime {
         Self {
             config: DaemonConfig::default(),
             lifecycle: Vec::new(),
+            repo_overrides: Vec::new(),
             lua: Lua::new(),
             reports,
             terminal_sender: Arc::new(Mutex::new(None)),
@@ -540,12 +677,14 @@ impl DaemonRuntime {
         let lua = Lua::new();
         let config = Arc::new(Mutex::new(Some(DaemonConfig::default())));
         let lifecycle = Arc::new(Mutex::new(Some(Vec::new())));
+        let repo_overrides = Arc::new(Mutex::new(Some(Vec::new())));
         let (report_sender, reports) = mpsc::channel();
         let terminal_sender = Arc::new(Mutex::new(None));
         install_daemon_module(
             &lua,
             Arc::clone(&config),
             Arc::clone(&lifecycle),
+            Arc::clone(&repo_overrides),
             report_sender,
             Arc::clone(&terminal_sender),
         )?;
@@ -560,13 +699,29 @@ impl DaemonRuntime {
             .expect("daemon lifecycle lock poisoned")
             .take()
             .ok_or_else(|| mlua::Error::runtime("lifecycle hooks were already consumed"))?;
+        let repo_overrides = repo_overrides
+            .lock()
+            .expect("daemon repo overrides lock poisoned")
+            .take()
+            .ok_or_else(|| mlua::Error::runtime("repo overrides were already consumed"))?;
         Ok(Self {
             config,
             lifecycle,
+            repo_overrides,
             lua,
             reports,
             terminal_sender,
         })
+    }
+}
+
+/// The repo name a lifecycle payload carries, when it has one.
+fn payload_repo(payload: &LifecyclePayload) -> Option<&str> {
+    match payload {
+        LifecyclePayload::Worktree { repo, .. } | LifecyclePayload::Terminal { repo, .. } => {
+            Some(repo)
+        }
+        LifecyclePayload::Session { .. } => None,
     }
 }
 
@@ -740,8 +895,40 @@ fn install_tui_module(
         })?,
     )?;
 
+    let repo_overrides = Arc::clone(&registrations);
+    module.set(
+        "repo",
+        lua.create_function(move |_, (name, opts): (String, Table)| {
+            let theme = match opts.get::<Value>("theme")? {
+                Value::Nil => RepoTheme::default(),
+                Value::Table(theme) => RepoTheme {
+                    accent: optional_string(&theme, "accent")?,
+                    clean: optional_string(&theme, "clean")?,
+                    dirty: optional_string(&theme, "dirty")?,
+                    error: optional_string(&theme, "error")?,
+                    muted: optional_string(&theme, "muted")?,
+                    corners: optional_enum(&theme, "corners", parse_corners)?,
+                    density: optional_enum(&theme, "density", parse_density)?,
+                },
+                value => {
+                    return Err(mlua::Error::runtime(format!(
+                        "theme must be a table, got {}",
+                        value.type_name()
+                    )));
+                }
+            };
+            repo_overrides
+                .lock()
+                .expect("TUI registrations lock poisoned")
+                .as_mut()
+                .ok_or_else(|| mlua::Error::runtime("registrations are unavailable"))?
+                .repo_overrides
+                .push(TuiRepoOverride { name, theme });
+            Ok(())
+        })?,
+    )?;
+
     module.set("on", lua.create_function(noop)?)?;
-    module.set("repo", lua.create_function(noop)?)?;
     install_loaded_module(lua, module)
 }
 
@@ -749,6 +936,7 @@ fn install_daemon_module(
     lua: &Lua,
     config: Arc<Mutex<Option<DaemonConfig>>>,
     lifecycle: Arc<Mutex<Option<Vec<LifecycleRegistration>>>>,
+    repo_overrides: Arc<Mutex<Option<Vec<RepoOverride>>>>,
     reports: mpsc::Sender<HookReport>,
     terminal_sender: Arc<Mutex<Option<TerminalSender>>>,
 ) -> mlua::Result<()> {
@@ -980,7 +1168,79 @@ fn install_daemon_module(
         })?,
     )?;
 
-    for name in ["keymap", "command", "column", "session_template", "repo"] {
+    let repo_rules = Arc::clone(&repo_overrides);
+    module.set(
+        "repo",
+        lua.create_function(move |lua, (name, opts): (String, Table)| {
+            let mut worktree_path = None;
+            match opts.get::<Value>("worktree_path")? {
+                Value::Nil => {}
+                Value::String(value) => {
+                    worktree_path = Some(WorktreePath::Template(value.to_str()?.to_string()))
+                }
+                Value::Function(function) => {
+                    worktree_path =
+                        Some(WorktreePath::Function(lua.create_registry_value(function)?))
+                }
+                value => {
+                    return Err(mlua::Error::runtime(format!(
+                        "worktree_path must be a string or function, got {}",
+                        value.type_name()
+                    )));
+                }
+            }
+            let base = match opts.get::<Value>("base")? {
+                Value::Nil => None,
+                Value::String(value) => Some(value.to_str()?.to_string()),
+                value => {
+                    return Err(mlua::Error::runtime(format!(
+                        "base must be a string, got {}",
+                        value.type_name()
+                    )));
+                }
+            };
+            let setup = match opts.get::<Value>("setup")? {
+                Value::Nil => None,
+                Value::Function(function) => Some(lua.create_registry_value(function)?),
+                value => {
+                    return Err(mlua::Error::runtime(format!(
+                        "setup must be a function, got {}",
+                        value.type_name()
+                    )));
+                }
+            };
+            let mut rules_guard = repo_rules
+                .lock()
+                .expect("daemon repo overrides lock poisoned");
+            let rules = rules_guard
+                .as_mut()
+                .ok_or_else(|| mlua::Error::runtime("repo overrides are unavailable"))?;
+            if let Some(existing) = rules.iter_mut().find(|rule| rule.name == name) {
+                // Re-registering layers the new keys over the previous
+                // override; keys left unset keep falling back to globals.
+                if worktree_path.is_some() {
+                    existing.worktree_path = worktree_path;
+                }
+                if base.is_some() {
+                    existing.base = base;
+                }
+                if setup.is_some() {
+                    existing.setup = setup;
+                }
+            } else {
+                rules.push(RepoOverride {
+                    name,
+                    worktree_path,
+                    base,
+                    setup,
+                    setup_disabled: false,
+                });
+            }
+            Ok(())
+        })?,
+    )?;
+
+    for name in ["keymap", "command", "column", "session_template"] {
         module.set(name, lua.create_function(noop)?)?;
     }
     install_loaded_module(lua, module)
@@ -1003,18 +1263,18 @@ fn apply_tui_setup(config: &mut TuiConfig, table: Table) -> mlua::Result<()> {
         set_optional(&theme, "dirty", &mut config.theme.dirty)?;
         set_optional(&theme, "error", &mut config.theme.error)?;
         set_optional(&theme, "muted", &mut config.theme.muted)?;
-        if let Some(corners) = optional_string(&theme, "corners")? {
-            config.corners = parse_corners(&corners)?;
+        if let Some(corners) = optional_enum(&theme, "corners", parse_corners)? {
+            config.corners = corners;
         }
-        if let Some(density) = optional_string(&theme, "density")? {
-            config.density = parse_density(&density)?;
+        if let Some(density) = optional_enum(&theme, "density", parse_density)? {
+            config.density = density;
         }
     }
-    if let Some(corners) = optional_string(&table, "corners")? {
-        config.corners = parse_corners(&corners)?;
+    if let Some(corners) = optional_enum(&table, "corners", parse_corners)? {
+        config.corners = corners;
     }
-    if let Some(density) = optional_string(&table, "density")? {
-        config.density = parse_density(&density)?;
+    if let Some(density) = optional_enum(&table, "density", parse_density)? {
+        config.density = density;
     }
     Ok(())
 }
@@ -1060,6 +1320,22 @@ fn optional_string(table: &Table, key: &str) -> mlua::Result<Option<String>> {
     match table.get::<Value>(key)? {
         Value::Nil => Ok(None),
         Value::String(value) => Ok(Some(value.to_str()?.to_string())),
+        value => Err(mlua::Error::runtime(format!(
+            "{key} must be a string, got {}",
+            value.type_name()
+        ))),
+    }
+}
+
+/// Reads an optional string key and parses it into a setting value.
+fn optional_enum<T>(
+    table: &Table,
+    key: &str,
+    parse: fn(&str) -> mlua::Result<T>,
+) -> mlua::Result<Option<T>> {
+    match table.get::<Value>(key)? {
+        Value::Nil => Ok(None),
+        Value::String(value) => Ok(Some(parse(value.to_str()?.as_ref())?)),
         value => Err(mlua::Error::runtime(format!(
             "{key} must be a string, got {}",
             value.type_name()
@@ -1402,6 +1678,226 @@ mod tests {
         );
         assert_eq!(fs::read_to_string(&output).unwrap(), "ok\nok\n");
         let _ = fs::remove_file(output);
+    }
+
+    #[test]
+    fn repo_override_replaces_the_global_worktree_path_for_that_repo_only() {
+        let loaded = DaemonRuntime::load_source(
+            r#"
+                local grove = require("grove")
+                grove.setup({ worktree_path = "~/grove/{repo}/{branch_slug}" })
+                grove.repo("monorepo", {
+                  worktree_path = "/mnt/nvme/{repo}/{branch_slug}",
+                })
+            "#,
+            "repo-path",
+        );
+        assert!(loaded.error.is_none());
+        let runtime = loaded.runtime;
+        assert_eq!(
+            runtime
+                .worktree_path(WorktreePathContext {
+                    repo: "monorepo",
+                    branch: "feat/ABC-4471-invoice-split",
+                    session: "s",
+                    clone_parent: "/code",
+                })
+                .unwrap(),
+            "/mnt/nvme/monorepo/feat-ABC-4471-invoice-split"
+        );
+        // A repo without an override keeps the global rule.
+        assert_eq!(
+            runtime
+                .worktree_path(WorktreePathContext {
+                    repo: "other",
+                    branch: "main",
+                    session: "s",
+                    clone_parent: "/code",
+                })
+                .unwrap(),
+            "~/grove/other/main"
+        );
+    }
+
+    #[test]
+    fn repo_override_function_receives_repo_and_branch_like_the_global_one() {
+        let loaded = DaemonRuntime::load_source(
+            r#"
+                local grove = require("grove")
+                grove.repo("monorepo", { worktree_path = function(repo, branch)
+                    return "/mnt/" .. repo .. "/" .. branch
+                end })
+            "#,
+            "repo-function",
+        );
+        assert!(loaded.error.is_none());
+        assert_eq!(
+            loaded
+                .runtime
+                .worktree_path(WorktreePathContext {
+                    repo: "monorepo",
+                    branch: "main",
+                    session: "s",
+                    clone_parent: "/code",
+                })
+                .unwrap(),
+            "/mnt/monorepo/main"
+        );
+    }
+
+    #[test]
+    fn reregistering_a_repo_layers_new_keys_over_the_previous_override() {
+        let loaded = DaemonRuntime::load_source(
+            r#"
+                local grove = require("grove")
+                grove.repo("monorepo", {
+                  worktree_path = "/first",
+                  base = "origin/main",
+                  setup = function() end,
+                })
+                grove.repo("monorepo", { base = "origin/develop" })
+            "#,
+            "repo-layering",
+        );
+        assert!(loaded.error.is_none());
+        let overrides = loaded.runtime.repo_overrides();
+        assert_eq!(overrides.len(), 1);
+        // Keys left unset by the second registration keep their earlier value.
+        assert_eq!(overrides[0].base.as_deref(), Some("origin/develop"));
+        assert!(overrides[0].worktree_path.is_some());
+        assert!(overrides[0].setup.is_some());
+    }
+
+    #[test]
+    fn repo_setup_runs_after_global_worktree_created_hooks_in_order() {
+        let output = temp_path("repo-setup");
+        let source = format!(
+            r#"
+            local grove = require("grove")
+            local function record(tag)
+              return function()
+                local file = assert(io.open({output:?}, "a"))
+                file:write(tag .. "\n"); file:close()
+              end
+            end
+            grove.on("worktree_created", record("global-1"))
+            grove.repo("api", {{ setup = record("repo-setup") }})
+            grove.on("worktree_created", record("global-2"))
+            "#,
+            output = output.to_string_lossy(),
+        );
+        let mut runtime = DaemonRuntime::load_source(&source, "repo-setup").runtime;
+        let payload = LifecyclePayload::Worktree {
+            repo: "api".into(),
+            branch: "main".into(),
+            path: "/trees/api".into(),
+            clone: "/code/api".into(),
+            session: "one".into(),
+        };
+        assert!(
+            runtime
+                .fire(LifecycleEvent::WorktreeCreated, &payload)
+                .is_empty()
+        );
+        // Global hooks first, in registration order, then the repo's setup.
+        assert_eq!(
+            fs::read_to_string(&output).unwrap(),
+            "global-1\nglobal-2\nrepo-setup\n"
+        );
+        // Another repo gets only the global hooks.
+        let _ = fs::remove_file(&output);
+        let payload = LifecyclePayload::Worktree {
+            repo: "other".into(),
+            branch: "main".into(),
+            path: "/trees/other".into(),
+            clone: "/code/other".into(),
+            session: "one".into(),
+        };
+        assert!(
+            runtime
+                .fire(LifecycleEvent::WorktreeCreated, &payload)
+                .is_empty()
+        );
+        assert_eq!(fs::read_to_string(&output).unwrap(), "global-1\nglobal-2\n");
+        let _ = fs::remove_file(&output);
+    }
+
+    #[test]
+    fn throwing_repo_setup_is_disabled_without_touching_global_hooks() {
+        let output = temp_path("repo-setup-contained");
+        let source = format!(
+            r#"
+            local grove = require("grove")
+            local function record(tag)
+              return function()
+                local file = assert(io.open({output:?}, "a"))
+                file:write(tag .. "\n"); file:close()
+              end
+            end
+            grove.repo("api", {{ setup = function() error("broken setup") end }})
+            grove.on("worktree_created", record("global"))
+            "#,
+            output = output.to_string_lossy(),
+        );
+        let mut runtime = DaemonRuntime::load_source(&source, "repo-setup-contained").runtime;
+        let payload = LifecyclePayload::Worktree {
+            repo: "api".into(),
+            branch: "main".into(),
+            path: "/trees/api".into(),
+            clone: "/code/api".into(),
+            session: "one".into(),
+        };
+        let reports = runtime.fire(LifecycleEvent::WorktreeCreated, &payload);
+        assert!(matches!(
+            reports.as_slice(),
+            [HookReport::RepoSetupDisabled { repo, .. }] if repo == "api"
+        ));
+        // The setup ran and threw after the global hook, which is untouched.
+        assert_eq!(fs::read_to_string(&output).unwrap(), "global\n");
+        // A disabled setup is not run again, and no longer reported.
+        assert!(
+            runtime
+                .fire(LifecycleEvent::WorktreeCreated, &payload)
+                .is_empty()
+        );
+        assert_eq!(fs::read_to_string(&output).unwrap(), "global\nglobal\n");
+        let _ = fs::remove_file(&output);
+    }
+
+    #[test]
+    fn each_vm_takes_its_own_portion_of_a_repo_override() {
+        let source = r##"
+            local grove = require("grove")
+            grove.repo("monorepo", {
+              worktree_path = "/mnt/nvme/{repo}/{branch_slug}/{session}",
+              base = "origin/develop",
+              setup = function() end,
+              theme = { accent = "#ff0000", corners = "square" },
+            })
+        "##;
+        let daemon = DaemonRuntime::load_source(source, "repo-daemon");
+        assert!(daemon.error.is_none());
+        let overrides = daemon.runtime.repo_overrides();
+        assert_eq!(overrides.len(), 1);
+        assert_eq!(overrides[0].base.as_deref(), Some("origin/develop"));
+        assert!(overrides[0].setup.is_some());
+        assert!(
+            !daemon
+                .runtime
+                .config()
+                .worktree_path
+                .contains_session_placeholder()
+        );
+        assert!(daemon.runtime.contains_session_path_placeholder());
+
+        let tui = TuiRuntime::load_source(source, "repo-tui");
+        assert!(tui.error.is_none());
+        let overrides = &tui.runtime.registrations().repo_overrides;
+        assert_eq!(overrides.len(), 1);
+        assert_eq!(overrides[0].name, "monorepo");
+        assert_eq!(overrides[0].theme.accent.as_deref(), Some("#ff0000"));
+        assert_eq!(overrides[0].theme.corners, Some(Corners::Square));
+        assert_eq!(overrides[0].theme.clean, None);
     }
 
     #[test]
