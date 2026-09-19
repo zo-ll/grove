@@ -156,7 +156,6 @@ impl Store {
     pub fn remove_member(&mut self, session: &SessionId, repo: &RepoId) -> Result<(), Error> {
         let target = self.session_mut(session)?;
         target.members.retain(|member| member != repo);
-        target.owned.retain(|worktree| &worktree.repo != repo);
         self.persist()
     }
 
@@ -438,6 +437,8 @@ mod tests {
             .adopt(&sid("one"), worktree.clone(), &linked, &clone)
             .unwrap();
         assert_eq!(store.owner(&worktree), Some(&sid("one")));
+        store.remove_member(&sid("one"), &rid("repo")).unwrap();
+        assert_eq!(store.owner(&worktree), Some(&sid("one")));
         store.release(&sid("one"), &worktree).unwrap();
         assert!(store.owner(&worktree).is_none());
     }
@@ -479,5 +480,21 @@ mod tests {
             ),
             Err(Error::SessionPathTemplate)
         ));
+    }
+
+    #[test]
+    fn close_and_end_complete_the_state_machine() {
+        let temp = TempDir::new();
+        let mut store = Store::load_at(&temp.0, Path::new("/workspace"), "{repo}/{branch}");
+        store.create(sid("one"), "One".into()).unwrap();
+        store.open(&sid("one")).unwrap();
+        store.close(&sid("one")).unwrap();
+        assert_eq!(
+            store.session(&sid("one")).unwrap().state,
+            SessionState::Closed
+        );
+        let ended = store.end(&sid("one")).unwrap();
+        assert_eq!(ended.id, sid("one"));
+        assert!(store.sessions().is_empty());
     }
 }
