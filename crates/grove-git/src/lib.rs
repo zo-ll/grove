@@ -279,7 +279,20 @@ fn parse_worktrees(repo: &Path, bytes: &[u8]) -> Result<Vec<Worktree>, Error> {
 }
 
 pub fn is_dirty(worktree: &Path) -> Result<bool, Error> {
-    Ok(!git_success(worktree, "status", &["status", "--porcelain"])?.is_empty())
+    Ok(dirty_file_count(worktree)? > 0)
+}
+
+pub fn dirty_file_count(worktree: &Path) -> Result<u32, Error> {
+    let output = git_success(worktree, "status", &["status", "--porcelain=v1"])?;
+    let count = output
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .count();
+    u32::try_from(count).map_err(|_| Error::MalformedGitOutput {
+        operation: "status",
+        path: worktree.to_owned(),
+        message: "more dirty paths than a u32 can represent".into(),
+    })
 }
 
 pub fn ahead_behind(worktree: &Path) -> Result<Tracking, Error> {

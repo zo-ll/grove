@@ -1,7 +1,11 @@
 //! Evaluation of Grove's shared Lua configuration in process-specific VMs.
 
 use mlua::{Function, Lua, MultiValue, RegistryKey, Table, Value};
-use std::{cell::RefCell, fmt, fs, path::Path, rc::Rc};
+use std::{
+    fmt, fs,
+    path::Path,
+    sync::{Arc, Mutex},
+};
 
 const DEFAULT_ACCENT: &str = "#fab387";
 const DEFAULT_CLEAN: &str = "#a6e3a1";
@@ -223,16 +227,18 @@ impl TuiRuntime {
 
     fn evaluate(source: &str, name: &str) -> mlua::Result<Self> {
         let lua = Lua::new();
-        let config = Rc::new(RefCell::new(Some(TuiConfig::default())));
-        let registrations = Rc::new(RefCell::new(Some(TuiRegistrations::default())));
-        install_tui_module(&lua, Rc::clone(&config), Rc::clone(&registrations))?;
+        let config = Arc::new(Mutex::new(Some(TuiConfig::default())));
+        let registrations = Arc::new(Mutex::new(Some(TuiRegistrations::default())));
+        install_tui_module(&lua, Arc::clone(&config), Arc::clone(&registrations))?;
         lua.load(source).set_name(name).exec()?;
         let config = config
-            .borrow_mut()
+            .lock()
+            .expect("TUI config lock poisoned")
             .take()
             .ok_or_else(|| mlua::Error::runtime("config was already consumed"))?;
         let registrations = registrations
-            .borrow_mut()
+            .lock()
+            .expect("TUI registrations lock poisoned")
             .take()
             .ok_or_else(|| mlua::Error::runtime("registrations were already consumed"))?;
         Ok(Self {
@@ -403,16 +409,18 @@ impl DaemonRuntime {
 
     fn evaluate(source: &str, name: &str) -> mlua::Result<Self> {
         let lua = Lua::new();
-        let config = Rc::new(RefCell::new(Some(DaemonConfig::default())));
-        let lifecycle = Rc::new(RefCell::new(Some(Vec::new())));
-        install_daemon_module(&lua, Rc::clone(&config), Rc::clone(&lifecycle))?;
+        let config = Arc::new(Mutex::new(Some(DaemonConfig::default())));
+        let lifecycle = Arc::new(Mutex::new(Some(Vec::new())));
+        install_daemon_module(&lua, Arc::clone(&config), Arc::clone(&lifecycle))?;
         lua.load(source).set_name(name).exec()?;
         let config = config
-            .borrow_mut()
+            .lock()
+            .expect("daemon config lock poisoned")
             .take()
             .ok_or_else(|| mlua::Error::runtime("config was already consumed"))?;
         let lifecycle = lifecycle
-            .borrow_mut()
+            .lock()
+            .expect("daemon lifecycle lock poisoned")
             .take()
             .ok_or_else(|| mlua::Error::runtime("lifecycle hooks were already consumed"))?;
         Ok(Self {
@@ -468,16 +476,16 @@ fn expand_worktree_template(template: &str, context: &WorktreePathContext<'_>) -
 
 fn install_tui_module(
     lua: &Lua,
-    config: Rc<RefCell<Option<TuiConfig>>>,
-    registrations: Rc<RefCell<Option<TuiRegistrations>>>,
+    config: Arc<Mutex<Option<TuiConfig>>>,
+    registrations: Arc<Mutex<Option<TuiRegistrations>>>,
 ) -> mlua::Result<()> {
     let module = lua.create_table()?;
 
-    let setup_config = Rc::clone(&config);
+    let setup_config = Arc::clone(&config);
     module.set(
         "setup",
         lua.create_function(move |_, table: Table| {
-            let mut config = setup_config.borrow_mut();
+            let mut config = setup_config.lock().expect("TUI config lock poisoned");
             apply_tui_setup(
                 config
                     .as_mut()
@@ -487,12 +495,13 @@ fn install_tui_module(
         })?,
     )?;
 
-    let keymaps = Rc::clone(&registrations);
+    let keymaps = Arc::clone(&registrations);
     module.set(
         "keymap",
         lua.create_function(move |lua, (key, callback): (String, Function)| {
             keymaps
-                .borrow_mut()
+                .lock()
+                .expect("TUI registrations lock poisoned")
                 .as_mut()
                 .ok_or_else(|| mlua::Error::runtime("registrations are unavailable"))?
                 .keymaps
@@ -503,12 +512,13 @@ fn install_tui_module(
             Ok(())
         })?,
     )?;
-    let commands = Rc::clone(&registrations);
+    let commands = Arc::clone(&registrations);
     module.set(
         "command",
         lua.create_function(move |lua, (name, callback): (String, Function)| {
             commands
-                .borrow_mut()
+                .lock()
+                .expect("TUI registrations lock poisoned")
                 .as_mut()
                 .ok_or_else(|| mlua::Error::runtime("registrations are unavailable"))?
                 .commands
@@ -519,12 +529,13 @@ fn install_tui_module(
             Ok(())
         })?,
     )?;
-    let columns = Rc::clone(&registrations);
+    let columns = Arc::clone(&registrations);
     module.set(
         "column",
         lua.create_function(move |lua, (name, callback): (String, Function)| {
             columns
-                .borrow_mut()
+                .lock()
+                .expect("TUI registrations lock poisoned")
                 .as_mut()
                 .ok_or_else(|| mlua::Error::runtime("registrations are unavailable"))?
                 .columns
@@ -535,12 +546,13 @@ fn install_tui_module(
             Ok(())
         })?,
     )?;
-    let templates = Rc::clone(&registrations);
+    let templates = Arc::clone(&registrations);
     module.set(
         "session_template",
         lua.create_function(move |_, (name, value): (String, Table)| {
             templates
-                .borrow_mut()
+                .lock()
+                .expect("TUI registrations lock poisoned")
                 .as_mut()
                 .ok_or_else(|| mlua::Error::runtime("registrations are unavailable"))?
                 .session_templates
@@ -559,16 +571,16 @@ fn install_tui_module(
 
 fn install_daemon_module(
     lua: &Lua,
-    config: Rc<RefCell<Option<DaemonConfig>>>,
-    lifecycle: Rc<RefCell<Option<Vec<LifecycleRegistration>>>>,
+    config: Arc<Mutex<Option<DaemonConfig>>>,
+    lifecycle: Arc<Mutex<Option<Vec<LifecycleRegistration>>>>,
 ) -> mlua::Result<()> {
     let module = lua.create_table()?;
 
-    let setup_config = Rc::clone(&config);
+    let setup_config = Arc::clone(&config);
     module.set(
         "setup",
         lua.create_function(move |lua, table: Table| {
-            let mut config = setup_config.borrow_mut();
+            let mut config = setup_config.lock().expect("daemon config lock poisoned");
             apply_daemon_setup(
                 lua,
                 config
@@ -582,7 +594,8 @@ fn install_daemon_module(
         "on",
         lua.create_function(move |lua, (event, callback): (String, Function)| {
             lifecycle
-                .borrow_mut()
+                .lock()
+                .expect("daemon lifecycle lock poisoned")
                 .as_mut()
                 .ok_or_else(|| mlua::Error::runtime("lifecycle hooks are unavailable"))?
                 .push(LifecycleRegistration {

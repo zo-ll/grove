@@ -13,12 +13,14 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
 pub mod fetch;
 pub mod prune;
+pub mod session;
 pub mod terminal;
 
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -114,12 +116,14 @@ impl DaemonSocket {
         &self.socket_path
     }
 
-    pub fn run(self) -> Result<(), LifecycleError> {
+    pub fn run(self, service: session::SessionOrchestrator) -> Result<(), LifecycleError> {
+        let service = Arc::new(Mutex::new(service));
         loop {
             match self.listener.accept() {
                 Ok((stream, _)) => {
+                    let service = Arc::clone(&service);
                     thread::spawn(move || {
-                        let _ = serve_client(stream);
+                        let _ = serve_client_with(stream, Some(service));
                     });
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
@@ -225,7 +229,15 @@ fn configured_stream(path: &Path) -> io::Result<UnixStream> {
     Ok(stream)
 }
 
-fn serve_client(mut stream: UnixStream) -> Result<(), grove_proto::FrameError> {
+#[cfg(test)]
+fn serve_client(stream: UnixStream) -> Result<(), grove_proto::FrameError> {
+    serve_client_with(stream, None)
+}
+
+fn serve_client_with(
+    mut stream: UnixStream,
+    service: Option<Arc<Mutex<session::SessionOrchestrator>>>,
+) -> Result<(), grove_proto::FrameError> {
     stream.set_read_timeout(Some(IO_TIMEOUT))?;
     stream.set_write_timeout(Some(IO_TIMEOUT))?;
     let hello: Request = read_frame(&mut stream)?;
@@ -252,13 +264,23 @@ fn serve_client(mut stream: UnixStream) -> Result<(), grove_proto::FrameError> {
         }
     }
     while let Ok(request) = read_frame::<_, Request>(&mut stream) {
-        write_frame(
-            &mut stream,
-            &Event::Failed {
+        let events = if let Some(service) = &service {
+            match service.lock() {
+                Ok(mut service) => service.handle_request(request),
+                Err(_) => vec![Event::Failed {
+                    context: "daemon state".into(),
+                    message: "session orchestrator lock was poisoned".into(),
+                }],
+            }
+        } else {
+            vec![Event::Failed {
                 context: format!("{request:?}"),
                 message: "request handling is not installed yet".into(),
-            },
-        )?;
+            }]
+        };
+        for event in events {
+            write_frame(&mut stream, &event)?;
+        }
     }
     Ok(())
 }
@@ -356,6 +378,43 @@ mod tests {
         .unwrap();
         let event: Event = read_frame(&mut client).unwrap();
         assert_eq!(accept_welcome(&event), Handshake::Agreed);
+        drop(client);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn post_handshake_session_requests_reach_the_orchestrator() {
+        let temp = TempDir::new();
+        let runtime = grove_lua::DaemonRuntime::load(temp.0.join("missing.lua")).runtime;
+        let fetch = fetch::FetchPolicy::from_config(2, runtime.config()).unwrap();
+        let store = grove_state::Store::load_at(&temp.0, &temp.0, "");
+        let terminals =
+            terminal::TerminalManager::new(PathBuf::from("/bin/sh"), temp.0.clone(), 100);
+        let service =
+            session::SessionOrchestrator::new(store, Vec::new(), terminals, fetch, runtime);
+        let service = Arc::new(Mutex::new(service));
+        let (client, server) = UnixStream::pair().unwrap();
+        let worker = thread::spawn(move || serve_client_with(server, Some(service)).unwrap());
+        let mut client = client;
+        client.set_read_timeout(Some(IO_TIMEOUT)).unwrap();
+        write_frame(
+            &mut client,
+            &Request::Hello {
+                version: PROTOCOL_VERSION,
+            },
+        )
+        .unwrap();
+        let _: Event = read_frame(&mut client).unwrap();
+        write_frame(
+            &mut client,
+            &Request::OpenSession(grove_domain::SessionId("missing".into())),
+        )
+        .unwrap();
+        let event: Event = read_frame(&mut client).unwrap();
+        assert!(matches!(
+            event,
+            Event::Failed { message, .. } if message.contains("does not exist")
+        ));
         drop(client);
         worker.join().unwrap();
     }
