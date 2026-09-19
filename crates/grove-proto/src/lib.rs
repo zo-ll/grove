@@ -66,7 +66,9 @@
 
 use std::io::{self, Read, Write};
 
-use grove_domain::{RepoId, Session, SessionId};
+use std::path::PathBuf;
+
+use grove_domain::{Ownership, RepoId, SessionId, SessionState};
 use serde::{Deserialize, Serialize};
 
 /// Incremented for any change an older peer cannot decode: a changed field
@@ -94,6 +96,28 @@ pub const MAX_FRAME_BYTES: u32 = 16 * 1024 * 1024;
 pub struct WorktreeRef {
     pub repo: RepoId,
     pub branch: String,
+}
+
+/// A live terminal, for reattaching to one the client did not spawn itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalRow {
+    pub terminal: TerminalId,
+    pub target: TerminalTarget,
+    /// The command in the foreground, for the "terminal busy" warning.
+    pub foreground: Option<String>,
+}
+
+/// What a new terminal is attached to.
+///
+/// The scratch shell (§4.5) is deliberately attached to no worktree, so a
+/// spawn request that demanded one could not create it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TerminalTarget {
+    Worktree(WorktreeRef),
+    /// `cwd` defaults to `config.scratch_cwd` when absent.
+    Scratch {
+        cwd: Option<PathBuf>,
+    },
 }
 
 /// Identifies one pty for the lifetime of the daemon. Not stable across
@@ -127,6 +151,144 @@ pub struct Attach {
     pub cols: u16,
 }
 
+/// A session as the picker renders it (SPEC §4.3).
+///
+/// The picker shows "attached · 4 terminals", "detached 2d" and "closed ·
+/// 794 MB". The domain `Session` carries none of those: it has no terminal
+/// count, and no notion of how long it has held its state. Rather than push
+/// screen concerns into the pure type, the protocol carries the row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRow {
+    pub id: SessionId,
+    pub name: String,
+    /// Member repo names, in the order the picker lists them.
+    pub members: Vec<String>,
+    pub state: SessionState,
+    /// Live terminals. Zero for a closed session, by definition.
+    pub terminals: u32,
+    /// Seconds the session has held its current state, for "detached 2d".
+    pub since: u64,
+    /// Disk held by the worktrees this session owns, for "closed · 794 MB".
+    pub size: u64,
+}
+
+/// A repo as the REPOS pane renders it (SPEC §4.1).
+///
+/// `worktrees` counts every worktree the daemon can see in this repo, not only
+/// the session's — the pane shows a count beside each member, and a member with
+/// zero is a normal state meaning "this task touches this repo, I haven't
+/// branched yet".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoRow {
+    pub repo: RepoId,
+    pub name: String,
+    pub base_branch: String,
+    /// True when `base_branch` came from `origin/HEAD` rather than a config
+    /// override. §4.2 renders the provenance — "base: origin/main (from
+    /// origin/HEAD)" — and the name alone cannot express it.
+    pub base_from_origin_head: bool,
+    pub worktrees: u32,
+    /// Any worktree in this repo has uncommitted changes. A flag suffices
+    /// here: the REPOS pane colours a dot, and per-worktree counts come from
+    /// [`WorktreeRow::dirty_files`].
+    pub dirty: bool,
+    /// The repo is a member of the open session.
+    pub member: bool,
+}
+
+/// A worktree as the WORKTREES pane renders it (SPEC §4.1).
+///
+/// The pane lists *every* worktree of the selected repo regardless of owner,
+/// plus the clone, and must distinguish four ownership states — so ownership
+/// travels with the row rather than being inferred by the client.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreeRow {
+    pub worktree: WorktreeRef,
+    pub ownership: Ownership,
+    pub ahead: u64,
+    pub behind: u64,
+    /// Uncommitted files. Zero means clean.
+    ///
+    /// A count rather than a flag because §4.6 renders "9 files uncommitted"
+    /// and "9 uncommitted files in billing-service will be lost" before the
+    /// only destructive action in the product. A bool would force the client to
+    /// say "some files", which is a weaker warning than the spec asks for.
+    pub dirty_files: u32,
+    /// Seconds since the worktree was last touched.
+    pub age: u64,
+    pub size: u64,
+    /// The pty attached to this worktree, if one is running.
+    pub terminal: Option<TerminalId>,
+    /// The command in the foreground of that pty, for the "terminal busy"
+    /// warning before a worktree is removed.
+    pub foreground: Option<String>,
+    /// Refs have aged past `stale_after`, so ahead/behind may be wrong.
+    pub stale: bool,
+}
+
+/// Why a worktree *is* safe to prune (SPEC §5).
+///
+/// The picker renders this in its own column — "merged" or "gone" — so it
+/// cannot be inferred from the absence of blockers, which only say why a row is
+/// unsafe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PruneState {
+    /// Merged into its base.
+    Merged,
+    /// Its upstream branch no longer exists.
+    UpstreamGone,
+    /// Neither: the row is not safe, and `blockers` says why.
+    Neither,
+}
+
+/// Why a worktree is not safe to prune (SPEC §5).
+///
+/// Prune pre-checks only provably safe rows and shows everything else with the
+/// reason it was skipped, so the reason is data rather than prose the client
+/// invents.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PruneBlocker {
+    /// Not merged into its base and its upstream still exists.
+    Unmerged,
+    /// The working tree has uncommitted changes.
+    Dirty { files: u32 },
+    /// Commits exist locally that are not pushed.
+    Unpushed { commits: u64 },
+    /// An attached or detached session owns it.
+    Owned { session: SessionId, name: String },
+}
+
+/// One row of the prune picker (SPEC §5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PruneCandidate {
+    pub worktree: WorktreeRef,
+    /// What makes it prunable, rendered as its own column.
+    pub state: PruneState,
+    pub size: u64,
+    /// Empty when the row is safe, and the daemon pre-checked it. Any entry
+    /// means the client leaves it unchecked and shows why.
+    pub blockers: Vec<PruneBlocker>,
+}
+
+/// A file in the diff screen (SPEC §4.4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiffFile {
+    pub path: String,
+    /// `M`, `A`, `D` or `?` as the screen renders it.
+    pub status: char,
+    pub added: u64,
+    pub removed: u64,
+}
+
+/// One line of a unified hunk, pre-classified so the client does not parse.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DiffLine {
+    Header(String),
+    Context(String),
+    Added(String),
+    Removed(String),
+}
+
 /// Client to daemon.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Request {
@@ -137,6 +299,47 @@ pub enum Request {
     },
 
     ListSessions,
+    /// Every repo in the workspace, for the REPOS pane.
+    ListRepos,
+    /// Re-walk the workspace for repos (§5's `scan`).
+    Scan,
+    /// Create a session and make it current (§5's `session new`).
+    SessionNew {
+        name: String,
+    },
+    /// Rename the open session (§5's `session rename`).
+    SessionRename {
+        session: SessionId,
+        name: String,
+    },
+    /// Every worktree of one repo, regardless of owner, plus the clone.
+    ListWorktrees(RepoId),
+    /// Prune candidates across the workspace, each with the reasons it is not
+    /// safe to remove.
+    ListPruneCandidates,
+    /// Remove these worktrees. §5's picker ends in `enter prune 4`, and listing
+    /// candidates without a verb leaves the screen unable to do the one thing
+    /// it exists for.
+    ///
+    /// §5 says an unsafe row "can still be ticked deliberately", so the daemon
+    /// does not overrule the selection — that would make the deliberate tick
+    /// meaningless. It attempts each one and reports per-row outcomes in
+    /// [`Event::Pruned`], the same plan-then-results idiom §4.6 uses for the
+    /// only other destructive action. What it will not do is remove a worktree
+    /// a live session owns, because that is not the user's to override from
+    /// this screen: ending that session is.
+    Prune(Vec<WorktreeRef>),
+    /// The diff of one worktree against its base, for the read-only diff screen.
+    ///
+    /// `file` picks which patch comes back. `None` means "the first file", for
+    /// opening the screen. Moving the cursor re-requests with the new path —
+    /// §4.4's `↑↓ file` is the screen's only interaction, and without a way to
+    /// ask for another file's hunks it cannot happen. Hunks are not all sent up
+    /// front because opening the screen would then pay for every file's patch.
+    DiffWorktree {
+        worktree: WorktreeRef,
+        file: Option<String>,
+    },
     /// Open a stored session, replacing whatever is open. The outgoing session
     /// becomes detached, or is dropped if it is an unnamed launch session with
     /// no worktrees.
@@ -170,9 +373,7 @@ pub enum Request {
         worktree: WorktreeRef,
     },
 
-    SpawnTerminal {
-        worktree: WorktreeRef,
-    },
+    SpawnTerminal(TerminalTarget),
     KillTerminal(TerminalId),
     ResizeTerminal {
         terminal: TerminalId,
@@ -196,6 +397,15 @@ pub enum Request {
         session: SessionId,
         repo: Option<RepoId>,
     },
+    /// Open a worktree in `config.editor` (§3.3's `^g o`).
+    ///
+    /// The daemon runs it rather than returning a path: it is the side that
+    /// holds the editor configuration, and the TUI is barred from touching the
+    /// filesystem anyway. An earlier revision carried a path on every worktree
+    /// row for this, which no screen rendered.
+    OpenEditor(WorktreeRef),
+    /// Every live terminal, for reattach.
+    ListTerminals,
     /// Manual only, as in tmux-resurrect.
     SaveSnapshot(SessionId),
     RestoreSnapshot(SessionId),
@@ -275,9 +485,47 @@ pub enum Event {
         client: u32,
     },
 
-    Sessions(Vec<Session>),
+    Sessions(Vec<SessionRow>),
+    /// A terminal was created. Without this the spawn interaction cannot
+    /// complete: the client has no other way to learn the id it must attach to,
+    /// and §4.5's scratch shell is unreachable from the moment it is created.
+    TerminalSpawned {
+        target: TerminalTarget,
+        terminal: TerminalId,
+    },
+    /// Every live terminal, so a reattaching client can find the scratch shell
+    /// again. Worktree terminals are discoverable through `Worktrees`; the
+    /// scratch shell belongs to no worktree and would otherwise be lost on
+    /// reattach.
+    Terminals(Vec<TerminalRow>),
+    Repos(Vec<RepoRow>),
+    Worktrees {
+        repo: RepoId,
+        rows: Vec<WorktreeRow>,
+    },
+    PruneCandidates(Vec<PruneCandidate>),
+    /// What actually happened, per row. A prune can partly succeed — one
+    /// worktree's removal failing is no reason to hide that four others went —
+    /// and the user deliberately ticked anything unsafe, so they are owed the
+    /// outcome rather than a refusal.
+    Pruned {
+        removed: Vec<WorktreeRef>,
+        failed: Vec<(WorktreeRef, String)>,
+        reclaimed: u64,
+    },
+    /// `files` is the whole list; `hunks` covers `selected` only, so opening the
+    /// screen does not pay for every file's patch.
+    Diff {
+        worktree: WorktreeRef,
+        base: String,
+        files: Vec<DiffFile>,
+        selected: Option<String>,
+        hunks: Vec<DiffLine>,
+        added: u64,
+        removed: u64,
+    },
     /// A session's state changed, for any reason including another client.
-    SessionChanged(Session),
+    SessionChanged(SessionRow),
     SessionEnded(SessionId),
 
     /// The visible grid, sent first on attach so the pane can paint at once.
@@ -310,7 +558,21 @@ pub enum Event {
         status: Option<i32>,
     },
 
-    /// A request failed. `context` names the request that caused it.
+    /// A branch is already checked out in another worktree, so it cannot be
+    /// created again.
+    ///
+    /// §7 requires the UI to offer to adopt that existing worktree instead, and
+    /// it cannot do that from a prose message — it needs the conflicting path
+    /// and the worktree that holds it.
+    BranchCheckedOutElsewhere {
+        repo: RepoId,
+        branch: String,
+        existing: WorktreeRef,
+        existing_path: PathBuf,
+    },
+
+    /// A request failed in a way with no richer representation. `context` names
+    /// the request that caused it.
     Failed {
         context: String,
         message: String,
@@ -529,6 +791,24 @@ mod tests {
                 version: PROTOCOL_VERSION,
             },
             Request::ListSessions,
+            Request::ListRepos,
+            Request::Scan,
+            Request::SessionNew {
+                name: "invoice split".into(),
+            },
+            Request::SessionRename {
+                session: sid.clone(),
+                name: "renamed".into(),
+            },
+            Request::ListWorktrees(rid.clone()),
+            Request::ListPruneCandidates,
+            Request::Prune(vec![wt.clone()]),
+            Request::OpenEditor(wt.clone()),
+            Request::ListTerminals,
+            Request::DiffWorktree {
+                worktree: wt.clone(),
+                file: None,
+            },
             Request::OpenSession(sid.clone()),
             Request::DetachSession(sid.clone()),
             Request::CloseSession(sid.clone()),
@@ -554,7 +834,7 @@ mod tests {
                 session: sid.clone(),
                 worktree: wt.clone(),
             },
-            Request::SpawnTerminal { worktree: wt },
+            Request::SpawnTerminal(TerminalTarget::Scratch { cwd: None }),
             Request::KillTerminal(tid),
             Request::ResizeTerminal {
                 terminal: tid,
@@ -586,6 +866,16 @@ mod tests {
             match r {
                 Request::Hello { .. }
                 | Request::ListSessions
+                | Request::ListRepos
+                | Request::Scan
+                | Request::SessionNew { .. }
+                | Request::SessionRename { .. }
+                | Request::ListWorktrees(_)
+                | Request::ListPruneCandidates
+                | Request::Prune(_)
+                | Request::OpenEditor(_)
+                | Request::ListTerminals
+                | Request::DiffWorktree { .. }
                 | Request::OpenSession(_)
                 | Request::DetachSession(_)
                 | Request::CloseSession(_)
@@ -595,7 +885,7 @@ mod tests {
                 | Request::NewWorktrees { .. }
                 | Request::AdoptWorktree { .. }
                 | Request::ReleaseWorktree { .. }
-                | Request::SpawnTerminal { .. }
+                | Request::SpawnTerminal(_)
                 | Request::KillTerminal(_)
                 | Request::ResizeTerminal { .. }
                 | Request::Input { .. }
@@ -610,65 +900,174 @@ mod tests {
 
     #[test]
     fn every_event_round_trips() {
-        let session = Session {
+        let session = SessionRow {
             id: SessionId("s".into()),
             name: "invoice split".into(),
-            members: vec![],
-            owned: vec![],
-            state: SessionState::Attached,
+            members: vec!["billing-service".into(), "web-app".into()],
+            state: SessionState::Detached,
+            terminals: 4,
+            since: 172_800,
+            size: 794_000_000,
         };
-        round_trip(&Event::Welcome {
-            version: PROTOCOL_VERSION,
-        });
-        round_trip(&Event::VersionMismatch {
-            daemon: 1,
-            client: 2,
-        });
-        round_trip(&Event::Sessions(vec![session.clone()]));
-        round_trip(&Event::SessionChanged(session));
-        round_trip(&Event::TerminalScreen {
-            terminal: TerminalId(1),
-            screen: Screen {
-                rows: 1,
-                cols: 2,
-                cells: vec![vec![
-                    Cell {
-                        text: "a".into(),
-                        fg: Color::Rgb(250, 179, 135),
-                        bg: Color::Default,
-                        attrs: Attrs {
-                            bold: true,
-                            ..Attrs::default()
-                        },
-                    },
-                    Cell {
-                        text: "b".into(),
-                        fg: Color::Indexed(2),
-                        bg: Color::Default,
-                        attrs: Attrs::default(),
-                    },
-                ]],
-                cursor: Some((0, 1)),
+        let rid = RepoId("billing-service".into());
+        let wt = WorktreeRef {
+            repo: rid.clone(),
+            branch: "feat/x".into(),
+        };
+        let tid = TerminalId(1);
+
+        let all = [
+            Event::Welcome {
+                version: PROTOCOL_VERSION,
             },
-        });
-        round_trip(&Event::TerminalScrollback {
-            terminal: TerminalId(1),
-            seq: 0,
-            lines: vec!["old".into()],
-            done: true,
-        });
-        round_trip(&Event::TerminalOutput {
-            terminal: TerminalId(1),
-            bytes: vec![27, 91, 65],
-        });
-        round_trip(&Event::TerminalExited {
-            terminal: TerminalId(1),
-            status: Some(1),
-        });
-        round_trip(&Event::Failed {
-            context: "OpenSession".into(),
-            message: "gone".into(),
-        });
+            Event::VersionMismatch {
+                daemon: 1,
+                client: 2,
+            },
+            Event::Sessions(vec![session.clone()]),
+            Event::TerminalSpawned {
+                target: TerminalTarget::Scratch { cwd: None },
+                terminal: tid,
+            },
+            Event::Terminals(vec![TerminalRow {
+                terminal: tid,
+                target: TerminalTarget::Worktree(wt.clone()),
+                foreground: Some("pnpm test".into()),
+            }]),
+            Event::Repos(vec![RepoRow {
+                repo: rid.clone(),
+                name: "billing-service".into(),
+                base_branch: "origin/main".into(),
+                base_from_origin_head: true,
+                worktrees: 3,
+                dirty: true,
+                member: true,
+            }]),
+            Event::Worktrees {
+                repo: rid.clone(),
+                rows: vec![WorktreeRow {
+                    worktree: wt.clone(),
+                    ownership: Ownership::Other(SessionId("other".into())),
+                    ahead: 4,
+                    behind: 2,
+                    dirty_files: 9,
+                    age: 7200,
+                    size: 286_000_000,
+                    terminal: Some(tid),
+                    foreground: Some("pnpm test".into()),
+                    stale: true,
+                }],
+            },
+            Event::Pruned {
+                removed: vec![wt.clone()],
+                failed: vec![(wt.clone(), "worktree is locked".into())],
+                reclaimed: 412_000_000,
+            },
+            Event::PruneCandidates(vec![PruneCandidate {
+                worktree: wt.clone(),
+                state: PruneState::Merged,
+                size: 412_000_000,
+                blockers: vec![
+                    PruneBlocker::Unmerged,
+                    PruneBlocker::Dirty { files: 9 },
+                    PruneBlocker::Unpushed { commits: 6 },
+                    PruneBlocker::Owned {
+                        session: SessionId("s".into()),
+                        name: "invoice split".into(),
+                    },
+                ],
+            }]),
+            Event::Diff {
+                worktree: wt,
+                base: "origin/main".into(),
+                files: vec![DiffFile {
+                    path: "src/invoice/split.ts".into(),
+                    status: 'M',
+                    added: 184,
+                    removed: 22,
+                }],
+                selected: Some("src/invoice/split.ts".into()),
+                hunks: vec![
+                    DiffLine::Header("@@ -198,12 +198,26 @@".into()),
+                    DiffLine::Context(" const items = invoice.lineItems;".into()),
+                    DiffLine::Removed("-  return items.map(toLine);".into()),
+                    DiffLine::Added("+  const boundary = cycleBoundary(invoice);".into()),
+                ],
+                added: 412,
+                removed: 137,
+            },
+            Event::SessionChanged(session),
+            Event::SessionEnded(SessionId("s".into())),
+            Event::TerminalScreen {
+                terminal: tid,
+                screen: Screen {
+                    rows: 1,
+                    cols: 2,
+                    cells: vec![vec![
+                        Cell {
+                            text: "a".into(),
+                            fg: Color::Rgb(250, 179, 135),
+                            bg: Color::Default,
+                            attrs: Attrs {
+                                bold: true,
+                                ..Attrs::default()
+                            },
+                        },
+                        Cell {
+                            text: "b".into(),
+                            fg: Color::Indexed(2),
+                            bg: Color::Default,
+                            attrs: Attrs::default(),
+                        },
+                    ]],
+                    cursor: Some((0, 1)),
+                },
+            },
+            Event::TerminalScrollback {
+                terminal: tid,
+                seq: 0,
+                lines: vec!["old".into()],
+                done: true,
+            },
+            Event::TerminalOutput {
+                terminal: tid,
+                bytes: vec![27, 91, 65],
+            },
+            Event::TerminalExited {
+                terminal: tid,
+                status: Some(1),
+            },
+            Event::Failed {
+                context: "OpenSession".into(),
+                message: "gone".into(),
+            },
+        ];
+
+        for e in &all {
+            round_trip(e);
+            // Compile-time exhaustiveness: a new event breaks this match, so the
+            // set cannot drift the way a hand-kept list does.
+            match e {
+                Event::Welcome { .. }
+                | Event::VersionMismatch { .. }
+                | Event::Sessions(_)
+                | Event::TerminalSpawned { .. }
+                | Event::Terminals(_)
+                | Event::Repos(_)
+                | Event::Worktrees { .. }
+                | Event::PruneCandidates(_)
+                | Event::Pruned { .. }
+                | Event::Diff { .. }
+                | Event::SessionChanged(_)
+                | Event::SessionEnded(_)
+                | Event::TerminalScreen { .. }
+                | Event::TerminalScrollback { .. }
+                | Event::TerminalOutput { .. }
+                | Event::TerminalExited { .. }
+                | Event::BranchCheckedOutElsewhere { .. }
+                | Event::Failed { .. } => {}
+            }
+        }
     }
 
     #[test]
