@@ -280,7 +280,9 @@ pub fn ahead_behind(worktree: &Path) -> Result<Tracking, Error> {
     )?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return if stderr.contains("no upstream configured") || stderr.contains("no upstream branch")
+        return if stderr.contains("no upstream configured")
+            || stderr.contains("no upstream branch")
+            || stderr.contains("HEAD does not point to a branch")
         {
             Ok(Tracking::NoUpstream)
         } else if stderr.contains("unknown revision")
@@ -654,6 +656,14 @@ mod tests {
         assert!(!is_dirty(&temp.0).unwrap());
         fs::write(temp.0.join("untracked"), "work").unwrap();
         assert!(is_dirty(&temp.0).unwrap());
+    }
+
+    #[test]
+    fn detached_head_has_no_upstream() {
+        let temp = TempDir::new("detached-tracking");
+        repo(&temp.0);
+        git(&temp.0, &["checkout", "--detach", "-q"]);
+        assert_eq!(ahead_behind(&temp.0).unwrap(), Tracking::NoUpstream);
     }
 
     #[test]
