@@ -3,8 +3,17 @@
 use mlua::{Function, Lua, MultiValue, RegistryKey, Table, Value};
 use std::{
     fmt, fs,
-    path::Path,
-    sync::{Arc, Mutex},
+    io::Read,
+    os::unix::process::CommandExt,
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    },
+    thread,
+    time::{Duration, Instant},
 };
 
 const DEFAULT_ACCENT: &str = "#fab387";
@@ -334,13 +343,90 @@ pub struct LifecycleRegistration {
     /// Event that triggers this hook.
     pub event: LifecycleEvent,
     callback: RegistryKey,
+    disabled: bool,
 }
+
+/// Stable data exposed to a lifecycle callback.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LifecyclePayload {
+    Worktree {
+        repo: String,
+        branch: String,
+        path: PathBuf,
+        clone: PathBuf,
+        session: String,
+    },
+    Terminal {
+        terminal: u64,
+        repo: String,
+        branch: String,
+        path: PathBuf,
+        session: String,
+    },
+    Session {
+        id: String,
+        name: String,
+    },
+}
+
+/// Most `grove.run` jobs that may be in flight at once.
+///
+/// A hook is user code inside the daemon; without a cap, one loop exhausts the
+/// daemon's threads, processes and file descriptors for everything else.
+pub const MAX_CONCURRENT_JOBS: u64 = 16;
+
+/// How long to keep draining output after the shell itself has exited.
+///
+/// A backgrounded grandchild can hold the pipe open indefinitely; the shell's
+/// own output is already flushed by then, so this only needs to be long enough
+/// to collect it.
+pub const SH_DRAIN: Duration = Duration::from_millis(200);
+
+/// How long `grove.sh` may block the daemon before its command is killed.
+pub const SH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Signal a whole process group, best effort.
+///
+/// Directly, not through `/bin/kill`: the group signal is load-bearing — it is
+/// what closes pipes a backgrounded grandchild is still holding — and an
+/// external binary makes that depend on PATH and on the binary existing at all.
+/// On a system without it the signal silently became a no-op and the freeze
+/// came back, which is exactly the failure a best-effort call should not hide.
+/// `killpg` is a safe function in `nix`, so this costs no `unsafe`.
+fn signal_group(pgid: u32) {
+    let Ok(pgid) = i32::try_from(pgid) else {
+        return;
+    };
+    // Best effort by design: the group may already be gone, which is success
+    // by another name.
+    let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pgid), nix::sys::signal::SIGTERM);
+}
+
+/// A contained hook error or the eventual result of an asynchronous command.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HookReport {
+    HookDisabled {
+        event: LifecycleEvent,
+        registration: usize,
+        message: String,
+    },
+    CommandFinished {
+        job: u64,
+        command: String,
+        success: bool,
+        message: String,
+    },
+}
+
+type TerminalSender = Arc<dyn Fn(u64, &[u8]) -> Result<(), String> + Send + Sync>;
 
 /// A daemon-owned Lua VM with only daemon settings and lifecycle hooks in Rust.
 pub struct DaemonRuntime {
     config: DaemonConfig,
     lifecycle: Vec<LifecycleRegistration>,
     lua: Lua,
+    reports: mpsc::Receiver<HookReport>,
+    terminal_sender: Arc<Mutex<Option<TerminalSender>>>,
 }
 
 impl DaemonRuntime {
@@ -388,6 +474,46 @@ impl DaemonRuntime {
         self.lua.registry_value(&self.lifecycle[index].callback)
     }
 
+    /// Installs the daemon-owned terminal input operation used by `grove.send`.
+    pub fn set_terminal_sender<F>(&mut self, sender: F)
+    where
+        F: Fn(u64, &[u8]) -> Result<(), String> + Send + Sync + 'static,
+    {
+        *self
+            .terminal_sender
+            .lock()
+            .expect("terminal sender lock poisoned") = Some(Arc::new(sender));
+    }
+
+    /// Runs matching hooks in registration order. A failing hook is disabled
+    /// before the next event, while later registrations still run.
+    pub fn fire(&mut self, event: LifecycleEvent, payload: &LifecyclePayload) -> Vec<HookReport> {
+        let mut reports = Vec::new();
+        for index in 0..self.lifecycle.len() {
+            if self.lifecycle[index].event != event || self.lifecycle[index].disabled {
+                continue;
+            }
+            let result = self
+                .lua
+                .registry_value::<Function>(&self.lifecycle[index].callback)
+                .and_then(|callback| callback.call::<()>(payload_table(&self.lua, payload)?));
+            if let Err(error) = result {
+                self.lifecycle[index].disabled = true;
+                reports.push(HookReport::HookDisabled {
+                    event,
+                    registration: index,
+                    message: error.to_string(),
+                });
+            }
+        }
+        reports
+    }
+
+    /// Returns completed asynchronous command reports without waiting.
+    pub fn drain_reports(&self) -> Vec<HookReport> {
+        self.reports.try_iter().collect()
+    }
+
     /// Expands the configured template or invokes its Lua function.
     pub fn worktree_path(&self, context: WorktreePathContext<'_>) -> mlua::Result<String> {
         match &self.config.worktree_path {
@@ -400,10 +526,13 @@ impl DaemonRuntime {
     }
 
     fn defaults() -> Self {
+        let (_, reports) = mpsc::channel();
         Self {
             config: DaemonConfig::default(),
             lifecycle: Vec::new(),
             lua: Lua::new(),
+            reports,
+            terminal_sender: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -411,7 +540,15 @@ impl DaemonRuntime {
         let lua = Lua::new();
         let config = Arc::new(Mutex::new(Some(DaemonConfig::default())));
         let lifecycle = Arc::new(Mutex::new(Some(Vec::new())));
-        install_daemon_module(&lua, Arc::clone(&config), Arc::clone(&lifecycle))?;
+        let (report_sender, reports) = mpsc::channel();
+        let terminal_sender = Arc::new(Mutex::new(None));
+        install_daemon_module(
+            &lua,
+            Arc::clone(&config),
+            Arc::clone(&lifecycle),
+            report_sender,
+            Arc::clone(&terminal_sender),
+        )?;
         lua.load(source).set_name(name).exec()?;
         let config = config
             .lock()
@@ -427,8 +564,47 @@ impl DaemonRuntime {
             config,
             lifecycle,
             lua,
+            reports,
+            terminal_sender,
         })
     }
+}
+
+fn payload_table(lua: &Lua, payload: &LifecyclePayload) -> mlua::Result<Table> {
+    let table = lua.create_table()?;
+    match payload {
+        LifecyclePayload::Worktree {
+            repo,
+            branch,
+            path,
+            clone,
+            session,
+        } => {
+            table.set("repo", repo.as_str())?;
+            table.set("branch", branch.as_str())?;
+            table.set("path", path.to_string_lossy().as_ref())?;
+            table.set("clone", clone.to_string_lossy().as_ref())?;
+            table.set("session", session.as_str())?;
+        }
+        LifecyclePayload::Terminal {
+            terminal,
+            repo,
+            branch,
+            path,
+            session,
+        } => {
+            table.set("terminal", *terminal)?;
+            table.set("repo", repo.as_str())?;
+            table.set("branch", branch.as_str())?;
+            table.set("path", path.to_string_lossy().as_ref())?;
+            table.set("session", session.as_str())?;
+        }
+        LifecyclePayload::Session { id, name } => {
+            table.set("id", id.as_str())?;
+            table.set("name", name.as_str())?;
+        }
+    }
+    Ok(table)
 }
 
 /// Converts a branch name into a deterministic, portable path component.
@@ -573,6 +749,8 @@ fn install_daemon_module(
     lua: &Lua,
     config: Arc<Mutex<Option<DaemonConfig>>>,
     lifecycle: Arc<Mutex<Option<Vec<LifecycleRegistration>>>>,
+    reports: mpsc::Sender<HookReport>,
+    terminal_sender: Arc<Mutex<Option<TerminalSender>>>,
 ) -> mlua::Result<()> {
     let module = lua.create_table()?;
 
@@ -601,8 +779,204 @@ fn install_daemon_module(
                 .push(LifecycleRegistration {
                     event: parse_event(&event)?,
                     callback: lua.create_registry_value(callback)?,
+                    disabled: false,
                 });
             Ok(())
+        })?,
+    )?;
+
+    let next_job = Arc::new(AtomicU64::new(1));
+    // A hook is user code running inside the daemon, so an unbounded spawn is a
+    // way to take the daemon down by accident: `while true do grove.run(..) end`
+    // costs a thread, a /bin/sh child and two pipe descriptors per iteration.
+    // Refusing past the cap keeps a runaway hook local to itself.
+    let in_flight = Arc::new(AtomicU64::new(0));
+    module.set(
+        "run",
+        lua.create_function(move |_, (cwd, command): (String, String)| {
+            if in_flight.load(Ordering::SeqCst) >= MAX_CONCURRENT_JOBS {
+                return Err(mlua::Error::runtime(format!(
+                    "grove.run: {MAX_CONCURRENT_JOBS} jobs already running; \
+                     this one was refused rather than exhausting the daemon"
+                )));
+            }
+            in_flight.fetch_add(1, Ordering::SeqCst);
+
+            let job = next_job.fetch_add(1, Ordering::Relaxed);
+            let reports = reports.clone();
+            let reported_command = command.clone();
+            let running = Arc::clone(&in_flight);
+            thread::spawn(move || {
+                let result = Command::new("/bin/sh")
+                    .args(["-lc", &command])
+                    .current_dir(cwd)
+                    .output();
+                let (success, message) = match result {
+                    Ok(output) => {
+                        let message = if output.status.success() {
+                            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+                        } else {
+                            String::from_utf8_lossy(&output.stderr).trim().to_owned()
+                        };
+                        (output.status.success(), message)
+                    }
+                    Err(error) => (false, error.to_string()),
+                };
+                // Released whatever happened, so a failing command cannot leak
+                // a slot and slowly wedge the cap shut.
+                running.fetch_sub(1, Ordering::SeqCst);
+                let _ = reports.send(HookReport::CommandFinished {
+                    job,
+                    command: reported_command,
+                    success,
+                    message,
+                });
+            });
+            Ok(job)
+        })?,
+    )?;
+    module.set(
+        "sh",
+        lua.create_function(|_, command: String| {
+            // Hooks fire while the daemon holds its service lock, so this blocks
+            // every other request for the command's duration. Acceptable for
+            // reading a value, disastrous for anything slow — hence the bound.
+            //
+            // Bounding the *shell* is not enough. A backgrounded grandchild
+            // (`grove.sh("npm run dev &")`) inherits the pipe's write end, so
+            // the shell exits in milliseconds and reading stdout to EOF then
+            // blocks until the grandchild does. An earlier version used
+            // `wait_with_output` and froze the daemon for the grandchild's
+            // lifetime — the very freeze the timeout was added to prevent,
+            // reached by a different door.
+            //
+            // So: its own process group, output drained on threads that cannot
+            // hold us, and on timeout the whole group is signalled rather than
+            // just the shell.
+            let mut child = Command::new("/bin/sh")
+                .args(["-lc", &command])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .process_group(0)
+                .spawn()
+                .map_err(mlua::Error::external)?;
+
+            let pgid = child.id();
+            // Channels, not `JoinHandle`s. A reader blocked on a pipe some
+            // grandchild still holds never returns, and `join` has no deadline,
+            // so joining is the freeze again one line further down. A channel
+            // can be given one: whatever arrived by the time the window closes
+            // is the output, and the reader finishes detached or not at all.
+            let mut out = child.stdout.take();
+            let mut err = child.stderr.take();
+            let (out_tx, out_rx) = mpsc::channel();
+            let (err_tx, err_rx) = mpsc::channel();
+            thread::spawn(move || {
+                let mut buf = Vec::new();
+                if let Some(pipe) = out.as_mut() {
+                    let _ = pipe.read_to_end(&mut buf);
+                }
+                let _ = out_tx.send(buf);
+            });
+            thread::spawn(move || {
+                let mut buf = Vec::new();
+                if let Some(pipe) = err.as_mut() {
+                    let _ = pipe.read_to_end(&mut buf);
+                }
+                let _ = err_tx.send(buf);
+            });
+
+            let deadline = Instant::now() + SH_TIMEOUT;
+            let mut exited_at: Option<Instant> = None;
+            let mut out_buf: Option<Vec<u8>> = None;
+            let mut err_buf: Option<Vec<u8>> = None;
+            let status = loop {
+                if out_buf.is_none() {
+                    out_buf = out_rx.try_recv().ok();
+                }
+                if err_buf.is_none() {
+                    err_buf = err_rx.try_recv().ok();
+                }
+                match child.try_wait().map_err(mlua::Error::external)? {
+                    Some(status) if out_buf.is_some() && err_buf.is_some() => break status,
+                    // The shell is gone but a pipe is still held, so something
+                    // it spawned outlives it. Its own output has long since
+                    // flushed; waiting the full timeout for a background job
+                    // that may run for hours is the freeze in slow motion.
+                    // Give the readers a moment, then close the pipes by
+                    // signalling the group and take what arrived.
+                    Some(status) if exited_at.is_some_and(|at| at.elapsed() >= SH_DRAIN) => {
+                        signal_group(pgid);
+                        break status;
+                    }
+                    Some(_) => {
+                        exited_at.get_or_insert_with(Instant::now);
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    _ if Instant::now() >= deadline => {
+                        // Signal the group: killing only the shell leaves its
+                        // children running and still holding the pipes.
+                        signal_group(pgid);
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(mlua::Error::runtime(format!(
+                            "grove.sh: {command:?} exceeded {}s and its process group was killed; \
+                             grove.sh blocks the daemon, so use grove.run for slow commands",
+                            SH_TIMEOUT.as_secs()
+                        )));
+                    }
+                    None => thread::sleep(Duration::from_millis(10)),
+                }
+            };
+
+            // One last window — shared, not one each, so the two waits cannot
+            // add up. Output written just before the signal still counts; past
+            // the window the read is abandoned rather than waited on, because
+            // the whole point of the group signal is that the caller is already
+            // free, and a pipe-holder that ignored the signal — or a signal that
+            // never landed — must not be able to take that back.
+            //
+            // So the bound on grove.sh is SH_TIMEOUT plus two drain windows:
+            // the in-loop one that decides the shell's children are outliving
+            // it, and this one.
+            let drain_until = Instant::now() + SH_DRAIN;
+            let take = |buf: Option<Vec<u8>>, rx: &mpsc::Receiver<Vec<u8>>| match buf {
+                Some(buf) => buf,
+                None => rx
+                    .recv_timeout(drain_until.saturating_duration_since(Instant::now()))
+                    .unwrap_or_default(),
+            };
+            let out = take(out_buf, &out_rx);
+            let err = take(err_buf, &err_rx);
+            if !status.success() {
+                return Err(mlua::Error::runtime(
+                    String::from_utf8_lossy(&err).trim().to_owned(),
+                ));
+            }
+            Ok(String::from_utf8_lossy(&out).trim().to_owned())
+        })?,
+    )?;
+    module.set(
+        "copy",
+        lua.create_function(|_, (from, to): (String, String)| {
+            fs::copy(from, to)
+                .map(|_| ())
+                .map_err(mlua::Error::external)
+        })?,
+    )?;
+    module.set(
+        "exists",
+        lua.create_function(|_, path: String| Ok(Path::new(&path).exists()))?,
+    )?;
+    module.set(
+        "send",
+        lua.create_function(move |_, (terminal, bytes): (u64, mlua::String)| {
+            let sender = terminal_sender
+                .lock()
+                .map_err(|_| mlua::Error::runtime("terminal sender lock poisoned"))?
+                .clone()
+                .ok_or_else(|| mlua::Error::runtime("terminal sender is unavailable"))?;
+            sender(terminal, bytes.as_bytes().as_ref()).map_err(mlua::Error::runtime)
         })?,
     )?;
 
@@ -740,6 +1114,18 @@ fn parse_event(value: &str) -> mlua::Result<LifecycleEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    fn temp_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "grove-lua-{label}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
 
     const SHARED_CONFIG: &str = r##"
         local grove = require("grove")
@@ -913,5 +1299,343 @@ mod tests {
         let loaded = TuiRuntime::load(path);
         assert!(loaded.error.is_none());
         assert_eq!(loaded.runtime.config(), &TuiConfig::default());
+    }
+
+    #[test]
+    fn lifecycle_events_expose_stable_payloads_in_registration_order() {
+        let output = temp_path("events");
+        let source = format!(
+            r#"
+            local grove = require("grove")
+            local function record(name)
+              return function(value)
+                local file = assert(io.open({output:?}, "a"))
+                file:write(name .. ":" .. (value.repo or value.id) .. ":" .. (value.branch or value.name) .. "\n")
+                file:close()
+              end
+            end
+            grove.on("worktree_created", record("created-1"))
+            grove.on("worktree_created", record("created-2"))
+            grove.on("worktree_removed", record("removed"))
+            grove.on("worktree_adopted", record("adopted"))
+            grove.on("terminal_spawned", record("spawned"))
+            grove.on("terminal_exited", record("exited"))
+            grove.on("session_opened", record("opened"))
+            grove.on("session_closed", record("closed"))
+            grove.on("session_ended", record("ended"))
+            "#,
+            output = output.to_string_lossy()
+        );
+        let mut runtime = DaemonRuntime::load_source(&source, "events").runtime;
+        let worktree = LifecyclePayload::Worktree {
+            repo: "api".into(),
+            branch: "feat/hooks".into(),
+            path: "/trees/api".into(),
+            clone: "/code/api".into(),
+            session: "session-1".into(),
+        };
+        let terminal = LifecyclePayload::Terminal {
+            terminal: 7,
+            repo: "api".into(),
+            branch: "feat/hooks".into(),
+            path: "/trees/api".into(),
+            session: "session-1".into(),
+        };
+        let session = LifecyclePayload::Session {
+            id: "session-1".into(),
+            name: "hooks".into(),
+        };
+        for event in [
+            LifecycleEvent::WorktreeCreated,
+            LifecycleEvent::WorktreeRemoved,
+            LifecycleEvent::WorktreeAdopted,
+        ] {
+            assert!(runtime.fire(event, &worktree).is_empty());
+        }
+        for event in [
+            LifecycleEvent::TerminalSpawned,
+            LifecycleEvent::TerminalExited,
+        ] {
+            assert!(runtime.fire(event, &terminal).is_empty());
+        }
+        for event in [
+            LifecycleEvent::SessionOpened,
+            LifecycleEvent::SessionClosed,
+            LifecycleEvent::SessionEnded,
+        ] {
+            assert!(runtime.fire(event, &session).is_empty());
+        }
+        assert_eq!(
+            fs::read_to_string(&output).unwrap(),
+            "created-1:api:feat/hooks\ncreated-2:api:feat/hooks\nremoved:api:feat/hooks\nadopted:api:feat/hooks\nspawned:api:feat/hooks\nexited:api:feat/hooks\nopened:session-1:hooks\nclosed:session-1:hooks\nended:session-1:hooks\n"
+        );
+        let _ = fs::remove_file(output);
+    }
+
+    #[test]
+    fn throwing_hook_is_disabled_without_skipping_later_registrations() {
+        let output = temp_path("contained");
+        let source = format!(
+            r#"
+            local grove = require("grove")
+            grove.on("session_opened", function() error("broken hook") end)
+            grove.on("session_opened", function()
+              local file = assert(io.open({output:?}, "a")); file:write("ok\n"); file:close()
+            end)
+            "#,
+            output = output.to_string_lossy()
+        );
+        let mut runtime = DaemonRuntime::load_source(&source, "contained").runtime;
+        let payload = LifecyclePayload::Session {
+            id: "one".into(),
+            name: "one".into(),
+        };
+        let reports = runtime.fire(LifecycleEvent::SessionOpened, &payload);
+        assert!(matches!(
+            reports.as_slice(),
+            [HookReport::HookDisabled { .. }]
+        ));
+        assert!(
+            runtime
+                .fire(LifecycleEvent::SessionOpened, &payload)
+                .is_empty()
+        );
+        assert_eq!(fs::read_to_string(&output).unwrap(), "ok\nok\n");
+        let _ = fs::remove_file(output);
+    }
+
+    #[test]
+    fn run_refuses_past_the_concurrency_cap_rather_than_exhausting_the_daemon() {
+        // A hook is user code inside the daemon. Without a cap, `while true do
+        // grove.run(..) end` costs a thread, a /bin/sh child and two pipe
+        // descriptors per iteration until the daemon cannot serve anything.
+        let source = format!(
+            "local grove = require('grove')\n\
+             grove.setup({{}})\n\
+             grove.on('worktree_created', function(wt)\n\
+               for _ = 1, {} do grove.run(wt.path, 'sleep 5') end\n\
+             end)\n",
+            MAX_CONCURRENT_JOBS + 8
+        );
+        let mut runtime = DaemonRuntime::load_source(&source, "cap").runtime;
+        let reports = runtime.fire(
+            LifecycleEvent::WorktreeCreated,
+            &LifecyclePayload::Worktree {
+                repo: "r".into(),
+                branch: "b".into(),
+                path: std::env::temp_dir(),
+                clone: std::env::temp_dir(),
+                session: "s".into(),
+            },
+        );
+        // The hook is disabled at the point of refusal, and the refusal says
+        // why rather than failing obscurely.
+        assert!(
+            reports.iter().any(|r| matches!(
+                r,
+                HookReport::HookDisabled { message, .. } if message.contains("already running")
+            )),
+            "expected a refusal past the cap, got {reports:?}"
+        );
+    }
+
+    #[test]
+    fn sh_still_returns_normal_output_promptly() {
+        // The drain window must not cost a fast command its result.
+        let source = "local grove = require('grove')\n\
+                      grove.setup({})\n\
+                      grove.on('session_opened', function()\n\
+                        local v = grove.sh('printf hello')\n\
+                        if v ~= 'hello' then error('got: ' .. tostring(v)) end\n\
+                      end)\n";
+        let mut runtime = DaemonRuntime::load_source(source, "sh-ok").runtime;
+        let started = Instant::now();
+        let reports = runtime.fire(
+            LifecycleEvent::SessionOpened,
+            &LifecyclePayload::Session {
+                id: "s".into(),
+                name: "s".into(),
+            },
+        );
+        assert!(
+            reports.is_empty(),
+            "a working command must not report a failure: {reports:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn sh_does_not_block_on_a_backgrounded_grandchild_holding_the_pipe() {
+        // The shell exits in milliseconds; a backgrounded child inherits the
+        // pipe's write end, so reading stdout to EOF waits for *it*. Bounding
+        // only the shell left the daemon frozen for the grandchild's lifetime.
+        let source = "local grove = require('grove')\n\
+                      grove.setup({})\n\
+                      grove.on('session_opened', function() grove.sh('sleep 30 &') end)\n";
+        let mut runtime = DaemonRuntime::load_source(source, "grandchild").runtime;
+        let started = Instant::now();
+        let _ = runtime.fire(
+            LifecycleEvent::SessionOpened,
+            &LifecyclePayload::Session {
+                id: "s".into(),
+                name: "s".into(),
+            },
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < SH_TIMEOUT + Duration::from_secs(2),
+            "grove.sh blocked {elapsed:?} on a backgrounded grandchild; \
+             the shell exits at once, so anything near 30s means the pipe held us"
+        );
+    }
+
+    #[test]
+    fn sh_does_not_block_on_a_grandchild_that_ignores_the_signal() {
+        // Closing the pipes by signalling the group only works if the group
+        // takes the signal. A hook that traps TERM — or a system where the
+        // signal never lands at all — must still not freeze the daemon, so the
+        // drain window has to bound the read as well as the signal.
+        let source = "local grove = require('grove')\n\
+                      grove.setup({})\n\
+                      grove.on('session_opened', function() grove.sh('trap \"\" TERM; sleep 30 &') end)\n";
+        let mut runtime = DaemonRuntime::load_source(source, "deaf-grandchild").runtime;
+        let started = Instant::now();
+        let _ = runtime.fire(
+            LifecycleEvent::SessionOpened,
+            &LifecyclePayload::Session {
+                id: "s".into(),
+                name: "s".into(),
+            },
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < SH_TIMEOUT + Duration::from_secs(2),
+            "grove.sh blocked {elapsed:?} on a grandchild that ignored the group signal; \
+             the read must be bounded by the drain window, not by the signal working"
+        );
+    }
+
+    #[test]
+    fn sh_is_bounded_so_a_hanging_command_cannot_freeze_the_daemon() {
+        // Hooks fire while the daemon holds its service lock, so an unbounded
+        // grove.sh blocks every other request for as long as the command runs.
+        let source = "local grove = require('grove')\n\
+                      grove.setup({})\n\
+                      grove.on('session_opened', function() grove.sh('sleep 120') end)\n";
+        let mut runtime = DaemonRuntime::load_source(source, "sh-timeout").runtime;
+        let started = Instant::now();
+        let reports = runtime.fire(
+            LifecycleEvent::SessionOpened,
+            &LifecyclePayload::Session {
+                id: "s".into(),
+                name: "s".into(),
+            },
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < SH_TIMEOUT + Duration::from_secs(5),
+            "grove.sh blocked for {elapsed:?}; the bound did not apply"
+        );
+        assert!(
+            reports.iter().any(|r| matches!(
+                r,
+                HookReport::HookDisabled { message, .. } if message.contains("exceeded")
+            )),
+            "expected a timeout report, got {reports:?}"
+        );
+    }
+
+    #[test]
+    fn run_is_async_and_reports_completion() {
+        let directory = temp_path("async-dir");
+        fs::create_dir_all(&directory).unwrap();
+        let source = format!(
+            r#"local grove = require("grove"); grove.on("session_opened", function()
+                grove.run({directory:?}, "sleep 1; printf done > completed")
+            end)"#,
+            directory = directory.to_string_lossy()
+        );
+        let mut runtime = DaemonRuntime::load_source(&source, "async").runtime;
+        let started = Instant::now();
+        assert!(
+            runtime
+                .fire(
+                    LifecycleEvent::SessionOpened,
+                    &LifecyclePayload::Session {
+                        id: "one".into(),
+                        name: "one".into()
+                    }
+                )
+                .is_empty()
+        );
+        assert!(started.elapsed() < Duration::from_millis(500));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let report = loop {
+            if let Some(report) = runtime.drain_reports().into_iter().next() {
+                break report;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "async command did not report completion"
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert!(matches!(
+            report,
+            HookReport::CommandFinished { success: true, .. }
+        ));
+        assert_eq!(
+            fs::read_to_string(directory.join("completed")).unwrap(),
+            "done"
+        );
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn hook_helpers_copy_query_shell_and_send_terminal_input() {
+        let source = temp_path("copy-source");
+        let target = temp_path("copy-target");
+        fs::write(&source, "copied").unwrap();
+        let config = format!(
+            r#"
+            local grove = require("grove")
+            grove.on("terminal_spawned", function(terminal)
+              grove.copy({source:?}, {target:?})
+              assert(grove.exists({target:?}))
+              grove.send(terminal.terminal, grove.sh("printf shell-output"))
+            end)
+            "#,
+            source = source.to_string_lossy(),
+            target = target.to_string_lossy(),
+        );
+        let mut runtime = DaemonRuntime::load_source(&config, "helpers").runtime;
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&sent);
+        runtime.set_terminal_sender(move |terminal, bytes| {
+            captured.lock().unwrap().push((terminal, bytes.to_vec()));
+            Ok(())
+        });
+        assert!(
+            runtime
+                .fire(
+                    LifecycleEvent::TerminalSpawned,
+                    &LifecyclePayload::Terminal {
+                        terminal: 9,
+                        repo: "api".into(),
+                        branch: "main".into(),
+                        path: "/tmp/api".into(),
+                        session: "one".into(),
+                    },
+                )
+                .is_empty()
+        );
+        assert_eq!(fs::read_to_string(&target).unwrap(), "copied");
+        assert_eq!(*sent.lock().unwrap(), [(9, b"shell-output".to_vec())]);
+        let _ = fs::remove_file(source);
+        let _ = fs::remove_file(target);
     }
 }
