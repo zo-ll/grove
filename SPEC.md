@@ -573,6 +573,20 @@ it. Without this, every `new` is followed by the same handful of commands typed 
 Events: `worktree_created`, `worktree_removed`, `worktree_adopted`, `terminal_spawned`,
 `terminal_exited`, `session_opened`, `session_closed`, `session_ended`.
 
+Worktree event payloads have `repo`, `branch`, `path`, `clone`, and `session` fields.
+Terminal event payloads have `terminal`, `repo`, `branch`, `path`, and `session` fields.
+Session event payloads have `id` and `name` fields. Paths are absolute whenever the
+underlying checkout still exists; `worktree_removed.path` is empty when Grove is
+forgetting an already-missing checkout.
+
+Hooks for one event run in the order they were registered. An error disables only that
+registration; later registrations still run for the current event. `grove.run(cwd,
+command)` starts `/bin/sh -lc command` in `cwd` and returns a job id immediately;
+completion and failure are reported by the daemon. `grove.sh(command)` runs the same
+shell synchronously and returns trimmed stdout. `grove.copy(from, to)` copies a file,
+`grove.exists(path)` tests path existence, and `grove.send(terminal, bytes)` writes to
+the named live terminal.
+
 ### 10.2 Computed values
 
 Any setting that takes a string may instead take a function.

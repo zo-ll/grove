@@ -4,10 +4,10 @@ use crate::fetch::{FetchPolicy, FetchResult, FetchStatus};
 use crate::terminal::{TerminalError, TerminalManager};
 use grove_domain::{RepoId, SessionId, SessionState};
 use grove_git::{RemoveOptions, Repository};
-use grove_lua::{DaemonRuntime, WorktreePathContext};
+use grove_lua::{DaemonRuntime, HookReport, LifecycleEvent, LifecyclePayload, WorktreePathContext};
 use grove_proto::{Event, Request, SessionRow, TerminalId, WorktreeRef};
 use grove_state::{OwnedWorktree, Store};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -120,6 +120,8 @@ pub struct SessionOrchestrator {
     fetch: FetchPolicy,
     runtime: DaemonRuntime,
     live: HashMap<SessionId, Vec<LiveTerminal>>,
+    hook_reports: Vec<HookReport>,
+    notified_exits: HashSet<TerminalId>,
 }
 
 impl SessionOrchestrator {
@@ -130,6 +132,13 @@ impl SessionOrchestrator {
         fetch: FetchPolicy,
         runtime: DaemonRuntime,
     ) -> Self {
+        let input = terminals.input_handle();
+        let mut runtime = runtime;
+        runtime.set_terminal_sender(move |terminal, bytes| {
+            input
+                .send(TerminalId(terminal), bytes)
+                .map_err(|error| error.to_string())
+        });
         Self {
             store,
             repositories: repositories
@@ -140,6 +149,8 @@ impl SessionOrchestrator {
             fetch,
             runtime,
             live: HashMap::new(),
+            hook_reports: Vec::new(),
+            notified_exits: HashSet::new(),
         }
     }
 
@@ -154,14 +165,18 @@ impl SessionOrchestrator {
     /// Applies the session-related protocol surface. Each call completes its
     /// effects before returning events, so the socket layer remains transport.
     pub fn handle_request(&mut self, request: Request) -> Vec<Event> {
+        self.fire_observed_terminal_exits();
         let context = format!("{request:?}");
-        match self.apply_request(request) {
+        let mut events = match self.apply_request(request) {
             Ok(events) => events,
             Err(error) => vec![Event::Failed {
                 context,
                 message: error.to_string(),
             }],
-        }
+        };
+        self.hook_reports.extend(self.runtime.drain_reports());
+        events.extend(self.hook_reports.drain(..).filter_map(hook_report_event));
+        events
     }
 
     fn apply_request(&mut self, request: Request) -> Result<Vec<Event>, OrchestrationError> {
@@ -330,6 +345,7 @@ impl SessionOrchestrator {
                             id,
                         });
                     terminal_ids.push(id);
+                    self.fire_terminal(LifecycleEvent::TerminalSpawned, session, owned, id);
                 }
                 Err(error) => failed.push(EffectFailure {
                     worktree: Some(owned.clone()),
@@ -338,6 +354,7 @@ impl SessionOrchestrator {
             }
         }
         self.store.open(session)?;
+        self.fire_session(LifecycleEvent::SessionOpened, session);
         Ok(OpenReport {
             fetches,
             terminals: terminal_ids,
@@ -357,7 +374,16 @@ impl SessionOrchestrator {
         let mut remaining = Vec::new();
         for terminal in self.live.remove(session).unwrap_or_default() {
             match self.terminals.kill(terminal.id) {
-                Ok(()) => killed.push(terminal.id),
+                Ok(()) => {
+                    killed.push(terminal.id);
+                    self.fire_terminal(
+                        LifecycleEvent::TerminalExited,
+                        session,
+                        &terminal.worktree,
+                        terminal.id,
+                    );
+                    self.notified_exits.insert(terminal.id);
+                }
                 Err(error) => {
                     failed.push(EffectFailure {
                         worktree: Some(terminal.worktree.clone()),
@@ -373,6 +399,7 @@ impl SessionOrchestrator {
         let closed = failed.is_empty();
         if closed {
             self.store.close(session)?;
+            self.fire_session(LifecycleEvent::SessionClosed, session);
         }
         Ok(CloseReport {
             killed,
@@ -416,6 +443,7 @@ impl SessionOrchestrator {
     /// and received confirmation. This is the sole orchestration path that
     /// invokes `git worktree remove`.
     pub fn end_confirmed(&mut self, session: &SessionId) -> Result<EndReport, OrchestrationError> {
+        let session_name = self.store.session(session)?.name.clone();
         let plan = self.end_plan(session)?;
         let close = self.close(session)?;
         if !close.closed {
@@ -429,6 +457,7 @@ impl SessionOrchestrator {
         let mut failed = Vec::new();
         for missing in plan.missing {
             self.store.forget_owned(session, &missing)?;
+            self.fire_worktree(LifecycleEvent::WorktreeRemoved, session, &missing, None);
             removed.push(missing);
         }
         for item in plan.worktrees {
@@ -441,6 +470,12 @@ impl SessionOrchestrator {
             match grove_git::remove_worktree(&repository.path, &item.path, &options) {
                 Ok(()) => {
                     self.store.forget_owned(session, &item.worktree)?;
+                    self.fire_worktree(
+                        LifecycleEvent::WorktreeRemoved,
+                        session,
+                        &item.worktree,
+                        Some(item.path.clone()),
+                    );
                     removed.push(item.worktree);
                 }
                 Err(error) => failed.push(EffectFailure {
@@ -452,6 +487,7 @@ impl SessionOrchestrator {
         let ended = failed.is_empty();
         if ended {
             self.store.end(session)?;
+            self.fire_session_named(LifecycleEvent::SessionEnded, session, &session_name);
             self.live.remove(session);
         }
         Ok(EndReport {
@@ -471,6 +507,12 @@ impl SessionOrchestrator {
         let path = self.resolve_owned_unowned(&worktree)?;
         self.store
             .adopt(session, worktree.clone(), &path, &repository.path)?;
+        self.fire_worktree(
+            LifecycleEvent::WorktreeAdopted,
+            session,
+            &worktree,
+            Some(path.clone()),
+        );
         if state == SessionState::Closed {
             return Ok(None);
         }
@@ -480,7 +522,11 @@ impl SessionOrchestrator {
         self.live
             .entry(session.clone())
             .or_default()
-            .push(LiveTerminal { worktree, id });
+            .push(LiveTerminal {
+                worktree: worktree.clone(),
+                id,
+            });
+        self.fire_terminal(LifecycleEvent::TerminalSpawned, session, &worktree, id);
         Ok(Some(id))
     }
 
@@ -492,15 +538,21 @@ impl SessionOrchestrator {
         if !self.store.ownership_movable() {
             return Err(grove_state::Error::SessionPathTemplate.into());
         }
-        if let Some(terminals) = self.live.get_mut(session) {
-            if let Some(index) = terminals
+        let terminal = self.live.get_mut(session).and_then(|terminals| {
+            terminals
                 .iter()
                 .position(|entry| &entry.worktree == worktree)
-            {
-                let terminal = terminals[index].clone();
-                self.terminals.kill(terminal.id)?;
-                terminals.remove(index);
-            }
+                .map(|index| terminals.remove(index))
+        });
+        if let Some(terminal) = terminal {
+            self.terminals.kill(terminal.id)?;
+            self.fire_terminal(
+                LifecycleEvent::TerminalExited,
+                session,
+                &terminal.worktree,
+                terminal.id,
+            );
+            self.notified_exits.insert(terminal.id);
         }
         self.store.release(session, worktree)?;
         Ok(())
@@ -536,6 +588,12 @@ impl SessionOrchestrator {
                 grove_git::create_worktree(&repository.path, &path, branch, base)?;
                 self.store
                     .own_created(session, worktree.clone(), &path, &repository.path)?;
+                self.fire_worktree(
+                    LifecycleEvent::WorktreeCreated,
+                    session,
+                    &worktree,
+                    Some(path.clone()),
+                );
                 let terminal = if stored.state == SessionState::Closed {
                     None
                 } else {
@@ -549,6 +607,7 @@ impl SessionOrchestrator {
                             worktree: worktree.clone(),
                             id,
                         });
+                    self.fire_terminal(LifecycleEvent::TerminalSpawned, session, &worktree, id);
                     Some(id)
                 };
                 Ok(CreatedWorktree {
@@ -598,6 +657,81 @@ impl SessionOrchestrator {
                 && self.terminals.is_alive(terminal.id).unwrap_or(false))
             .then_some(terminal.id)
         })
+    }
+
+    fn fire_observed_terminal_exits(&mut self) {
+        for id in self.terminals.drain_exited() {
+            if self.notified_exits.insert(id) {
+                let found = self.live.iter().find_map(|(session, terminals)| {
+                    terminals
+                        .iter()
+                        .find(|terminal| terminal.id == id)
+                        .map(|terminal| (session.clone(), terminal.worktree.clone()))
+                });
+                if let Some((session, worktree)) = found {
+                    self.fire_terminal(LifecycleEvent::TerminalExited, &session, &worktree, id);
+                }
+            }
+        }
+    }
+
+    fn fire_session(&mut self, event: LifecycleEvent, session: &SessionId) {
+        if let Ok(stored) = self.store.session(session) {
+            let name = stored.name.clone();
+            self.fire_session_named(event, session, &name);
+        }
+    }
+
+    fn fire_session_named(&mut self, event: LifecycleEvent, session: &SessionId, name: &str) {
+        self.hook_reports.extend(self.runtime.fire(
+            event,
+            &LifecyclePayload::Session {
+                id: session.0.clone(),
+                name: name.to_owned(),
+            },
+        ));
+    }
+
+    fn fire_worktree(
+        &mut self,
+        event: LifecycleEvent,
+        session: &SessionId,
+        worktree: &OwnedWorktree,
+        path: Option<PathBuf>,
+    ) {
+        let Some(repository) = self.repositories.get(&worktree.repo) else {
+            return;
+        };
+        let payload = LifecyclePayload::Worktree {
+            repo: repository.name.clone(),
+            branch: worktree.branch.clone(),
+            path: path
+                .or_else(|| self.resolve_owned(worktree).ok())
+                .unwrap_or_default(),
+            clone: repository.path.clone(),
+            session: session.0.clone(),
+        };
+        self.hook_reports.extend(self.runtime.fire(event, &payload));
+    }
+
+    fn fire_terminal(
+        &mut self,
+        event: LifecycleEvent,
+        session: &SessionId,
+        worktree: &OwnedWorktree,
+        terminal: TerminalId,
+    ) {
+        let Some(repository) = self.repositories.get(&worktree.repo) else {
+            return;
+        };
+        let payload = LifecyclePayload::Terminal {
+            terminal: terminal.0,
+            repo: repository.name.clone(),
+            branch: worktree.branch.clone(),
+            path: self.resolve_owned(worktree).unwrap_or_default(),
+            session: session.0.clone(),
+        };
+        self.hook_reports.extend(self.runtime.fire(event, &payload));
     }
 
     fn worktree_path(
@@ -655,6 +789,34 @@ fn effect_failure_events(context: &str, failures: &[EffectFailure]) -> Vec<Event
             message: failure.message.clone(),
         })
         .collect()
+}
+
+fn hook_report_event(report: HookReport) -> Option<Event> {
+    match report {
+        HookReport::HookDisabled {
+            event,
+            registration,
+            message,
+        } => Some(Event::Failed {
+            context: format!("lifecycle hook {event:?} #{registration}"),
+            message,
+        }),
+        HookReport::CommandFinished {
+            job,
+            command,
+            success,
+            message,
+        } => {
+            eprintln!(
+                "groved: hook job {job} {}: {command}: {message}",
+                if success { "completed" } else { "failed" }
+            );
+            (!success).then_some(Event::Failed {
+                context: format!("lifecycle command job {job}"),
+                message: format!("{command}: {message}"),
+            })
+        }
+    }
 }
 
 fn fetch_failure_events(results: &[FetchResult]) -> Vec<Event> {
@@ -783,10 +945,26 @@ mod tests {
         };
         let terminals = TerminalManager::new(PathBuf::from("/bin/sh"), temp.0.clone(), 100);
         let fetch = FetchPolicy::new(2, Duration::from_secs(60));
+        let lifecycle_log = temp.0.join("lifecycle.log");
         let runtime = DaemonRuntime::load_source(
             &format!(
-                "local grove = require('grove'); grove.setup({{ worktree_path = {:?} }})",
-                template
+                r#"
+                local grove = require('grove')
+                grove.setup({{ worktree_path = {template:?} }})
+                grove.on('worktree_created', function() error('bootstrap failed') end)
+                for _, event in ipairs({{
+                  'worktree_created', 'worktree_removed', 'worktree_adopted',
+                  'terminal_spawned', 'terminal_exited', 'session_opened',
+                  'session_closed', 'session_ended'
+                }}) do
+                  grove.on(event, function()
+                    local file = assert(io.open({lifecycle_log:?}, 'a'))
+                    file:write(event .. '\n'); file:close()
+                  end)
+                end
+                "#,
+                template = template,
+                lifecycle_log = lifecycle_log.to_string_lossy(),
             ),
             "test-config",
         )
@@ -881,14 +1059,35 @@ mod tests {
 
         let events = daemon.handle_request(Request::OpenSession(sid("one")));
         assert!(matches!(
-            events.last(),
+            events.iter().find(|event| matches!(event, Event::SessionChanged(_))),
             Some(Event::SessionChanged(row))
                 if row.state == SessionState::Attached && row.terminals == 2
         ));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Event::Failed { context, message }
+                if context.contains("WorktreeCreated") && message.contains("bootstrap failed")
+        )));
         let events = daemon.handle_request(Request::DetachSession(sid("one")));
         assert!(matches!(
             events.as_slice(),
             [Event::SessionChanged(row)] if row.state == SessionState::Detached
         ));
+        let lifecycle = fs::read_to_string(lifecycle_log).unwrap();
+        for event in [
+            "worktree_created",
+            "worktree_removed",
+            "worktree_adopted",
+            "terminal_spawned",
+            "terminal_exited",
+            "session_opened",
+            "session_closed",
+            "session_ended",
+        ] {
+            assert!(
+                lifecycle.lines().any(|line| line == event),
+                "missing {event}"
+            );
+        }
     }
 }

@@ -3,8 +3,14 @@
 use mlua::{Function, Lua, MultiValue, RegistryKey, Table, Value};
 use std::{
     fmt, fs,
-    path::Path,
-    sync::{Arc, Mutex},
+    path::{Path, PathBuf},
+    process::Command,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    },
+    thread,
 };
 
 const DEFAULT_ACCENT: &str = "#fab387";
@@ -334,13 +340,57 @@ pub struct LifecycleRegistration {
     /// Event that triggers this hook.
     pub event: LifecycleEvent,
     callback: RegistryKey,
+    disabled: bool,
 }
+
+/// Stable data exposed to a lifecycle callback.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LifecyclePayload {
+    Worktree {
+        repo: String,
+        branch: String,
+        path: PathBuf,
+        clone: PathBuf,
+        session: String,
+    },
+    Terminal {
+        terminal: u64,
+        repo: String,
+        branch: String,
+        path: PathBuf,
+        session: String,
+    },
+    Session {
+        id: String,
+        name: String,
+    },
+}
+
+/// A contained hook error or the eventual result of an asynchronous command.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HookReport {
+    HookDisabled {
+        event: LifecycleEvent,
+        registration: usize,
+        message: String,
+    },
+    CommandFinished {
+        job: u64,
+        command: String,
+        success: bool,
+        message: String,
+    },
+}
+
+type TerminalSender = Arc<dyn Fn(u64, &[u8]) -> Result<(), String> + Send + Sync>;
 
 /// A daemon-owned Lua VM with only daemon settings and lifecycle hooks in Rust.
 pub struct DaemonRuntime {
     config: DaemonConfig,
     lifecycle: Vec<LifecycleRegistration>,
     lua: Lua,
+    reports: mpsc::Receiver<HookReport>,
+    terminal_sender: Arc<Mutex<Option<TerminalSender>>>,
 }
 
 impl DaemonRuntime {
@@ -388,6 +438,46 @@ impl DaemonRuntime {
         self.lua.registry_value(&self.lifecycle[index].callback)
     }
 
+    /// Installs the daemon-owned terminal input operation used by `grove.send`.
+    pub fn set_terminal_sender<F>(&mut self, sender: F)
+    where
+        F: Fn(u64, &[u8]) -> Result<(), String> + Send + Sync + 'static,
+    {
+        *self
+            .terminal_sender
+            .lock()
+            .expect("terminal sender lock poisoned") = Some(Arc::new(sender));
+    }
+
+    /// Runs matching hooks in registration order. A failing hook is disabled
+    /// before the next event, while later registrations still run.
+    pub fn fire(&mut self, event: LifecycleEvent, payload: &LifecyclePayload) -> Vec<HookReport> {
+        let mut reports = Vec::new();
+        for index in 0..self.lifecycle.len() {
+            if self.lifecycle[index].event != event || self.lifecycle[index].disabled {
+                continue;
+            }
+            let result = self
+                .lua
+                .registry_value::<Function>(&self.lifecycle[index].callback)
+                .and_then(|callback| callback.call::<()>(payload_table(&self.lua, payload)?));
+            if let Err(error) = result {
+                self.lifecycle[index].disabled = true;
+                reports.push(HookReport::HookDisabled {
+                    event,
+                    registration: index,
+                    message: error.to_string(),
+                });
+            }
+        }
+        reports
+    }
+
+    /// Returns completed asynchronous command reports without waiting.
+    pub fn drain_reports(&self) -> Vec<HookReport> {
+        self.reports.try_iter().collect()
+    }
+
     /// Expands the configured template or invokes its Lua function.
     pub fn worktree_path(&self, context: WorktreePathContext<'_>) -> mlua::Result<String> {
         match &self.config.worktree_path {
@@ -400,10 +490,13 @@ impl DaemonRuntime {
     }
 
     fn defaults() -> Self {
+        let (_, reports) = mpsc::channel();
         Self {
             config: DaemonConfig::default(),
             lifecycle: Vec::new(),
             lua: Lua::new(),
+            reports,
+            terminal_sender: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -411,7 +504,15 @@ impl DaemonRuntime {
         let lua = Lua::new();
         let config = Arc::new(Mutex::new(Some(DaemonConfig::default())));
         let lifecycle = Arc::new(Mutex::new(Some(Vec::new())));
-        install_daemon_module(&lua, Arc::clone(&config), Arc::clone(&lifecycle))?;
+        let (report_sender, reports) = mpsc::channel();
+        let terminal_sender = Arc::new(Mutex::new(None));
+        install_daemon_module(
+            &lua,
+            Arc::clone(&config),
+            Arc::clone(&lifecycle),
+            report_sender,
+            Arc::clone(&terminal_sender),
+        )?;
         lua.load(source).set_name(name).exec()?;
         let config = config
             .lock()
@@ -427,8 +528,47 @@ impl DaemonRuntime {
             config,
             lifecycle,
             lua,
+            reports,
+            terminal_sender,
         })
     }
+}
+
+fn payload_table(lua: &Lua, payload: &LifecyclePayload) -> mlua::Result<Table> {
+    let table = lua.create_table()?;
+    match payload {
+        LifecyclePayload::Worktree {
+            repo,
+            branch,
+            path,
+            clone,
+            session,
+        } => {
+            table.set("repo", repo.as_str())?;
+            table.set("branch", branch.as_str())?;
+            table.set("path", path.to_string_lossy().as_ref())?;
+            table.set("clone", clone.to_string_lossy().as_ref())?;
+            table.set("session", session.as_str())?;
+        }
+        LifecyclePayload::Terminal {
+            terminal,
+            repo,
+            branch,
+            path,
+            session,
+        } => {
+            table.set("terminal", *terminal)?;
+            table.set("repo", repo.as_str())?;
+            table.set("branch", branch.as_str())?;
+            table.set("path", path.to_string_lossy().as_ref())?;
+            table.set("session", session.as_str())?;
+        }
+        LifecyclePayload::Session { id, name } => {
+            table.set("id", id.as_str())?;
+            table.set("name", name.as_str())?;
+        }
+    }
+    Ok(table)
 }
 
 /// Converts a branch name into a deterministic, portable path component.
@@ -573,6 +713,8 @@ fn install_daemon_module(
     lua: &Lua,
     config: Arc<Mutex<Option<DaemonConfig>>>,
     lifecycle: Arc<Mutex<Option<Vec<LifecycleRegistration>>>>,
+    reports: mpsc::Sender<HookReport>,
+    terminal_sender: Arc<Mutex<Option<TerminalSender>>>,
 ) -> mlua::Result<()> {
     let module = lua.create_table()?;
 
@@ -601,8 +743,81 @@ fn install_daemon_module(
                 .push(LifecycleRegistration {
                     event: parse_event(&event)?,
                     callback: lua.create_registry_value(callback)?,
+                    disabled: false,
                 });
             Ok(())
+        })?,
+    )?;
+
+    let next_job = Arc::new(AtomicU64::new(1));
+    module.set(
+        "run",
+        lua.create_function(move |_, (cwd, command): (String, String)| {
+            let job = next_job.fetch_add(1, Ordering::Relaxed);
+            let reports = reports.clone();
+            let reported_command = command.clone();
+            thread::spawn(move || {
+                let result = Command::new("/bin/sh")
+                    .args(["-lc", &command])
+                    .current_dir(cwd)
+                    .output();
+                let (success, message) = match result {
+                    Ok(output) => {
+                        let message = if output.status.success() {
+                            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+                        } else {
+                            String::from_utf8_lossy(&output.stderr).trim().to_owned()
+                        };
+                        (output.status.success(), message)
+                    }
+                    Err(error) => (false, error.to_string()),
+                };
+                let _ = reports.send(HookReport::CommandFinished {
+                    job,
+                    command: reported_command,
+                    success,
+                    message,
+                });
+            });
+            Ok(job)
+        })?,
+    )?;
+    module.set(
+        "sh",
+        lua.create_function(|_, command: String| {
+            let output = Command::new("/bin/sh")
+                .args(["-lc", &command])
+                .output()
+                .map_err(mlua::Error::external)?;
+            if !output.status.success() {
+                return Err(mlua::Error::runtime(
+                    String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+                ));
+            }
+            Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        })?,
+    )?;
+    module.set(
+        "copy",
+        lua.create_function(|_, (from, to): (String, String)| {
+            fs::copy(from, to)
+                .map(|_| ())
+                .map_err(mlua::Error::external)
+        })?,
+    )?;
+    module.set(
+        "exists",
+        lua.create_function(|_, path: String| Ok(Path::new(&path).exists()))?,
+    )?;
+    module.set(
+        "send",
+        lua.create_function(move |_, (terminal, bytes): (u64, mlua::String)| {
+            let sender = terminal_sender
+                .lock()
+                .map_err(|_| mlua::Error::runtime("terminal sender lock poisoned"))?
+                .clone()
+                .ok_or_else(|| mlua::Error::runtime("terminal sender is unavailable"))?;
+            sender(terminal, bytes.as_bytes().as_ref()).map_err(mlua::Error::runtime)
         })?,
     )?;
 
@@ -740,6 +955,18 @@ fn parse_event(value: &str) -> mlua::Result<LifecycleEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    fn temp_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "grove-lua-{label}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
 
     const SHARED_CONFIG: &str = r##"
         local grove = require("grove")
@@ -913,5 +1140,198 @@ mod tests {
         let loaded = TuiRuntime::load(path);
         assert!(loaded.error.is_none());
         assert_eq!(loaded.runtime.config(), &TuiConfig::default());
+    }
+
+    #[test]
+    fn lifecycle_events_expose_stable_payloads_in_registration_order() {
+        let output = temp_path("events");
+        let source = format!(
+            r#"
+            local grove = require("grove")
+            local function record(name)
+              return function(value)
+                local file = assert(io.open({output:?}, "a"))
+                file:write(name .. ":" .. (value.repo or value.id) .. ":" .. (value.branch or value.name) .. "\n")
+                file:close()
+              end
+            end
+            grove.on("worktree_created", record("created-1"))
+            grove.on("worktree_created", record("created-2"))
+            grove.on("worktree_removed", record("removed"))
+            grove.on("worktree_adopted", record("adopted"))
+            grove.on("terminal_spawned", record("spawned"))
+            grove.on("terminal_exited", record("exited"))
+            grove.on("session_opened", record("opened"))
+            grove.on("session_closed", record("closed"))
+            grove.on("session_ended", record("ended"))
+            "#,
+            output = output.to_string_lossy()
+        );
+        let mut runtime = DaemonRuntime::load_source(&source, "events").runtime;
+        let worktree = LifecyclePayload::Worktree {
+            repo: "api".into(),
+            branch: "feat/hooks".into(),
+            path: "/trees/api".into(),
+            clone: "/code/api".into(),
+            session: "session-1".into(),
+        };
+        let terminal = LifecyclePayload::Terminal {
+            terminal: 7,
+            repo: "api".into(),
+            branch: "feat/hooks".into(),
+            path: "/trees/api".into(),
+            session: "session-1".into(),
+        };
+        let session = LifecyclePayload::Session {
+            id: "session-1".into(),
+            name: "hooks".into(),
+        };
+        for event in [
+            LifecycleEvent::WorktreeCreated,
+            LifecycleEvent::WorktreeRemoved,
+            LifecycleEvent::WorktreeAdopted,
+        ] {
+            assert!(runtime.fire(event, &worktree).is_empty());
+        }
+        for event in [
+            LifecycleEvent::TerminalSpawned,
+            LifecycleEvent::TerminalExited,
+        ] {
+            assert!(runtime.fire(event, &terminal).is_empty());
+        }
+        for event in [
+            LifecycleEvent::SessionOpened,
+            LifecycleEvent::SessionClosed,
+            LifecycleEvent::SessionEnded,
+        ] {
+            assert!(runtime.fire(event, &session).is_empty());
+        }
+        assert_eq!(
+            fs::read_to_string(&output).unwrap(),
+            "created-1:api:feat/hooks\ncreated-2:api:feat/hooks\nremoved:api:feat/hooks\nadopted:api:feat/hooks\nspawned:api:feat/hooks\nexited:api:feat/hooks\nopened:session-1:hooks\nclosed:session-1:hooks\nended:session-1:hooks\n"
+        );
+        let _ = fs::remove_file(output);
+    }
+
+    #[test]
+    fn throwing_hook_is_disabled_without_skipping_later_registrations() {
+        let output = temp_path("contained");
+        let source = format!(
+            r#"
+            local grove = require("grove")
+            grove.on("session_opened", function() error("broken hook") end)
+            grove.on("session_opened", function()
+              local file = assert(io.open({output:?}, "a")); file:write("ok\n"); file:close()
+            end)
+            "#,
+            output = output.to_string_lossy()
+        );
+        let mut runtime = DaemonRuntime::load_source(&source, "contained").runtime;
+        let payload = LifecyclePayload::Session {
+            id: "one".into(),
+            name: "one".into(),
+        };
+        let reports = runtime.fire(LifecycleEvent::SessionOpened, &payload);
+        assert!(matches!(
+            reports.as_slice(),
+            [HookReport::HookDisabled { .. }]
+        ));
+        assert!(
+            runtime
+                .fire(LifecycleEvent::SessionOpened, &payload)
+                .is_empty()
+        );
+        assert_eq!(fs::read_to_string(&output).unwrap(), "ok\nok\n");
+        let _ = fs::remove_file(output);
+    }
+
+    #[test]
+    fn run_is_async_and_reports_completion() {
+        let directory = temp_path("async-dir");
+        fs::create_dir_all(&directory).unwrap();
+        let source = format!(
+            r#"local grove = require("grove"); grove.on("session_opened", function()
+                grove.run({directory:?}, "sleep 1; printf done > completed")
+            end)"#,
+            directory = directory.to_string_lossy()
+        );
+        let mut runtime = DaemonRuntime::load_source(&source, "async").runtime;
+        let started = Instant::now();
+        assert!(
+            runtime
+                .fire(
+                    LifecycleEvent::SessionOpened,
+                    &LifecyclePayload::Session {
+                        id: "one".into(),
+                        name: "one".into()
+                    }
+                )
+                .is_empty()
+        );
+        assert!(started.elapsed() < Duration::from_millis(500));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let report = loop {
+            if let Some(report) = runtime.drain_reports().into_iter().next() {
+                break report;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "async command did not report completion"
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert!(matches!(
+            report,
+            HookReport::CommandFinished { success: true, .. }
+        ));
+        assert_eq!(
+            fs::read_to_string(directory.join("completed")).unwrap(),
+            "done"
+        );
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn hook_helpers_copy_query_shell_and_send_terminal_input() {
+        let source = temp_path("copy-source");
+        let target = temp_path("copy-target");
+        fs::write(&source, "copied").unwrap();
+        let config = format!(
+            r#"
+            local grove = require("grove")
+            grove.on("terminal_spawned", function(terminal)
+              grove.copy({source:?}, {target:?})
+              assert(grove.exists({target:?}))
+              grove.send(terminal.terminal, grove.sh("printf shell-output"))
+            end)
+            "#,
+            source = source.to_string_lossy(),
+            target = target.to_string_lossy(),
+        );
+        let mut runtime = DaemonRuntime::load_source(&config, "helpers").runtime;
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&sent);
+        runtime.set_terminal_sender(move |terminal, bytes| {
+            captured.lock().unwrap().push((terminal, bytes.to_vec()));
+            Ok(())
+        });
+        assert!(
+            runtime
+                .fire(
+                    LifecycleEvent::TerminalSpawned,
+                    &LifecyclePayload::Terminal {
+                        terminal: 9,
+                        repo: "api".into(),
+                        branch: "main".into(),
+                        path: "/tmp/api".into(),
+                        session: "one".into(),
+                    },
+                )
+                .is_empty()
+        );
+        assert_eq!(fs::read_to_string(&target).unwrap(), "copied");
+        assert_eq!(*sent.lock().unwrap(), [(9, b"shell-output".to_vec())]);
+        let _ = fs::remove_file(source);
+        let _ = fs::remove_file(target);
     }
 }
