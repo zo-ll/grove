@@ -211,8 +211,8 @@ Six. Everything else is a palette command.
 Three panes, each hideable, at least one always visible.
 
 **REPOS** — the session's member repos. Dot shows worktree presence and dirtiness;
-trailing count is the number of worktrees grove can see in that repo. A member with
-zero worktrees shows `·`.
+trailing count is the number of branched worktrees grove can see in that repo, the
+clone excluded. A member with zero worktrees shows `·`.
 
 **WORKTREES** — every worktree of the selected repo, regardless of owner, plus the
 clone. Columns: ownership glyph · branch · `↑ahead` · `↓behind` · age. A stale-refs

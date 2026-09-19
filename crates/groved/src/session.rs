@@ -145,6 +145,9 @@ pub struct SessionOrchestrator {
     /// pane is currently showing: bounded memory beats a daemon-lifetime map
     /// of paths for repos the pane may never show again.
     known_sizes: HashMap<PathBuf, u64>,
+    /// Checkouts whose size walk failed. Their rows stay at 0 and are marked
+    /// stale rather than presenting an unmeasured checkout as measured.
+    failed_sizes: HashSet<PathBuf>,
 }
 
 impl SessionOrchestrator {
@@ -196,6 +199,7 @@ impl SessionOrchestrator {
             unknown_overrides,
             pending_sizes: HashMap::new(),
             known_sizes: HashMap::new(),
+            failed_sizes: HashSet::new(),
         }
     }
 
@@ -365,6 +369,7 @@ impl SessionOrchestrator {
     /// and is dropped.
     fn drain_sizes(&mut self) {
         let mut finished: Vec<(PathBuf, u64)> = Vec::new();
+        let mut failed: Vec<PathBuf> = Vec::new();
         self.pending_sizes
             .retain(|path, task| match task.try_result() {
                 Ok(Some(size)) => {
@@ -372,9 +377,13 @@ impl SessionOrchestrator {
                     false
                 }
                 Ok(None) => true,
-                Err(_) => false,
+                Err(_) => {
+                    failed.push(path.clone());
+                    false
+                }
             });
         self.known_sizes.extend(finished);
+        self.failed_sizes.extend(failed);
     }
 
     /// The REPOS pane's rows (SPEC §4.1), in display order.
@@ -451,16 +460,21 @@ impl SessionOrchestrator {
         for checkout in checkouts {
             paths.insert(checkout.path.clone());
             let detached = checkout.branch.is_none();
+            let mut degraded = false;
             let (ahead, behind) = match grove_git::ahead_behind(&checkout.path) {
                 Ok(Tracking::Tracked(counts)) => (counts.ahead, counts.behind),
-                // No upstream is data, not failure; an unreadable checkout
-                // degrades to zeros rather than failing the whole pane.
-                _ => (0, 0),
+                // No upstream and a gone upstream are data, not failure.
+                Ok(Tracking::NoUpstream | Tracking::UpstreamGone) => (0, 0),
+                // An unreadable checkout degrades to zeros rather than
+                // failing the whole pane — and is marked stale below.
+                Err(_) => {
+                    degraded = true;
+                    (0, 0)
+                }
             };
             let terminal = self.live_worktree_terminal(&repository.id, checkout.branch.as_deref());
             let foreground =
                 terminal.and_then(|id| self.terminals.foreground_process(id).ok().flatten());
-            let mut degraded = false;
             let dirty_files = match grove_git::dirty_file_count(&checkout.path) {
                 Ok(count) => count,
                 Err(_) => {
@@ -468,9 +482,12 @@ impl SessionOrchestrator {
                     0
                 }
             };
+            // An unborn HEAD has no tip commit, so its age is unknown —
+            // answering 0 would render "now" for a checkout that may be as
+            // old as the repo.
             let age = match grove_git::branch_age(&checkout.path) {
-                Ok(age) => age.unwrap_or_default(),
-                Err(_) => {
+                Ok(Some(age)) => age,
+                Ok(None) | Err(_) => {
                     degraded = true;
                     Duration::default()
                 }
@@ -493,14 +510,17 @@ impl SessionOrchestrator {
                 terminal,
                 foreground,
                 // A degraded row must not present its confident zeros as
-                // fresh facts, so it is marked stale too.
-                stale: freshness.stale || degraded,
+                // fresh facts, so it is marked stale too. That includes an
+                // unmeasured size: a checkout whose walk failed keeps 0 and
+                // is marked rather than shown as measured-and-empty.
+                stale: freshness.stale || degraded || self.failed_sizes.contains(&checkout.path),
             });
         }
         // The size cache is scoped to the repo the pane is showing: switching
         // repos re-measures, and removed checkouts do not linger.
         self.pending_sizes.retain(|path, _| paths.contains(path));
         self.known_sizes.retain(|path, _| paths.contains(path));
+        self.failed_sizes.retain(|path| paths.contains(path));
         rows.sort_by(|a, b| a.worktree.branch.cmp(&b.worktree.branch));
         Ok(rows)
     }
@@ -534,7 +554,14 @@ impl SessionOrchestrator {
         // The scan changed the population an override can apply to, so the
         // unknown set is recomputed: a rescan is a deliberate re-sync, and its
         // report is fresh even when a name was reported before the scan.
-        let known: HashSet<&str> = self.repositories.keys().map(|id| id.0.as_str()).collect();
+        // Overrides apply by display name — the same key every override
+        // lookup uses — so the check is against names, not repo ids: a nested
+        // repo's id ("gamma/nested") differs from its name ("nested").
+        let known: HashSet<&str> = self
+            .repositories
+            .values()
+            .map(|repository| repository.name.as_str())
+            .collect();
         let mut names: Vec<String> = self
             .runtime
             .repo_overrides()
@@ -1205,7 +1232,8 @@ mod tests {
     use std::env;
     use std::fs;
     use std::process::Command;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::thread;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     struct TempDir(PathBuf);
 
@@ -1586,14 +1614,26 @@ mod tests {
         let other = &rows[2];
         assert_eq!(other.ownership, Ownership::Other(sid("two")));
 
-        // The next request has drained the background size walk, so this
-        // refresh carries the measured size.
-        let events = daemon.handle_request(Request::ListWorktrees(RepoId("repo-a".into())));
-        let Some(Event::Worktrees { rows, .. }) = events.into_iter().next() else {
-            panic!("expected Worktrees")
+        // The background size walk answers on a later request; the handoff
+        // completes within a deadline rather than assuming one refresh
+        // suffices, since the walk runs at its own pace.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let size = loop {
+            let events = daemon.handle_request(Request::ListWorktrees(RepoId("repo-a".into())));
+            let Some(Event::Worktrees { rows, .. }) = events.into_iter().next() else {
+                panic!("expected Worktrees")
+            };
+            assert_eq!(rows[0].ownership, Ownership::Ours);
+            if rows[0].size > 0 {
+                break rows[0].size;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the background size walk never answered"
+            );
+            thread::sleep(Duration::from_millis(10));
         };
-        assert!(rows[0].size > 0, "the size walk answered between requests");
-        assert_eq!(rows[0].ownership, Ownership::Ours);
+        assert!(size > 0);
 
         // A repo that was never fetched has no FETCH_HEAD, and unknown refs
         // are stale exactly as the fetch policy judges them.
@@ -1620,7 +1660,11 @@ mod tests {
         let mut store = Store::load_at(&temp.0.join("state"), &temp.0, "");
         store.create(sid("one"), "one".to_string()).unwrap();
         let runtime = DaemonRuntime::load_source(
-            "local grove = require('grove'); grove.setup({ ignore = { 'vendor/' } })",
+            "local grove = require('grove')\n\
+             grove.setup({ ignore = { 'vendor/' } })\n\
+             -- Nested below gamma: its id is 'gamma/nested', its name is 'nested'.\n\
+             grove.repo('nested', { base = 'origin/main' })\n\
+             grove.repo('ghost', { base = 'origin/main' })\n",
             "scan-config",
         )
         .runtime;
@@ -1641,7 +1685,12 @@ mod tests {
         );
 
         let events = daemon.handle_request(Request::ListRepos);
-        let Some(Event::Repos(rows)) = events.into_iter().next() else {
+        // The config already carries overrides, so the response leads with
+        // their report; find the rows among the events.
+        let Some(Event::Repos(rows)) = events
+            .into_iter()
+            .find(|event| matches!(event, Event::Repos(_)))
+        else {
             panic!("expected Repos")
         };
         assert_eq!(
@@ -1667,7 +1716,10 @@ mod tests {
         assert!(ids.contains(&"gamma/nested"));
 
         let events = daemon.handle_request(Request::Scan);
-        let Some(Event::Repos(second)) = events.into_iter().next() else {
+        let Some(Event::Repos(second)) = events
+            .into_iter()
+            .find(|event| matches!(event, Event::Repos(_)))
+        else {
             panic!("expected Repos")
         };
         assert_eq!(

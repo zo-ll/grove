@@ -173,10 +173,11 @@ pub struct SessionRow {
 
 /// A repo as the REPOS pane renders it (SPEC §4.1).
 ///
-/// `worktrees` counts every worktree the daemon can see in this repo, not only
-/// the session's — the pane shows a count beside each member, and a member with
-/// zero is a normal state meaning "this task touches this repo, I haven't
-/// branched yet".
+/// `worktrees` counts the branched checkouts the daemon can see in this repo,
+/// not only the session's, and never the clone — the clone is every repo's
+/// baseline, listed on the WORKTREES pane but not branched work, so a member
+/// with zero is a reachable normal state meaning "this task touches this
+/// repo, I haven't branched yet".
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoRow {
     pub repo: RepoId,
