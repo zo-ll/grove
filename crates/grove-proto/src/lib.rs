@@ -65,8 +65,7 @@
 //! protocol version bump rather than a compatible change.
 
 use std::io::{self, Read, Write};
-
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use grove_domain::{Ownership, RepoId, SessionId, SessionState};
 use serde::{Deserialize, Serialize};
@@ -654,6 +653,33 @@ pub fn read_frame<R: Read, T: for<'de> Deserialize<'de>>(r: &mut R) -> Result<T,
     serde_json::from_slice(&body).map_err(|e| FrameError::Malformed(e.to_string()))
 }
 
+/// Where a workspace's daemon listens.
+///
+/// Both binaries derive this, so it lives with the protocol rather than being
+/// implemented twice. Two copies that drift by one character produce a client
+/// that connects to nothing and a daemon nobody finds, with no error saying so.
+///
+/// `$XDG_RUNTIME_DIR/grove/<hash>.sock`, per SPEC §6.
+pub fn socket_path(workspace: &Path) -> PathBuf {
+    let dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    dir.join("grove")
+        .join(format!("{}.sock", workspace_hash(workspace)))
+}
+
+/// FNV-1a over the canonicalised path. Stable across runs and platforms, which
+/// is what matters: two invocations in one workspace must agree.
+pub fn workspace_hash(path: &Path) -> String {
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in canonical.as_os_str().as_encoded_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
 /// Outcome of the opening handshake.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Handshake {
@@ -1136,6 +1162,17 @@ mod tests {
             Err(FrameError::Io(e)) => assert_eq!(e.kind(), io::ErrorKind::UnexpectedEof),
             other => panic!("expected Io(UnexpectedEof), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn the_socket_path_is_stable_and_workspace_specific() {
+        // Both binaries derive it independently at runtime; if it were not
+        // stable they would meet only by luck.
+        let a = Path::new("/tmp");
+        let b = Path::new("/usr");
+        assert_eq!(socket_path(a), socket_path(a));
+        assert_ne!(socket_path(a), socket_path(b));
+        assert!(socket_path(a).to_string_lossy().ends_with(".sock"));
     }
 
     #[test]
