@@ -567,6 +567,7 @@ name = "grove-lua"
 version = "0.1.0"
 dependencies = [
  "mlua",
+ "nix",
 ]
 
 [[package]]

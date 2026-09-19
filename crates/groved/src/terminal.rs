@@ -12,6 +12,9 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use thiserror::Error;
 
+type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
+type WriterMap = Arc<Mutex<HashMap<TerminalId, SharedWriter>>>;
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum TerminalKey {
     Worktree(PathBuf),
@@ -33,6 +36,28 @@ pub struct TerminalSnapshot {
 pub struct Attachment {
     pub snapshot: TerminalSnapshot,
     pub output: mpsc::Receiver<Vec<u8>>,
+}
+
+/// Cloneable terminal input capability for Lua helpers.
+#[derive(Clone)]
+pub struct TerminalInputHandle {
+    writers: WriterMap,
+}
+
+impl TerminalInputHandle {
+    pub fn send(&self, id: TerminalId, bytes: &[u8]) -> Result<(), TerminalError> {
+        let writer = self
+            .writers
+            .lock()
+            .map_err(|_| TerminalError::Poisoned)?
+            .get(&id)
+            .cloned()
+            .ok_or(TerminalError::Missing(id))?;
+        let mut writer = writer.lock().map_err(|_| TerminalError::Poisoned)?;
+        writer.write_all(bytes)?;
+        writer.flush()?;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -71,7 +96,6 @@ pub enum TerminalError {
 struct TerminalProcess {
     key: TerminalKey,
     master: Box<dyn MasterPty + Send>,
-    writer: Mutex<Box<dyn Write + Send>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     parser: Arc<Mutex<vt100::Parser>>,
     subscribers: Arc<Mutex<Vec<mpsc::SyncSender<Vec<u8>>>>>,
@@ -88,10 +112,14 @@ pub struct TerminalManager {
     shell: PathBuf,
     scratch_cwd: PathBuf,
     scrollback: usize,
+    exit_sender: mpsc::Sender<TerminalId>,
+    exits: mpsc::Receiver<TerminalId>,
+    writers: WriterMap,
 }
 
 impl TerminalManager {
     pub fn new(shell: PathBuf, scratch_cwd: PathBuf, scrollback: usize) -> Self {
+        let (exit_sender, exits) = mpsc::channel();
         Self {
             terminals: HashMap::new(),
             keys: HashMap::new(),
@@ -99,6 +127,9 @@ impl TerminalManager {
             shell,
             scratch_cwd,
             scrollback,
+            exit_sender,
+            exits,
+            writers: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -135,6 +166,10 @@ impl TerminalManager {
             }
             self.keys.remove(&key);
             self.terminals.remove(&existing);
+            self.writers
+                .lock()
+                .map_err(|_| TerminalError::Poisoned)?
+                .remove(&existing);
         }
         let size = PtySize {
             rows,
@@ -150,7 +185,7 @@ impl TerminalManager {
         let process_id = child.process_id();
         let killer = child.clone_killer();
         let mut reader = pair.master.try_clone_reader().map_err(pty_error)?;
-        let writer = pair.master.take_writer().map_err(pty_error)?;
+        let writer = Arc::new(Mutex::new(pair.master.take_writer().map_err(pty_error)?));
         let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, self.scrollback)));
         let subscribers = Arc::new(Mutex::new(Vec::<mpsc::SyncSender<Vec<u8>>>::new()));
         let alive = Arc::new(AtomicBool::new(true));
@@ -181,21 +216,26 @@ impl TerminalManager {
             }
             reader_alive.store(false, Ordering::Release);
         });
+        let id = TerminalId(self.next_id.fetch_add(1, Ordering::Relaxed));
         let wait_alive = Arc::clone(&alive);
+        let exit_sender = self.exit_sender.clone();
         thread::spawn(move || {
             let mut child = child;
             let _ = child.wait();
             wait_alive.store(false, Ordering::Release);
+            let _ = exit_sender.send(id);
         });
 
-        let id = TerminalId(self.next_id.fetch_add(1, Ordering::Relaxed));
         self.keys.insert(key.clone(), id);
+        self.writers
+            .lock()
+            .map_err(|_| TerminalError::Poisoned)?
+            .insert(id, Arc::clone(&writer));
         self.terminals.insert(
             id,
             TerminalProcess {
                 key,
                 master: pair.master,
-                writer: Mutex::new(writer),
                 killer: Mutex::new(killer),
                 parser,
                 subscribers,
@@ -209,14 +249,14 @@ impl TerminalManager {
     }
 
     pub fn input(&self, id: TerminalId, bytes: &[u8]) -> Result<(), TerminalError> {
-        let terminal = self.terminal(id)?;
-        let mut writer = terminal
-            .writer
-            .lock()
-            .map_err(|_| TerminalError::Poisoned)?;
-        writer.write_all(bytes)?;
-        writer.flush()?;
-        Ok(())
+        self.terminal(id)?;
+        self.input_handle().send(id, bytes)
+    }
+
+    pub fn input_handle(&self) -> TerminalInputHandle {
+        TerminalInputHandle {
+            writers: Arc::clone(&self.writers),
+        }
     }
 
     pub fn resize(&mut self, id: TerminalId, rows: u16, cols: u16) -> Result<(), TerminalError> {
@@ -354,11 +394,20 @@ impl TerminalManager {
             .remove(&id)
             .ok_or(TerminalError::Missing(id))?;
         self.keys.remove(&terminal.key);
+        self.writers
+            .lock()
+            .map_err(|_| TerminalError::Poisoned)?
+            .remove(&id);
         Ok(())
     }
 
     pub fn is_alive(&self, id: TerminalId) -> Result<bool, TerminalError> {
         Ok(self.terminal(id)?.alive.load(Ordering::Acquire))
+    }
+
+    /// Returns process exits observed since the previous drain without waiting.
+    pub fn drain_exited(&self) -> Vec<TerminalId> {
+        self.exits.try_iter().collect()
     }
 
     fn terminal(&self, id: TerminalId) -> Result<&TerminalProcess, TerminalError> {
