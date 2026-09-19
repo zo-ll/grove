@@ -673,6 +673,15 @@ impl SessionOrchestrator {
                 }
             }
         }
+        // The set exists only to fire each exit once. An id whose terminal is no
+        // longer live can never be drained again, so keeping it forever grows
+        // the daemon's memory for its whole lifetime with nothing to show for
+        // it — a daemon is expected to outlive many terminals.
+        self.notified_exits.retain(|id| {
+            self.live
+                .values()
+                .any(|terminals| terminals.iter().any(|terminal| terminal.id == *id))
+        });
     }
 
     fn fire_session(&mut self, event: LifecycleEvent, session: &SessionId) {

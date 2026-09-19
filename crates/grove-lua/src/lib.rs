@@ -4,13 +4,14 @@ use mlua::{Function, Lua, MultiValue, RegistryKey, Table, Value};
 use std::{
     fmt, fs,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
         mpsc,
     },
     thread,
+    time::{Duration, Instant},
 };
 
 const DEFAULT_ACCENT: &str = "#fab387";
@@ -365,6 +366,15 @@ pub enum LifecyclePayload {
         name: String,
     },
 }
+
+/// Most `grove.run` jobs that may be in flight at once.
+///
+/// A hook is user code inside the daemon; without a cap, one loop exhausts the
+/// daemon's threads, processes and file descriptors for everything else.
+pub const MAX_CONCURRENT_JOBS: u64 = 16;
+
+/// How long `grove.sh` may block the daemon before its command is killed.
+pub const SH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A contained hook error or the eventual result of an asynchronous command.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -750,12 +760,26 @@ fn install_daemon_module(
     )?;
 
     let next_job = Arc::new(AtomicU64::new(1));
+    // A hook is user code running inside the daemon, so an unbounded spawn is a
+    // way to take the daemon down by accident: `while true do grove.run(..) end`
+    // costs a thread, a /bin/sh child and two pipe descriptors per iteration.
+    // Refusing past the cap keeps a runaway hook local to itself.
+    let in_flight = Arc::new(AtomicU64::new(0));
     module.set(
         "run",
         lua.create_function(move |_, (cwd, command): (String, String)| {
+            if in_flight.load(Ordering::SeqCst) >= MAX_CONCURRENT_JOBS {
+                return Err(mlua::Error::runtime(format!(
+                    "grove.run: {MAX_CONCURRENT_JOBS} jobs already running; \
+                     this one was refused rather than exhausting the daemon"
+                )));
+            }
+            in_flight.fetch_add(1, Ordering::SeqCst);
+
             let job = next_job.fetch_add(1, Ordering::Relaxed);
             let reports = reports.clone();
             let reported_command = command.clone();
+            let running = Arc::clone(&in_flight);
             thread::spawn(move || {
                 let result = Command::new("/bin/sh")
                     .args(["-lc", &command])
@@ -772,6 +796,9 @@ fn install_daemon_module(
                     }
                     Err(error) => (false, error.to_string()),
                 };
+                // Released whatever happened, so a failing command cannot leak
+                // a slot and slowly wedge the cap shut.
+                running.fetch_sub(1, Ordering::SeqCst);
                 let _ = reports.send(HookReport::CommandFinished {
                     job,
                     command: reported_command,
@@ -785,10 +812,35 @@ fn install_daemon_module(
     module.set(
         "sh",
         lua.create_function(|_, command: String| {
-            let output = Command::new("/bin/sh")
+            // Hooks fire while the daemon holds its service lock, so this blocks
+            // every other request for the command's duration. That is acceptable
+            // for reading a value and disastrous for anything slow, hence the
+            // bound: a hook that hangs stops itself rather than the daemon.
+            let mut child = Command::new("/bin/sh")
                 .args(["-lc", &command])
-                .output()
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
                 .map_err(mlua::Error::external)?;
+
+            let deadline = Instant::now() + SH_TIMEOUT;
+            loop {
+                match child.try_wait().map_err(mlua::Error::external)? {
+                    Some(_) => break,
+                    None if Instant::now() >= deadline => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(mlua::Error::runtime(format!(
+                            "grove.sh: {command:?} exceeded {}s and was killed; \
+                             grove.sh blocks the daemon, so use grove.run for slow commands",
+                            SH_TIMEOUT.as_secs()
+                        )));
+                    }
+                    None => thread::sleep(Duration::from_millis(10)),
+                }
+            }
+
+            let output = child.wait_with_output().map_err(mlua::Error::external)?;
             if !output.status.success() {
                 return Err(mlua::Error::runtime(
                     String::from_utf8_lossy(&output.stderr).trim().to_owned(),
@@ -1243,6 +1295,71 @@ mod tests {
         );
         assert_eq!(fs::read_to_string(&output).unwrap(), "ok\nok\n");
         let _ = fs::remove_file(output);
+    }
+
+    #[test]
+    fn run_refuses_past_the_concurrency_cap_rather_than_exhausting_the_daemon() {
+        // A hook is user code inside the daemon. Without a cap, `while true do
+        // grove.run(..) end` costs a thread, a /bin/sh child and two pipe
+        // descriptors per iteration until the daemon cannot serve anything.
+        let source = format!(
+            "local grove = require('grove')\n\
+             grove.setup({{}})\n\
+             grove.on('worktree_created', function(wt)\n\
+               for _ = 1, {} do grove.run(wt.path, 'sleep 5') end\n\
+             end)\n",
+            MAX_CONCURRENT_JOBS + 8
+        );
+        let mut runtime = DaemonRuntime::load_source(&source, "cap").runtime;
+        let reports = runtime.fire(
+            LifecycleEvent::WorktreeCreated,
+            &LifecyclePayload::Worktree {
+                repo: "r".into(),
+                branch: "b".into(),
+                path: std::env::temp_dir(),
+                clone: std::env::temp_dir(),
+                session: "s".into(),
+            },
+        );
+        // The hook is disabled at the point of refusal, and the refusal says
+        // why rather than failing obscurely.
+        assert!(
+            reports.iter().any(|r| matches!(
+                r,
+                HookReport::HookDisabled { message, .. } if message.contains("already running")
+            )),
+            "expected a refusal past the cap, got {reports:?}"
+        );
+    }
+
+    #[test]
+    fn sh_is_bounded_so_a_hanging_command_cannot_freeze_the_daemon() {
+        // Hooks fire while the daemon holds its service lock, so an unbounded
+        // grove.sh blocks every other request for as long as the command runs.
+        let source = "local grove = require('grove')\n\
+                      grove.setup({})\n\
+                      grove.on('session_opened', function() grove.sh('sleep 120') end)\n";
+        let mut runtime = DaemonRuntime::load_source(source, "sh-timeout").runtime;
+        let started = Instant::now();
+        let reports = runtime.fire(
+            LifecycleEvent::SessionOpened,
+            &LifecyclePayload::Session {
+                id: "s".into(),
+                name: "s".into(),
+            },
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < SH_TIMEOUT + Duration::from_secs(5),
+            "grove.sh blocked for {elapsed:?}; the bound did not apply"
+        );
+        assert!(
+            reports.iter().any(|r| matches!(
+                r,
+                HookReport::HookDisabled { message, .. } if message.contains("exceeded")
+            )),
+            "expected a timeout report, got {reports:?}"
+        );
     }
 
     #[test]

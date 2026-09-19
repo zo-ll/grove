@@ -583,7 +583,12 @@ Hooks for one event run in the order they were registered. An error disables onl
 registration; later registrations still run for the current event. `grove.run(cwd,
 command)` starts `/bin/sh -lc command` in `cwd` and returns a job id immediately;
 completion and failure are reported by the daemon. `grove.sh(command)` runs the same
-shell synchronously and returns trimmed stdout. `grove.copy(from, to)` copies a file,
+shell synchronously and returns trimmed stdout — it **blocks the daemon** for the
+command's duration, since hooks fire while the service lock is held, so it is for
+reading a value and `grove.run` is for anything slow. It is bounded: a command
+exceeding the timeout is killed and reported rather than freezing the daemon.
+`grove.run` is likewise capped in the number of jobs it will have in flight, so a
+runaway hook exhausts itself rather than the daemon's threads and descriptors. `grove.copy(from, to)` copies a file,
 `grove.exists(path)` tests path existence, and `grove.send(terminal, bytes)` writes to
 the named live terminal.
 
