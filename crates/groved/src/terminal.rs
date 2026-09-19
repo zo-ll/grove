@@ -1,5 +1,5 @@
 use grove_domain::SessionId;
-use grove_proto::TerminalId;
+use grove_proto::{Attrs, Cell, Color as WireColor, Screen, TerminalId};
 use grove_state::{SnapshotTerminal, Store};
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::collections::HashMap;
@@ -27,6 +27,8 @@ pub struct TerminalSnapshot {
     pub cols: u16,
     pub contents: String,
     pub formatted: Vec<u8>,
+    /// The visible grid with colour and attributes, ready for the wire.
+    pub screen: Screen,
     /// Retained history, oldest first and disjoint from the visible screen.
     pub scrollback: Vec<String>,
     pub retained_scrollback_rows: usize,
@@ -145,6 +147,19 @@ impl TerminalManager {
 
     pub fn spawn_scratch(&mut self, rows: u16, cols: u16) -> Result<TerminalId, TerminalError> {
         let cwd = self.scratch_cwd.clone();
+        self.spawn(TerminalKey::Scratch, &cwd, rows, cols)
+    }
+
+    /// The scratch shell at an explicit directory, for a spawn request that
+    /// names one. Still no worktree: §4.5's scratch is one shell, wherever it
+    /// starts.
+    pub fn spawn_scratch_at(
+        &mut self,
+        cwd: impl Into<PathBuf>,
+        rows: u16,
+        cols: u16,
+    ) -> Result<TerminalId, TerminalError> {
+        let cwd = fs::canonicalize(cwd.into())?;
         self.spawn(TerminalKey::Scratch, &cwd, rows, cols)
     }
 
@@ -405,6 +420,25 @@ impl TerminalManager {
         Ok(self.terminal(id)?.alive.load(Ordering::Acquire))
     }
 
+    /// Every terminal held by id order, with its key and liveness. Dead
+    /// terminals are included until they are reaped so a caller can tell
+    /// "exited" from "never existed".
+    pub fn list(&self) -> Vec<(TerminalId, TerminalKey, bool)> {
+        let mut rows: Vec<_> = self
+            .terminals
+            .iter()
+            .map(|(id, terminal)| {
+                (
+                    *id,
+                    terminal.key.clone(),
+                    terminal.alive.load(Ordering::Acquire),
+                )
+            })
+            .collect();
+        rows.sort_by_key(|(id, _, _)| *id);
+        rows
+    }
+
     /// Returns process exits observed since the previous drain without waiting.
     pub fn drain_exited(&self) -> Vec<TerminalId> {
         self.exits.try_iter().collect()
@@ -456,14 +490,71 @@ fn snapshot_from_parser(
         consumed += count;
     }
     parser.screen_mut().set_scrollback(0);
+    let screen = wire_screen(parser, terminal.rows, terminal.cols);
     TerminalSnapshot {
         rows: terminal.rows,
         cols: terminal.cols,
         contents: parser.screen().contents(),
         formatted: parser.screen().contents_formatted(),
+        screen,
         scrollback,
         retained_scrollback_rows,
         alive: terminal.alive.load(Ordering::Acquire),
+    }
+}
+
+/// The visible grid as the wire carries it: one `Cell` per column, colour and
+/// attributes included, cursor omitted when the program hid it.
+fn wire_screen(parser: &vt100::Parser, rows: u16, cols: u16) -> Screen {
+    let screen = parser.screen();
+    let cells = (0..rows)
+        .map(|row| {
+            (0..cols)
+                .map(|col| match screen.cell(row, col) {
+                    Some(cell) => Cell {
+                        text: cell.contents().to_string(),
+                        fg: wire_color(cell.fgcolor()),
+                        bg: wire_color(cell.bgcolor()),
+                        attrs: Attrs {
+                            bold: cell.bold(),
+                            italic: cell.italic(),
+                            underline: cell.underline(),
+                            reverse: cell.inverse(),
+                            dim: cell.dim(),
+                            strikethrough: false,
+                        },
+                    },
+                    // Outside the grid means the parser still believes the
+                    // grid is smaller than we asked: report blanks rather
+                    // than lie about the shape.
+                    None => Cell {
+                        text: String::new(),
+                        fg: WireColor::Default,
+                        bg: WireColor::Default,
+                        attrs: Attrs::default(),
+                    },
+                })
+                .collect()
+        })
+        .collect();
+    let cursor = if screen.hide_cursor() {
+        None
+    } else {
+        Some(screen.cursor_position())
+    };
+    Screen {
+        rows,
+        cols,
+        cells,
+        cursor,
+    }
+}
+
+fn wire_color(color: vt100::Color) -> WireColor {
+    match color {
+        vt100::Color::Default => WireColor::Default,
+        vt100::Color::Idx(index) => WireColor::Indexed(index),
+        vt100::Color::Rgb(red, green, blue) => WireColor::Rgb(red, green, blue),
     }
 }
 

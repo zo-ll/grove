@@ -2,8 +2,8 @@
 
 use fs2::FileExt;
 use grove_proto::{
-    Event, Handshake, PROTOCOL_VERSION, Request, accept_hello, accept_welcome, read_frame,
-    write_frame,
+    Event, Handshake, PROTOCOL_VERSION, Request, TerminalId, accept_hello, accept_welcome,
+    read_frame, write_frame,
 };
 use std::env;
 use std::fs::{self, OpenOptions};
@@ -13,6 +13,8 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -263,26 +265,135 @@ fn serve_client_with(
             return Ok(());
         }
     }
-    while let Ok(request) = read_frame::<_, Request>(&mut stream) {
-        let events = if let Some(service) = &service {
+
+    // Every frame the client receives — responses and streamed terminal
+    // output alike — goes through one writer, so frames cannot interleave
+    // mid-sequence the way two threads writing one socket directly would.
+    let (outbound, outbound_rx) = mpsc::sync_channel::<Event>(256);
+    let mut writer = stream.try_clone().map_err(grove_proto::FrameError::from)?;
+    thread::spawn(move || {
+        for event in outbound_rx {
+            if write_frame(&mut writer, &event).is_err() {
+                break;
+            }
+        }
+    });
+
+    // This client's live terminal feed, if attached. At most one at a time:
+    // a pane follows one terminal, and a new attach or an explicit detach
+    // replaces or drops the old one.
+    let mut live: Option<LiveFeed> = None;
+    let handle_attach = |stream_feed: &mut Option<LiveFeed>, attach: &grove_proto::Attach| {
+        if let Some(feed) = stream_feed.take() {
+            feed.stop();
+        }
+        let response = if let Some(service) = &service {
             match service.lock() {
-                Ok(mut service) => service.handle_request(request),
-                Err(_) => vec![Event::Failed {
-                    context: "daemon state".into(),
-                    message: "session orchestrator lock was poisoned".into(),
-                }],
+                Ok(mut service) => service
+                    .attach_terminal(*attach)
+                    .map_err(|error| error.to_string()),
+                Err(_) => Err("session orchestrator lock was poisoned".into()),
             }
         } else {
-            vec![Event::Failed {
-                context: format!("{request:?}"),
-                message: "request handling is not installed yet".into(),
-            }]
+            Err("request handling is not installed yet".into())
         };
-        for event in events {
-            write_frame(&mut stream, &event)?;
+        match response {
+            Ok((events, output)) => {
+                for event in events {
+                    if outbound.send(event).is_err() {
+                        return;
+                    }
+                }
+                *stream_feed = Some(LiveFeed::spawn(attach.terminal, output, outbound.clone()));
+            }
+            Err(message) => {
+                let _ = outbound.send(Event::Failed {
+                    context: format!("attach terminal {:?}", attach.terminal),
+                    message,
+                });
+            }
+        }
+    };
+
+    while let Ok(request) = read_frame::<_, Request>(&mut stream) {
+        match &request {
+            Request::AttachTerminal(attach) => handle_attach(&mut live, attach),
+            Request::DetachTerminal(_) => {
+                // Dropping the feed ends only this client's stream: the pty
+                // keeps running, and the subscriber is cleaned up by the pty
+                // reader the next time output arrives.
+                if let Some(feed) = live.take() {
+                    feed.stop();
+                }
+            }
+            _ => {
+                let events = if let Some(service) = &service {
+                    match service.lock() {
+                        Ok(mut service) => service.handle_request(request),
+                        Err(_) => vec![Event::Failed {
+                            context: "daemon state".into(),
+                            message: "session orchestrator lock was poisoned".into(),
+                        }],
+                    }
+                } else {
+                    vec![Event::Failed {
+                        context: format!("{request:?}"),
+                        message: "request handling is not installed yet".into(),
+                    }]
+                };
+                for event in events {
+                    if outbound.send(event).is_err() {
+                        return Ok(());
+                    }
+                }
+            }
         }
     }
     Ok(())
+}
+
+/// Forwards one terminal's live output to the attached client until the feed
+/// is stopped (detach, re-attach, connection gone) or the channel closes
+/// (terminal killed or died — the client sees the stream end, which is its
+/// signal that the pane ended; the `TerminalExited` event itself is emitted
+/// once, to the killer, never once per attached client).
+struct LiveFeed {
+    stop: Arc<AtomicBool>,
+}
+
+impl LiveFeed {
+    fn spawn(
+        terminal: TerminalId,
+        output: mpsc::Receiver<Vec<u8>>,
+        outbound: mpsc::SyncSender<Event>,
+    ) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        thread::spawn(move || {
+            loop {
+                if flag.load(Ordering::Acquire) {
+                    break;
+                }
+                match output.recv_timeout(Duration::from_millis(100)) {
+                    Ok(bytes) => {
+                        if outbound
+                            .send(Event::TerminalOutput { terminal, bytes })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+        });
+        Self { stop }
+    }
+
+    fn stop(self) {
+        self.stop.store(true, Ordering::Release);
+    }
 }
 
 fn socket_error(path: &Path, source: io::Error) -> LifecycleError {
@@ -378,6 +489,119 @@ mod tests {
         .unwrap();
         let event: Event = read_frame(&mut client).unwrap();
         assert_eq!(accept_welcome(&event), Handshake::Agreed);
+        drop(client);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn attach_over_the_socket_streams_screen_then_live_output() {
+        use grove_proto::{Attach, ScrollbackRequest};
+        let temp = TempDir::new();
+        let runtime = grove_lua::DaemonRuntime::load(temp.0.join("missing.lua")).runtime;
+        let fetch = fetch::FetchPolicy::from_config(2, runtime.config()).unwrap();
+        let store = grove_state::Store::load_at(&temp.0, &temp.0, "");
+        let terminals =
+            terminal::TerminalManager::new(PathBuf::from("/bin/sh"), temp.0.clone(), 200);
+        let service = session::SessionOrchestrator::new(
+            store,
+            Vec::new(),
+            temp.0.clone(),
+            terminals,
+            fetch,
+            runtime,
+        );
+        let service = Arc::new(Mutex::new(service));
+        let (client, server) = UnixStream::pair().unwrap();
+        let worker = thread::spawn(move || serve_client_with(server, Some(service)).unwrap());
+        let mut client = client;
+        client.set_read_timeout(Some(IO_TIMEOUT)).unwrap();
+        write_frame(
+            &mut client,
+            &Request::Hello {
+                version: PROTOCOL_VERSION,
+            },
+        )
+        .unwrap();
+        let _: Event = read_frame(&mut client).unwrap();
+
+        // Spawn over the socket; the id comes back and the attach follows it.
+        write_frame(
+            &mut client,
+            &Request::SpawnTerminal(grove_proto::TerminalTarget::Scratch { cwd: None }),
+        )
+        .unwrap();
+        let Event::TerminalSpawned { terminal, .. } = read_frame(&mut client).unwrap() else {
+            panic!("expected TerminalSpawned")
+        };
+        write_frame(
+            &mut client,
+            &Request::AttachTerminal(Attach {
+                terminal,
+                scrollback: ScrollbackRequest::None,
+                rows: 24,
+                cols: 80,
+            }),
+        )
+        .unwrap();
+        // Screen first, then the terminal empty-chunk, in that order.
+        let Event::TerminalScreen { screen, .. } = read_frame(&mut client).unwrap() else {
+            panic!("screen must arrive first")
+        };
+        assert_eq!(screen.rows, 24);
+        let Event::TerminalScrollback {
+            seq, lines, done, ..
+        } = read_frame(&mut client).unwrap()
+        else {
+            panic!("expected scrollback after the screen")
+        };
+        assert_eq!((seq, lines.len(), done), (0, 0, true));
+
+        // Live output interleave: input typed after attach reaches the client
+        // as TerminalOutput, through the same writer as every other frame.
+        write_frame(
+            &mut client,
+            &Request::Input {
+                terminal,
+                bytes: b"echo socket-stream\r".to_vec(),
+            },
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(4);
+        let mut seen = false;
+        while !seen && Instant::now() < deadline {
+            if let Ok(Event::TerminalOutput { bytes, .. }) = read_frame(&mut client) {
+                seen = bytes.windows(6).any(|window| window == b"socket");
+            }
+        }
+        assert!(seen, "live output never arrived over the socket");
+
+        // The pty survives detach, and killing reports the exit exactly once.
+        write_frame(&mut client, &Request::DetachTerminal(terminal)).unwrap();
+        write_frame(
+            &mut client,
+            &Request::Input {
+                terminal,
+                bytes: b"echo still-running\r".to_vec(),
+            },
+        )
+        .unwrap();
+        write_frame(&mut client, &Request::KillTerminal(terminal)).unwrap();
+        // After the detach the feed stops, but frames already queued in the
+        // writer may still be in flight: read past any of them to the exit.
+        let event = loop {
+            match read_frame(&mut client) {
+                Ok(Event::TerminalOutput { .. }) => continue,
+                Ok(event) => break event,
+                Err(error) => panic!("no TerminalExited for the kill: {error}"),
+            }
+        };
+        let Event::TerminalExited {
+            terminal: exited, ..
+        } = event
+        else {
+            panic!("expected TerminalExited for the kill, got {event:?}")
+        };
+        assert_eq!(exited, terminal);
         drop(client);
         worker.join().unwrap();
     }
