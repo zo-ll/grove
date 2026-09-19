@@ -286,7 +286,7 @@ impl Router {
             // a prefix key, without which a program inside the terminal could
             // never receive one.
             if is_prefix(&key) {
-                return if focus.is_pty() {
+                return if pty_holds_the_keyboard(screen, focus) {
                     Routed::ToPty(key)
                 } else {
                     Routed::Ignored
@@ -316,7 +316,7 @@ impl Router {
         // say anything: `focus` is the dash's pane selection, and opening the
         // shell does not change it. Gating the shell on it stranded every key
         // in `Ignored`, which is the same mistake as M4 pointing the other way.
-        if screen.is_pty_screen() || (screen.pty_can_hold_focus() && focus.is_pty()) {
+        if pty_holds_the_keyboard(screen, focus) {
             return Routed::ToPty(key);
         }
 
@@ -342,6 +342,21 @@ impl Default for Router {
     }
 }
 
+/// Whether a pty is what the keyboard is talking to.
+///
+/// Two callers ask this — the main rule and the `^g ^g` literal escape — and
+/// they must agree. They did not: the escape asked `focus` alone, so in the
+/// scratch shell, where `focus` still holds whichever dash pane was selected,
+/// the one keystroke that exists to reach the program inside the pty was the
+/// one keystroke that could not. One definition, so the next caller cannot
+/// drift either.
+fn pty_holds_the_keyboard(screen: Screen, focus: Focus) -> bool {
+    // The scratch shell *is* a pty — there is no list on that screen to hold
+    // focus — so it takes keys whatever `focus` happens to say. An overlay, by
+    // contrast, owns the keyboard while it is open, so the dash's pane focus
+    // must not be consulted there at all.
+    screen.is_pty_screen() || (screen.pty_can_hold_focus() && focus.is_pty())
+}
 fn is_prefix(key: &KeyEvent) -> bool {
     key.code == KeyCode::Char('g') && key.modifiers.contains(KeyModifiers::CONTROL)
 }
@@ -449,6 +464,24 @@ mod tests {
         r.route(Screen::Dash, Focus::Terminal, ctrl('g'));
         assert_eq!(
             r.route(Screen::Dash, Focus::Terminal, ctrl('g')),
+            Routed::ToPty(ctrl('g'))
+        );
+    }
+
+    #[test]
+    fn a_literal_prefix_reaches_the_scratch_shell_too() {
+        // The scratch shell *is* a pty, and `focus` there is whatever the dash
+        // pane selection happened to be — so the literal-prefix escape has to
+        // ask the same question the main rule asks, not `focus` alone. Asking
+        // `focus` sent `^g ^g` to `Ignored` and left no way to type a literal
+        // `^g` into the shell.
+        let mut r = Router::new();
+        assert_eq!(
+            r.route(Screen::Shell, Focus::Worktrees, ctrl('g')),
+            Routed::PrefixPending
+        );
+        assert_eq!(
+            r.route(Screen::Shell, Focus::Worktrees, ctrl('g')),
             Routed::ToPty(ctrl('g'))
         );
     }
