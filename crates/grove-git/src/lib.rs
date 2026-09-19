@@ -23,6 +23,7 @@ use std::process::{Command, Output};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
+use std::time::{Duration, SystemTime};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -45,6 +46,8 @@ pub enum Error {
         path: PathBuf,
         message: String,
     },
+    #[error("could not read ref timestamp at {path}: {source}")]
+    RefTimestamp { path: PathBuf, source: io::Error },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -564,6 +567,8 @@ pub fn fetch_prune(repo: &Path) -> Result<(), WriteError> {
         .arg("-C")
         .arg(repo)
         .args(["fetch", "--prune"])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GCM_INTERACTIVE", "Never")
         .output()
         .map_err(|err| command_spawn_failure(WriteOperation::FetchPrune, repo, err))?;
     if output.status.success() {
@@ -575,6 +580,35 @@ pub fn fetch_prune(repo: &Path) -> Result<(), WriteError> {
             message: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
         })
     }
+}
+
+/// Age of the refs written by the most recent successful fetch. `None` means
+/// this repository has never fetched (or Git has no FETCH_HEAD for it).
+pub fn ref_age(repo: &Path) -> Result<Option<Duration>, Error> {
+    let bytes = git_success(
+        repo,
+        "fetch head path",
+        &["rev-parse", "--git-path", "FETCH_HEAD"],
+    )?;
+    let value = text_output("fetch head path", repo, &bytes)?;
+    let path = PathBuf::from(value);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        repo.join(path)
+    };
+    let modified = match fs::metadata(&path) {
+        Ok(metadata) => metadata
+            .modified()
+            .map_err(|source| Error::RefTimestamp { path, source })?,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(Error::RefTimestamp { path, source }),
+    };
+    Ok(Some(
+        SystemTime::now()
+            .duration_since(modified)
+            .unwrap_or_default(),
+    ))
 }
 
 fn command_spawn_failure(operation: WriteOperation, repo: &Path, error: io::Error) -> WriteError {
@@ -1029,6 +1063,14 @@ mod tests {
         assert!(clone.join(".git/refs/remotes/origin/obsolete").exists());
         fetch_prune(&clone).unwrap();
         assert!(!clone.join(".git/refs/remotes/origin/obsolete").exists());
+        assert!(ref_age(&clone).unwrap().unwrap() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn ref_age_is_unknown_before_the_first_fetch() {
+        let temp = TempDir::new("ref-age");
+        repo(&temp.0);
+        assert_eq!(ref_age(&temp.0).unwrap(), None);
     }
 
     #[test]

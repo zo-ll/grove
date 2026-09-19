@@ -17,6 +17,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
+pub mod fetch;
 pub mod prune;
 pub mod terminal;
 
@@ -314,6 +315,14 @@ mod tests {
         let path = socket_path_at(&temp.0, Path::new("/workspace"));
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         drop(UnixListener::bind(&path).unwrap());
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while UnixStream::connect(&path).is_ok() {
+            assert!(
+                Instant::now() < deadline,
+                "closed listener stayed connectable"
+            );
+            thread::yield_now();
+        }
         let outcome = DaemonSocket::bind_at(&temp.0, Path::new("/workspace")).unwrap();
         let BindOutcome::Owner(owner) = outcome else {
             panic!("stale socket was not replaced")
