@@ -12,4 +12,6 @@ workspace = true
 [dependencies]
 grove-domain = { workspace = true }
 grove-proto = { workspace = true }
+ratatui = "0.30"
+signal-hook = "0.3"
 grove-lua = { workspace = true }

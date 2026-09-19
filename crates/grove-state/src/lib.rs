@@ -214,12 +214,11 @@ impl Store {
 
     pub fn open(&mut self, id: &SessionId) -> Result<(), Error> {
         self.session(id)?;
-        if let Some(previous) = self.state.open.take() {
-            if previous != *id {
-                if let Ok(session) = self.session_mut(&previous) {
-                    session.state = SessionState::Detached;
-                }
-            }
+        if let Some(previous) = self.state.open.take()
+            && previous != *id
+            && let Ok(session) = self.session_mut(&previous)
+        {
+            session.state = SessionState::Detached;
         }
         self.session_mut(id)?.state = SessionState::Attached;
         self.state.open = Some(id.clone());

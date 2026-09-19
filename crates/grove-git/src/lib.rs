@@ -541,13 +541,13 @@ pub fn remove_worktree(
             path: path.to_owned(),
         });
     }
-    if !options.force_busy {
-        if let Some(process) = &options.foreground_process {
-            return Err(WriteError::BusyWorktree {
-                path: path.to_owned(),
-                process: process.clone(),
-            });
-        }
+    if !options.force_busy
+        && let Some(process) = &options.foreground_process
+    {
+        return Err(WriteError::BusyWorktree {
+            path: path.to_owned(),
+            process: process.clone(),
+        });
     }
     if is_dirty(path)? && !options.force_dirty {
         return Err(WriteError::DirtyWorktree {
