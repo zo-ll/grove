@@ -156,6 +156,7 @@ dependencies = [
  "grove-domain",
  "serde",
  "serde_json",
+ "thiserror",
 ]
 
 [[package]]
