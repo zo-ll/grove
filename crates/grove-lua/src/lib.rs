@@ -3,6 +3,8 @@
 use mlua::{Function, Lua, MultiValue, RegistryKey, Table, Value};
 use std::{
     fmt, fs,
+    io::Read,
+    os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
@@ -372,6 +374,13 @@ pub enum LifecyclePayload {
 /// A hook is user code inside the daemon; without a cap, one loop exhausts the
 /// daemon's threads, processes and file descriptors for everything else.
 pub const MAX_CONCURRENT_JOBS: u64 = 16;
+
+/// How long to keep draining output after the shell itself has exited.
+///
+/// A backgrounded grandchild can hold the pipe open indefinitely; the shell's
+/// own output is already flushed by then, so this only needs to be long enough
+/// to collect it.
+pub const SH_DRAIN: Duration = Duration::from_millis(200);
 
 /// How long `grove.sh` may block the daemon before its command is killed.
 pub const SH_TIMEOUT: Duration = Duration::from_secs(10);
@@ -813,40 +822,93 @@ fn install_daemon_module(
         "sh",
         lua.create_function(|_, command: String| {
             // Hooks fire while the daemon holds its service lock, so this blocks
-            // every other request for the command's duration. That is acceptable
-            // for reading a value and disastrous for anything slow, hence the
-            // bound: a hook that hangs stops itself rather than the daemon.
+            // every other request for the command's duration. Acceptable for
+            // reading a value, disastrous for anything slow — hence the bound.
+            //
+            // Bounding the *shell* is not enough. A backgrounded grandchild
+            // (`grove.sh("npm run dev &")`) inherits the pipe's write end, so
+            // the shell exits in milliseconds and reading stdout to EOF then
+            // blocks until the grandchild does. An earlier version used
+            // `wait_with_output` and froze the daemon for the grandchild's
+            // lifetime — the very freeze the timeout was added to prevent,
+            // reached by a different door.
+            //
+            // So: its own process group, output drained on threads that cannot
+            // hold us, and on timeout the whole group is signalled rather than
+            // just the shell.
             let mut child = Command::new("/bin/sh")
                 .args(["-lc", &command])
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
+                .process_group(0)
                 .spawn()
                 .map_err(mlua::Error::external)?;
 
+            let pgid = child.id();
+            let mut out = child.stdout.take();
+            let mut err = child.stderr.take();
+            let stdout = thread::spawn(move || {
+                let mut buf = Vec::new();
+                if let Some(pipe) = out.as_mut() {
+                    let _ = pipe.read_to_end(&mut buf);
+                }
+                buf
+            });
+            let stderr = thread::spawn(move || {
+                let mut buf = Vec::new();
+                if let Some(pipe) = err.as_mut() {
+                    let _ = pipe.read_to_end(&mut buf);
+                }
+                buf
+            });
+
             let deadline = Instant::now() + SH_TIMEOUT;
-            loop {
+            let mut exited_at: Option<Instant> = None;
+            let status = loop {
                 match child.try_wait().map_err(mlua::Error::external)? {
-                    Some(_) => break,
-                    None if Instant::now() >= deadline => {
+                    Some(status) if stdout.is_finished() && stderr.is_finished() => break status,
+                    // The shell is gone but a pipe is still held, so something
+                    // it spawned outlives it. Its own output has long since
+                    // flushed; waiting the full timeout for a background job
+                    // that may run for hours is the freeze in slow motion.
+                    // Give the readers a moment, then close the pipes by
+                    // signalling the group and take what arrived.
+                    Some(status) if exited_at.is_some_and(|at| at.elapsed() >= SH_DRAIN) => {
+                        let _ = Command::new("/bin/kill")
+                            .args(["-TERM", &format!("-{pgid}")])
+                            .status();
+                        break status;
+                    }
+                    Some(_) => {
+                        exited_at.get_or_insert_with(Instant::now);
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    _ if Instant::now() >= deadline => {
+                        // Signal the group: killing only the shell leaves its
+                        // children running and still holding the pipes.
+                        let _ = Command::new("/bin/kill")
+                            .args(["-TERM", &format!("-{pgid}")])
+                            .status();
                         let _ = child.kill();
                         let _ = child.wait();
                         return Err(mlua::Error::runtime(format!(
-                            "grove.sh: {command:?} exceeded {}s and was killed; \
+                            "grove.sh: {command:?} exceeded {}s and its process group was killed; \
                              grove.sh blocks the daemon, so use grove.run for slow commands",
                             SH_TIMEOUT.as_secs()
                         )));
                     }
                     None => thread::sleep(Duration::from_millis(10)),
                 }
-            }
+            };
 
-            let output = child.wait_with_output().map_err(mlua::Error::external)?;
-            if !output.status.success() {
+            let out = stdout.join().unwrap_or_default();
+            let err = stderr.join().unwrap_or_default();
+            if !status.success() {
                 return Err(mlua::Error::runtime(
-                    String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+                    String::from_utf8_lossy(&err).trim().to_owned(),
                 ));
             }
-            Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+            Ok(String::from_utf8_lossy(&out).trim().to_owned())
         })?,
     )?;
     module.set(
@@ -1329,6 +1391,60 @@ mod tests {
                 HookReport::HookDisabled { message, .. } if message.contains("already running")
             )),
             "expected a refusal past the cap, got {reports:?}"
+        );
+    }
+
+    #[test]
+    fn sh_still_returns_normal_output_promptly() {
+        // The drain window must not cost a fast command its result.
+        let source = "local grove = require('grove')\n\
+                      grove.setup({})\n\
+                      grove.on('session_opened', function()\n\
+                        local v = grove.sh('printf hello')\n\
+                        if v ~= 'hello' then error('got: ' .. tostring(v)) end\n\
+                      end)\n";
+        let mut runtime = DaemonRuntime::load_source(source, "sh-ok").runtime;
+        let started = Instant::now();
+        let reports = runtime.fire(
+            LifecycleEvent::SessionOpened,
+            &LifecyclePayload::Session {
+                id: "s".into(),
+                name: "s".into(),
+            },
+        );
+        assert!(
+            reports.is_empty(),
+            "a working command must not report a failure: {reports:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn sh_does_not_block_on_a_backgrounded_grandchild_holding_the_pipe() {
+        // The shell exits in milliseconds; a backgrounded child inherits the
+        // pipe's write end, so reading stdout to EOF waits for *it*. Bounding
+        // only the shell left the daemon frozen for the grandchild's lifetime.
+        let source = "local grove = require('grove')\n\
+                      grove.setup({})\n\
+                      grove.on('session_opened', function() grove.sh('sleep 30 &') end)\n";
+        let mut runtime = DaemonRuntime::load_source(source, "grandchild").runtime;
+        let started = Instant::now();
+        let _ = runtime.fire(
+            LifecycleEvent::SessionOpened,
+            &LifecyclePayload::Session {
+                id: "s".into(),
+                name: "s".into(),
+            },
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < SH_TIMEOUT + Duration::from_secs(2),
+            "grove.sh blocked {elapsed:?} on a backgrounded grandchild; \
+             the shell exits at once, so anything near 30s means the pipe held us"
         );
     }
 
