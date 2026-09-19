@@ -540,7 +540,7 @@ palette the terminal has — and **degradation preserves meaning, not appearance
 distinction is not academic: the defaults are Catppuccin Mocha, whose colours are
 pastels, and the nearest 16-colour match by any distance metric for `clean`, `dirty`
 and `error` alike is plain white. Three roles that render identically satisfy "nearest"
-and destroy the encoding §4.2 depends on.
+and destroy the encoding §4.1's WORKTREES pane depends on.
 
 So at 16 colours a role's hue chooses the colour, its lightness chooses the bright
 variant, and only a colour with too little chroma to have a hue falls back to the
