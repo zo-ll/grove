@@ -51,6 +51,15 @@ pub enum Focus {
 }
 
 impl Screen {
+    /// Whether a pty can hold focus on this screen.
+    ///
+    /// The dash's third pane is a terminal, and the scratch shell is one
+    /// outright. Every other screen is an overlay drawn over them: it owns the
+    /// keyboard while open, regardless of which dash pane had focus.
+    pub fn pty_can_hold_focus(self) -> bool {
+        matches!(self, Self::Dash | Self::Shell)
+    }
+
     /// Whether unbound printable keys are content rather than noise.
     ///
     /// Only the palette: it is a command line, so "nothing matched" is the
@@ -291,8 +300,13 @@ impl Router {
             return Routed::PrefixPending;
         }
 
-        // The rule itself: a pty takes everything not addressed to grove.
-        if focus.is_pty() {
+        // The rule itself: a pty takes everything not addressed to grove —
+        // but only where a pty is what has focus. An overlay *is* the focus
+        // while it is open, so consulting the dash's pane focus there would
+        // send every keystroke to a terminal the user cannot see. That is
+        // latent until #18 allows the screen to change, and silent when it
+        // lands.
+        if screen.pty_can_hold_focus() && focus.is_pty() {
             return Routed::ToPty(key);
         }
 
@@ -325,9 +339,31 @@ fn is_prefix(key: &KeyEvent) -> bool {
 fn lookup(screen: Screen, key: KeyEvent, prefixed: bool) -> Option<Action> {
     bindings(screen)
         .find(|bind| {
-            bind.prefixed == prefixed && bind.key == key.code && bind.modifiers == key.modifiers
+            bind.prefixed == prefixed && bind.key == key.code && modifiers_match(bind, key)
         })
         .map(|bind| bind.action)
+}
+
+/// Compare the modifiers that distinguish a binding, ignoring SHIFT on a
+/// character key.
+///
+/// A terminal that reports modifiers sends `SHIFT` alongside an uppercase
+/// character, and the shift is already expressed by the character itself.
+/// Matching exactly meant `^g X`, `^g S` and `^g ?` worked on terminals that
+/// omit the flag and were silently dead on those that send it — the kind of
+/// bug that looks like a broken keyboard.
+fn modifiers_match(bind: &Binding, key: KeyEvent) -> bool {
+    const DISTINGUISHING: KeyModifiers = KeyModifiers::CONTROL
+        .union(KeyModifiers::ALT)
+        .union(KeyModifiers::SUPER);
+    let significant = key.modifiers & DISTINGUISHING;
+    let declared = bind.modifiers & DISTINGUISHING;
+    if matches!(key.code, KeyCode::Char(_)) {
+        significant == declared
+    } else {
+        // For non-character keys SHIFT is meaningful: shift-tab is not tab.
+        key.modifiers == bind.modifiers
+    }
 }
 
 #[cfg(test)]
@@ -466,6 +502,61 @@ mod tests {
         assert_eq!(f, Focus::Repos, "three steps must return to the start");
         assert_eq!(Focus::Repos.previous(), Focus::Terminal);
         assert_eq!(Focus::Repos.next().previous(), Focus::Repos);
+    }
+
+    #[test]
+    fn an_uppercase_binding_works_whether_or_not_the_terminal_reports_shift() {
+        // Terminals disagree about sending SHIFT with an uppercase character.
+        // Exact matching made `^g X` work on some and silently die on others.
+        let mut r = Router::new();
+        for mods in [KeyModifiers::NONE, KeyModifiers::SHIFT] {
+            r.route(Screen::Dash, Focus::Terminal, ctrl('g'));
+            assert_eq!(
+                r.route(
+                    Screen::Dash,
+                    Focus::Terminal,
+                    KeyEvent::new(KeyCode::Char('X'), mods)
+                ),
+                Routed::Act(Action::EndSession),
+                "^g X must work with modifiers {mods:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn shift_still_distinguishes_non_character_keys() {
+        // shift-tab is not tab; the SHIFT relaxation must not reach those.
+        let mut r = Router::new();
+        r.route(Screen::Dash, Focus::Terminal, ctrl('g'));
+        assert_eq!(
+            r.route(Screen::Dash, Focus::Terminal, code(KeyCode::BackTab)),
+            Routed::Act(Action::CycleFocusBack)
+        );
+    }
+
+    #[test]
+    fn an_overlay_owns_the_keyboard_even_when_a_pane_held_a_pty() {
+        // The user opens the palette from the terminal pane. If routing still
+        // consulted the dash's focus, every keystroke would vanish into a
+        // terminal they can no longer see.
+        let mut r = Router::new();
+        assert_eq!(
+            r.route(Screen::Palette, Focus::Terminal, code(KeyCode::Enter)),
+            Routed::Act(Action::Confirm)
+        );
+        assert_eq!(
+            r.route(Screen::Picker, Focus::Terminal, code(KeyCode::Esc)),
+            Routed::Act(Action::Cancel)
+        );
+        assert_eq!(
+            r.route(Screen::Palette, Focus::Terminal, key('n')),
+            Routed::Text('n')
+        );
+        // The scratch shell is a real pty, so it still takes keys.
+        assert_eq!(
+            r.route(Screen::Shell, Focus::Terminal, key('n')),
+            Routed::ToPty(key('n'))
+        );
     }
 
     #[test]

@@ -63,6 +63,12 @@ impl Guard {
         enable_raw_mode()?;
         RAW.store(true, Ordering::SeqCst);
 
+        // The guard is constructed *here*, before anything else that can fail.
+        // An earlier version set the flag and then used `?` on the next call:
+        // that returns before any guard exists, so nothing restores and the
+        // user is left in raw mode by the very code meant to prevent it.
+        let guard = Self;
+
         let mut out = io::stdout();
         execute!(
             out,
@@ -82,7 +88,7 @@ impl Guard {
         install_signal_handlers();
 
         let terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-        Ok((Self, terminal))
+        Ok((guard, terminal))
     }
 }
 
@@ -92,21 +98,25 @@ impl Drop for Guard {
     }
 }
 
-/// SIGTERM and SIGHUP unwind nothing, so neither `Drop` nor the panic hook
-/// runs. Without this, `kill` or closing the terminal emulator leaves raw mode
-/// set in whatever shell survives.
+/// Terminating signals unwind nothing, so neither `Drop` nor the panic hook
+/// runs. Without this, `kill`, `kill -INT` or closing the terminal emulator
+/// leaves raw mode set in whatever shell survives.
+///
+/// All four that terminate by default are covered. An earlier version took only
+/// SIGTERM and SIGHUP, which left the most common one — `kill -INT` — wrecking
+/// the terminal.
 ///
 /// Uses `signal-hook` rather than raw `libc`: the workspace forbids `unsafe`,
 /// and a hand-rolled handler is not worth an exception to that.
 #[cfg(unix)]
 fn install_signal_handlers() {
-    use signal_hook::consts::{SIGHUP, SIGTERM};
+    use signal_hook::consts::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
     use signal_hook::iterator::Signals;
 
     // A blocking iterator, not a polled flag: the issue requires near-zero idle
     // CPU, and a thread waking on a timer to check an atomic is exactly the
     // spin that rules out. This thread sleeps until a signal actually arrives.
-    let Ok(mut signals) = Signals::new([SIGTERM, SIGHUP]) else {
+    let Ok(mut signals) = Signals::new([SIGTERM, SIGHUP, SIGINT, SIGQUIT]) else {
         // Registration failing is not worth aborting over — Drop and the panic
         // hook still cover every exit that unwinds.
         return;
@@ -150,6 +160,22 @@ mod tests {
         restore();
         assert!(!RAW.load(Ordering::SeqCst));
     }
+}
+
+#[test]
+fn a_failure_after_entering_raw_mode_still_restores() {
+    // The guard must exist before anything that can fail, or an early `?`
+    // returns with the terminal raw and nothing left to restore it. This
+    // asserts the ordering property directly: dropping a guard clears the
+    // flag, whatever set it.
+    RAW.store(true, Ordering::SeqCst);
+    {
+        let _g = Guard;
+    }
+    assert!(
+        !RAW.load(Ordering::SeqCst),
+        "a dropped guard must restore, so constructing it early covers every later failure"
+    );
 }
 
 #[cfg(test)]
