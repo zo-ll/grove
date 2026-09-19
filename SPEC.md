@@ -535,8 +535,26 @@ grove.setup({
 })
 ```
 
-Truecolor when the terminal supports it, degrading to the nearest ANSI colour when it
-does not. Defaults are Catppuccin Mocha, matching the source design.
+Truecolor when the terminal supports it. Where it does not, the colours degrade to the
+palette the terminal has — and **degradation preserves meaning, not appearance**. The
+distinction is not academic: the defaults are Catppuccin Mocha, whose colours are
+pastels, and the nearest 16-colour match by any distance metric for `clean`, `dirty`
+and `error` alike is plain white. Three roles that render identically satisfy "nearest"
+and destroy the encoding §4.1's WORKTREES pane depends on.
+
+So at 16 colours a role's hue chooses the colour, its lightness chooses the bright
+variant, and only a colour with too little chroma to have a hue falls back to the
+greys. Where two roles still want one slot — a peach accent and a pink error are both
+honestly red — the palette is resolved as a set rather than a colour at a time: the
+status colours claim first, since `clean`, `dirty` and `error` are read as meaning, and
+a displaced role takes the other brightness of its own hue before it takes another
+hue's. **At 16 colours, no two roles configured differently may render as the same
+colour** — that is the invariant the set resolution exists to hold.
+
+At 256 colours there is room for every role to keep its own value, so each is matched
+independently, against the cube and the grey ramp both.
+
+Defaults are Catppuccin Mocha, matching the source design.
 
 `worktree_path` accepts a template string with `{repo}`, `{branch}`, `{branch_slug}`,
 `{session}`, `{clone_parent}` — or a function, see §10.2. Using `{session}` disables
