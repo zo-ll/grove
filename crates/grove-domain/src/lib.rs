@@ -91,17 +91,23 @@ pub struct Worktree {
 /// addressed the real gap, since `Ours` could be paired with the clone's path
 /// regardless.
 ///
-/// The protection sits at the trust boundary instead:
+/// The protection belongs at the trust boundary instead. Neither half exists
+/// yet — both are obligations on the issues that will implement them, not
+/// descriptions of current code:
 ///
-/// - **No `grove-proto` request carries an `Ownership`.** A client cannot
-///   assert ownership at all — it can only ask to adopt or release a worktree —
-///   so the daemon is the sole writer of this value.
-/// - **The daemon refuses to own the repository path.** It derives
-///   [`Ownership::Clone`] by comparing the worktree path with the repository
-///   path, and rejects any attempt to make that worktree session-owned.
+/// - **No `grove-proto` request may carry an `Ownership` — issue #2.** A client
+///   must be unable to assert ownership at all, only to ask that a worktree be
+///   adopted or released, leaving the daemon the sole writer of this value.
+///   SPEC §8's protocol list contains no set-ownership request, so the design
+///   is settled even though the code is not written.
+/// - **The daemon must refuse to own the repository path — issues #10–#12.** It
+///   derives [`Ownership::Clone`] by comparing the worktree path with the
+///   repository path, and must reject any attempt to make that worktree
+///   session-owned.
 ///
-/// This type is therefore plain data: it travels daemon to client for display,
-/// and never the other way.
+/// Until both land, nothing mechanical stops an `Ownership` arriving from a
+/// client. This type is plain data: it is meant to travel daemon to client for
+/// display, and never the other way.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Ownership {
     /// The open session created or adopted this worktree and may manage it fully.
