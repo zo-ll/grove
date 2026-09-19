@@ -390,8 +390,14 @@ mod tests {
         let store = grove_state::Store::load_at(&temp.0, &temp.0, "");
         let terminals =
             terminal::TerminalManager::new(PathBuf::from("/bin/sh"), temp.0.clone(), 100);
-        let service =
-            session::SessionOrchestrator::new(store, Vec::new(), terminals, fetch, runtime);
+        let service = session::SessionOrchestrator::new(
+            store,
+            Vec::new(),
+            temp.0.clone(),
+            terminals,
+            fetch,
+            runtime,
+        );
         let service = Arc::new(Mutex::new(service));
         let (client, server) = UnixStream::pair().unwrap();
         let worker = thread::spawn(move || serve_client_with(server, Some(service)).unwrap());

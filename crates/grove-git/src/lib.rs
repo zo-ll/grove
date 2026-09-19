@@ -698,6 +698,20 @@ pub fn worktree_size(path: impl Into<PathBuf>) -> SizeTask {
     }
 }
 
+/// Blocks until the walk completes, unlike [`worktree_size`]. For
+/// request-scoped callers that need one number now and cannot poll; the
+/// cancellable background form remains for everything else.
+pub fn worktree_size_now(path: impl Into<PathBuf>) -> Result<u64, io::Error> {
+    let path = path.into();
+    let cancelled = AtomicBool::new(false);
+    match directory_size(&path, &cancelled) {
+        Some(result) => result,
+        // Unreachable while the flag stays false; a zero is cheaper than a
+        // panic a request handler would have to recover from.
+        None => Ok(0),
+    }
+}
+
 fn directory_size(path: &Path, cancelled: &AtomicBool) -> Option<Result<u64, io::Error>> {
     if cancelled.load(Ordering::Relaxed) {
         return None;

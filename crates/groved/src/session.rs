@@ -1,11 +1,11 @@
 //! Session transitions that coordinate persistent state, Git and PTYs.
 
-use crate::fetch::{FetchPolicy, FetchResult, FetchStatus};
+use crate::fetch::{FetchPolicy, FetchResult, FetchStatus, RefFreshness};
 use crate::terminal::{TerminalError, TerminalManager};
 use grove_domain::{Ownership, RepoId, SessionId, SessionState};
-use grove_git::{RemoveOptions, Repository};
+use grove_git::{RemoveOptions, Repository, Tracking, Workspace};
 use grove_lua::{DaemonRuntime, HookReport, LifecycleEvent, LifecyclePayload, WorktreePathContext};
-use grove_proto::{Event, Request, SessionRow, TerminalId, WorktreeRef};
+use grove_proto::{Event, RepoRow, Request, SessionRow, TerminalId, WorktreeRef, WorktreeRow};
 use grove_state::{OwnedWorktree, Store};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -113,6 +113,8 @@ pub enum OrchestrationError {
     WorktreePath(String),
     #[error("request is outside session orchestration")]
     UnsupportedRequest,
+    #[error("workspace scan failed: {0}")]
+    Scan(String),
 }
 
 #[derive(Clone, Debug)]
@@ -125,6 +127,7 @@ struct LiveTerminal {
 pub struct SessionOrchestrator {
     store: Store,
     repositories: HashMap<RepoId, Repository>,
+    scan_root: PathBuf,
     terminals: TerminalManager,
     fetch: FetchPolicy,
     runtime: DaemonRuntime,
@@ -138,6 +141,7 @@ impl SessionOrchestrator {
     pub fn new(
         store: Store,
         repositories: Vec<Repository>,
+        scan_root: PathBuf,
         terminals: TerminalManager,
         fetch: FetchPolicy,
         runtime: DaemonRuntime,
@@ -172,6 +176,7 @@ impl SessionOrchestrator {
                 .into_iter()
                 .map(|repository| (repository.id.clone(), repository))
                 .collect(),
+            scan_root,
             terminals,
             fetch,
             runtime,
@@ -241,6 +246,15 @@ impl SessionOrchestrator {
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(vec![Event::Sessions(rows)])
             }
+            Request::ListRepos => Ok(vec![Event::Repos(self.repo_rows()?)]),
+            Request::Scan => {
+                self.scan_workspace()?;
+                Ok(vec![Event::Repos(self.repo_rows()?)])
+            }
+            Request::ListWorktrees(repo) => Ok(vec![Event::Worktrees {
+                repo: repo.clone(),
+                rows: self.worktree_rows(&repo)?,
+            }]),
             Request::SessionNew { name } => {
                 let session = next_session_id();
                 self.store.create(session.clone(), name)?;
@@ -331,6 +345,113 @@ impl SessionOrchestrator {
             }
             _ => Err(OrchestrationError::UnsupportedRequest),
         }
+    }
+
+    /// The REPOS pane's rows (SPEC §4.1), in display order.
+    fn repo_rows(&self) -> Result<Vec<RepoRow>, OrchestrationError> {
+        let open_members = self
+            .store
+            .open_session()
+            .and_then(|id| self.store.session(id).ok())
+            .map(|stored| &stored.members);
+        let mut rows = Vec::new();
+        for repository in self.repositories.values() {
+            let checkouts = grove_git::worktrees(&repository.path)?;
+            // The count and dirtiness cover every checkout grove can see,
+            // clone included: the pane reports what exists, not what is owned.
+            let dirty = checkouts
+                .iter()
+                .any(|checkout| grove_git::is_dirty(&checkout.path).unwrap_or(false));
+            let override_base = self
+                .runtime
+                .repo_override(&repository.name)
+                .and_then(|rule| rule.base.clone());
+            rows.push(RepoRow {
+                repo: repository.id.clone(),
+                name: repository.name.clone(),
+                base_branch: override_base
+                    .clone()
+                    .or_else(|| repository.base_branch.clone())
+                    .unwrap_or_default(),
+                // Provenance the pane renders: only a base that came from
+                // git's advertised default may claim "(from origin/HEAD)".
+                base_from_origin_head: override_base.is_none() && repository.base_branch.is_some(),
+                worktrees: u32::try_from(checkouts.len()).unwrap_or(u32::MAX),
+                dirty,
+                member: open_members.is_some_and(|members| members.contains(&repository.id)),
+            });
+        }
+        // HashMap order is arbitrary; display order is not, so a rescan of an
+        // unchanged workspace produces byte-identical rows.
+        rows.sort_by(|a, b| {
+            (a.name.as_str(), a.repo.0.as_str()).cmp(&(b.name.as_str(), b.repo.0.as_str()))
+        });
+        Ok(rows)
+    }
+
+    /// The WORKTREES pane's rows (SPEC §4.1): every checkout of one repo,
+    /// regardless of owner, plus the clone.
+    fn worktree_rows(&self, repo: &RepoId) -> Result<Vec<WorktreeRow>, OrchestrationError> {
+        let repository = self.repository(repo)?.clone();
+        // Staleness tracks the repo's fetch, not the branch: refs that are
+        // unreadable or too old mean ahead/behind may be wrong, exactly as the
+        // fetch policy judges them.
+        let freshness = self
+            .fetch
+            .ref_freshness(&repository)
+            .unwrap_or(RefFreshness {
+                age: None,
+                stale: true,
+            });
+        let checkouts = grove_git::worktrees(&repository.path)?;
+        let mut rows = Vec::new();
+        for checkout in checkouts {
+            let (ahead, behind) = match grove_git::ahead_behind(&checkout.path) {
+                Ok(Tracking::Tracked(counts)) => (counts.ahead, counts.behind),
+                // No upstream is data, not failure; an unreadable checkout
+                // degrades to zeros rather than failing the whole pane.
+                _ => (0, 0),
+            };
+            let terminal = self.live_worktree_terminal(&repository.id, checkout.branch.as_deref());
+            let foreground =
+                terminal.and_then(|id| self.terminals.foreground_process(id).ok().flatten());
+            rows.push(WorktreeRow {
+                worktree: WorktreeRef {
+                    repo: repository.id.clone(),
+                    branch: checkout.branch.clone().unwrap_or_else(|| DETACHED.into()),
+                },
+                ownership: self.ownership(&repository, &checkout),
+                ahead,
+                behind,
+                dirty_files: grove_git::dirty_file_count(&checkout.path).unwrap_or(0),
+                age: grove_git::ref_age(&checkout.path)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default()
+                    .as_secs(),
+                size: grove_git::worktree_size_now(&checkout.path).unwrap_or(0),
+                terminal,
+                foreground,
+                stale: freshness.stale,
+            });
+        }
+        rows.sort_by(|a, b| a.worktree.branch.cmp(&b.worktree.branch));
+        Ok(rows)
+    }
+
+    /// Re-walks the workspace with the configured `ignore` globs (§5's `scan`)
+    /// and adopts the result as the workspace's repositories.
+    fn scan_workspace(&mut self) -> Result<(), OrchestrationError> {
+        let ignores = self.runtime.config().ignore.clone();
+        let workspace = Workspace::discover(&self.scan_root, ignores)
+            .map_err(|error| OrchestrationError::Scan(error.to_string()))?;
+        self.repositories = workspace
+            .repositories()
+            .iter()
+            .cloned()
+            .map(|repository| (repository.id.clone(), repository))
+            .collect();
+        Ok(())
     }
 
     fn session_changed(&self, session: &SessionId) -> Result<Event, OrchestrationError> {
@@ -771,6 +892,17 @@ impl SessionOrchestrator {
         })
     }
 
+    /// The live terminal of a checkout, whichever session runs it.
+    fn live_worktree_terminal(&self, repo: &RepoId, branch: Option<&str>) -> Option<TerminalId> {
+        let branch = branch?;
+        self.live.values().flatten().find_map(|terminal| {
+            (terminal.worktree.repo == *repo
+                && terminal.worktree.branch == branch
+                && self.terminals.is_alive(terminal.id).unwrap_or(false))
+            .then_some(terminal.id)
+        })
+    }
+
     fn fire_observed_terminal_exits(&mut self) {
         for id in self.terminals.drain_exited() {
             if self.notified_exits.insert(id) {
@@ -892,6 +1024,9 @@ fn owned_ref(worktree: WorktreeRef) -> OwnedWorktree {
         branch: worktree.branch,
     }
 }
+
+/// What a checkout with no branch checked out is named in display rows.
+const DETACHED: &str = "(detached)";
 
 /// Whether two paths name the same directory, tolerating symlinks and
 /// case-stable mounts on whichever side exists to canonicalize.
@@ -1096,7 +1231,14 @@ mod tests {
         ];
         let terminals = TerminalManager::new(PathBuf::from("/bin/sh"), temp.0.clone(), 100);
         let fetch = FetchPolicy::new(2, Duration::from_secs(60));
-        let mut daemon = SessionOrchestrator::new(store, repositories, terminals, fetch, runtime);
+        let mut daemon = SessionOrchestrator::new(
+            store,
+            repositories,
+            temp.0.clone(),
+            terminals,
+            fetch,
+            runtime,
+        );
 
         let report = daemon
             .create_worktrees(
@@ -1140,7 +1282,8 @@ mod tests {
         store.create(sid("one"), "one".to_string()).unwrap();
         let terminals = TerminalManager::new(PathBuf::from("/bin/sh"), temp.0.clone(), 100);
         let fetch = FetchPolicy::new(2, Duration::from_secs(60));
-        let mut daemon = SessionOrchestrator::new(store, Vec::new(), terminals, fetch, runtime);
+        let mut daemon =
+            SessionOrchestrator::new(store, Vec::new(), temp.0.clone(), terminals, fetch, runtime);
 
         let events = daemon.handle_request(Request::ListSessions);
         assert!(events.iter().any(|event| matches!(
@@ -1156,6 +1299,263 @@ mod tests {
             event,
             Event::Failed { context, .. } if context == "config: repo override"
         )));
+    }
+
+    fn remote_base(path: &Path, branch: &str) {
+        // Gives discovery an advertised default branch without needing a real
+        // remote: base_branch reads refs/remotes/origin/HEAD only.
+        git(path, &["remote", "add", "origin", "nowhere"]);
+        git(
+            path,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                &format!("refs/remotes/origin/{branch}"),
+            ],
+        );
+    }
+
+    #[test]
+    fn dash_requests_serve_repos_worktrees_and_base_provenance() {
+        let temp = TempDir::new();
+        let clone_a = temp.0.join("repo-a");
+        let clone_b = temp.0.join("repo-b");
+        let feat_path = temp.0.join("feat");
+        let other_path = temp.0.join("other");
+        for repo in [&clone_a, &clone_b] {
+            fs::create_dir_all(repo).unwrap();
+            git(repo, &["init", "-q", "-b", "main"]);
+            git(repo, &["config", "user.name", "Grove Test"]);
+            git(repo, &["config", "user.email", "grove@example.test"]);
+            fs::write(repo.join("tracked"), "base\n").unwrap();
+            git(repo, &["add", "tracked"]);
+            git(repo, &["commit", "-qm", "base"]);
+            remote_base(repo, "main");
+        }
+        git(
+            &clone_a,
+            &[
+                "worktree",
+                "add",
+                "-qb",
+                "feat",
+                feat_path.to_str().unwrap(),
+            ],
+        );
+        git(
+            &clone_a,
+            &[
+                "worktree",
+                "add",
+                "-qb",
+                "other",
+                other_path.to_str().unwrap(),
+            ],
+        );
+        fs::write(feat_path.join("uncommitted"), "work\n").unwrap();
+
+        let template = temp.0.join("trees/{repo}/{branch_slug}");
+        let template = template.to_string_lossy().into_owned();
+        let mut store = Store::load_at(&temp.0.join("state"), &temp.0, &template);
+        store.create(sid("one"), "one".to_string()).unwrap();
+        store.create(sid("two"), "two".to_string()).unwrap();
+        // repo-b stays out of the session: it must never be fetched, so its
+        // rows answer the stale question from a missing FETCH_HEAD.
+        store
+            .add_member(&sid("one"), RepoId("repo-a".into()))
+            .unwrap();
+        store
+            .add_member(&sid("two"), RepoId("repo-a".into()))
+            .unwrap();
+        store
+            .adopt(
+                &sid("one"),
+                OwnedWorktree {
+                    repo: RepoId("repo-a".into()),
+                    branch: "feat".into(),
+                },
+                &feat_path,
+                &clone_a,
+            )
+            .unwrap();
+        store
+            .adopt(
+                &sid("two"),
+                OwnedWorktree {
+                    repo: RepoId("repo-a".into()),
+                    branch: "other".into(),
+                },
+                &other_path,
+                &clone_a,
+            )
+            .unwrap();
+        let runtime = DaemonRuntime::load_source(
+            &format!(
+                "local grove = require('grove')\n\
+                 grove.setup({{ worktree_path = {template:?} }})\n\
+                 grove.repo('repo-a', {{ base = 'origin/develop' }})\n",
+                template = template
+            ),
+            "dash-config",
+        )
+        .runtime;
+        let repositories = vec![
+            Repository {
+                id: RepoId("repo-a".into()),
+                name: "repo-a".into(),
+                path: clone_a.clone(),
+                base_branch: Some("origin/main".into()),
+            },
+            Repository {
+                id: RepoId("repo-b".into()),
+                name: "repo-b".into(),
+                path: clone_b.clone(),
+                base_branch: Some("origin/main".into()),
+            },
+        ];
+        let terminals = TerminalManager::new(PathBuf::from("/bin/sh"), temp.0.clone(), 100);
+        let fetch = FetchPolicy::new(2, Duration::from_secs(3600));
+        let mut daemon = SessionOrchestrator::new(
+            store,
+            repositories,
+            temp.0.clone(),
+            terminals,
+            fetch,
+            runtime,
+        );
+        daemon.open(&sid("one")).unwrap();
+
+        let events = daemon.handle_request(Request::ListRepos);
+        let Some(Event::Repos(rows)) = events.into_iter().next() else {
+            panic!("expected Repos")
+        };
+        assert_eq!(
+            rows.iter().map(|row| row.name.as_str()).collect::<Vec<_>>(),
+            ["repo-a", "repo-b"]
+        );
+        let row_a = &rows[0];
+        assert_eq!(
+            row_a.worktrees, 3,
+            "the clone counts among visible checkouts"
+        );
+        assert!(row_a.dirty, "the feat worktree has an uncommitted file");
+        assert!(row_a.member);
+        // The override supplied the base, so the pane may not claim
+        // "(from origin/HEAD)" — the provenance #53's review required.
+        assert_eq!(row_a.base_branch, "origin/develop");
+        assert!(!row_a.base_from_origin_head);
+        let row_b = &rows[1];
+        assert_eq!(row_b.worktrees, 1);
+        assert!(!row_b.dirty);
+        assert!(!row_b.member);
+        assert_eq!(row_b.base_branch, "origin/main");
+        assert!(row_b.base_from_origin_head);
+
+        let events = daemon.handle_request(Request::ListWorktrees(RepoId("repo-a".into())));
+        let Some(Event::Worktrees { repo, rows }) = events.into_iter().next() else {
+            panic!("expected Worktrees")
+        };
+        assert_eq!(repo.0, "repo-a");
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.worktree.branch.as_str())
+                .collect::<Vec<_>>(),
+            ["feat", "main", "other"]
+        );
+        let feat = &rows[0];
+        assert_eq!(feat.ownership, Ownership::Ours);
+        assert_eq!(feat.dirty_files, 1);
+        // `open` spawned the terminal of the worktree session one owns.
+        assert!(feat.terminal.is_some());
+        assert!(feat.size > 0);
+        // Open's fetch attempt wrote a FETCH_HEAD, however briefly: the repo's
+        // refs count as fresh.
+        assert!(!rows[0].stale);
+        let main = &rows[1];
+        assert_eq!(main.ownership, Ownership::Clone);
+        assert_eq!(main.terminal, None);
+        let other = &rows[2];
+        assert_eq!(other.ownership, Ownership::Other(sid("two")));
+
+        // A repo that was never fetched has no FETCH_HEAD, and unknown refs
+        // are stale exactly as the fetch policy judges them.
+        let events = daemon.handle_request(Request::ListWorktrees(RepoId("repo-b".into())));
+        let Some(Event::Worktrees { rows, .. }) = events.into_iter().next() else {
+            panic!("expected Worktrees")
+        };
+        assert!(rows[0].stale);
+        assert_eq!(
+            rows[0].ownership,
+            Ownership::Clone,
+            "repo-b has only its clone"
+        );
+    }
+
+    #[test]
+    fn scan_rewalks_the_workspace_and_is_deterministic() {
+        let temp = TempDir::new();
+        for repo in ["alpha", "vendor/hidden", "gamma/nested"] {
+            let path = temp.0.join(repo);
+            fs::create_dir_all(&path).unwrap();
+            git(&path, &["init", "-q"]);
+        }
+        let mut store = Store::load_at(&temp.0.join("state"), &temp.0, "");
+        store.create(sid("one"), "one".to_string()).unwrap();
+        let runtime = DaemonRuntime::load_source(
+            "local grove = require('grove'); grove.setup({ ignore = { 'vendor/' } })",
+            "scan-config",
+        )
+        .runtime;
+        let terminals = TerminalManager::new(PathBuf::from("/bin/sh"), temp.0.clone(), 100);
+        let fetch = FetchPolicy::new(2, Duration::from_secs(60));
+        let mut daemon = SessionOrchestrator::new(
+            store,
+            vec![Repository {
+                id: RepoId("alpha".into()),
+                name: "alpha".into(),
+                path: temp.0.join("alpha"),
+                base_branch: None,
+            }],
+            temp.0.clone(),
+            terminals,
+            fetch,
+            runtime,
+        );
+
+        let events = daemon.handle_request(Request::ListRepos);
+        let Some(Event::Repos(rows)) = events.into_iter().next() else {
+            panic!("expected Repos")
+        };
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.repo.0.as_str())
+                .collect::<Vec<_>>(),
+            ["alpha"],
+            "only the constructor's view before a scan"
+        );
+
+        fs::create_dir_all(temp.0.join("beta")).unwrap();
+        git(&temp.0.join("beta"), &["init", "-q"]);
+        let events = daemon.handle_request(Request::Scan);
+        let Some(Event::Repos(first)) = events.into_iter().next() else {
+            panic!("expected Repos")
+        };
+        let ids: Vec<_> = first.iter().map(|row| row.repo.0.as_str()).collect();
+        assert_eq!(ids, ["alpha", "beta", "gamma/nested"]);
+        // Honours ignore globs.
+        assert!(!ids.contains(&"vendor/hidden"));
+        // Nested repos are repos per SPEC §2.2; the walk prunes only the
+        // repository's .git metadata itself.
+        assert!(ids.contains(&"gamma/nested"));
+
+        let events = daemon.handle_request(Request::Scan);
+        let Some(Event::Repos(second)) = events.into_iter().next() else {
+            panic!("expected Repos")
+        };
+        assert_eq!(
+            first, second,
+            "rescanning an unchanged workspace must produce the same rows"
+        );
     }
 
     #[test]
@@ -1217,8 +1617,14 @@ mod tests {
             "ownership-config",
         )
         .runtime;
-        let mut daemon =
-            SessionOrchestrator::new(store, vec![repository.clone()], terminals, fetch, runtime);
+        let mut daemon = SessionOrchestrator::new(
+            store,
+            vec![repository.clone()],
+            temp.0.clone(),
+            terminals,
+            fetch,
+            runtime,
+        );
 
         // Ownership is derived at the trust boundary: the clone by path
         // comparison, the rest by the store's records.
@@ -1257,6 +1663,7 @@ mod tests {
         let mut daemon = SessionOrchestrator::new(
             Store::load_at(&temp.0.join("state"), &temp.0, &template),
             vec![repository],
+            temp.0.clone(),
             TerminalManager::new(PathBuf::from("/bin/sh"), temp.0.clone(), 100),
             FetchPolicy::new(2, Duration::from_secs(60)),
             runtime,
@@ -1320,8 +1727,14 @@ mod tests {
             "slug-config",
         )
         .runtime;
-        let mut daemon =
-            SessionOrchestrator::new(store, vec![repository], terminals, fetch, runtime);
+        let mut daemon = SessionOrchestrator::new(
+            store,
+            vec![repository],
+            temp.0.clone(),
+            terminals,
+            fetch,
+            runtime,
+        );
 
         // branch_slug("feat/x") and branch_slug("feat-x") are both "feat-x":
         // the second branch must not silently take the first's checkout.
@@ -1391,8 +1804,14 @@ mod tests {
             "legacy-config",
         )
         .runtime;
-        let mut daemon =
-            SessionOrchestrator::new(store, vec![repository], terminals, fetch, runtime);
+        let mut daemon = SessionOrchestrator::new(
+            store,
+            vec![repository],
+            temp.0.clone(),
+            terminals,
+            fetch,
+            runtime,
+        );
 
         let report = daemon.end_confirmed(&sid("legacy")).unwrap();
         assert!(!report.ended);
@@ -1485,8 +1904,14 @@ mod tests {
             "test-config",
         )
         .runtime;
-        let mut daemon =
-            SessionOrchestrator::new(store, vec![repository], terminals, fetch, runtime);
+        let mut daemon = SessionOrchestrator::new(
+            store,
+            vec![repository],
+            temp.0.clone(),
+            terminals,
+            fetch,
+            runtime,
+        );
 
         let opened_one = daemon.open(&sid("one")).unwrap();
         assert_eq!(opened_one.terminals.len(), 1);
