@@ -1,15 +1,16 @@
 //! Session transitions that coordinate persistent state, Git and PTYs.
 
 use crate::fetch::{FetchPolicy, FetchResult, FetchStatus, RefFreshness};
+use crate::prune::{PruneDisqualifier, PruneHistory};
 use crate::terminal::{TerminalError, TerminalKey, TerminalManager};
 use grove_domain::{Ownership, RepoId, SessionId, SessionState};
 use grove_git::{RemoveOptions, Repository, SizeTask, Tracking, Workspace};
 use grove_lua::{DaemonRuntime, HookReport, LifecycleEvent, LifecyclePayload, WorktreePathContext};
 use grove_proto::{
-    Attach, Event, RepoRow, Request, ScrollbackRequest, SessionRow, TerminalId, TerminalRow,
-    TerminalTarget, WorktreeRef, WorktreeRow,
+    Attach, Event, PruneBlocker, PruneCandidate, PruneState, RepoRow, Request, ScrollbackRequest,
+    SessionRow, TerminalId, TerminalRow, TerminalTarget, WorktreeRef, WorktreeRow,
 };
-use grove_state::{OwnedWorktree, Store};
+use grove_state::{OwnedWorktree, Store, StoredSession};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -135,6 +136,8 @@ pub enum OrchestrationError {
     UnsupportedRequest,
     #[error("workspace scan failed: {0}")]
     Scan(String),
+    #[error("prune inspection failed: {0}")]
+    Prune(String),
 }
 
 #[derive(Clone, Debug)]
@@ -291,6 +294,8 @@ impl SessionOrchestrator {
                 repo: repo.clone(),
                 rows: self.worktree_rows(&repo)?,
             }]),
+            Request::ListPruneCandidates => Ok(vec![Event::PruneCandidates(self.prune_rows()?)]),
+            Request::Prune(selection) => Ok(vec![self.prune(&selection)?]),
             Request::SpawnTerminal(target) => {
                 let id = self.spawn_terminal(&target)?;
                 Ok(vec![Event::TerminalSpawned {
@@ -760,6 +765,169 @@ impl SessionOrchestrator {
         Ok(rows)
     }
 
+    /// The branch mergedness is judged against for a repo: a repo override
+    /// decides for its repo, otherwise git's advertised default (#54).
+    fn effective_base(&self, repository: &Repository) -> Option<String> {
+        self.runtime
+            .repo_override(&repository.name)
+            .and_then(|rule| rule.base.clone())
+            .or_else(|| repository.base_branch.clone())
+    }
+
+    /// The prune picker's rows (SPEC §5): every non-clone checkout of every
+    /// repo, with the state column and the reasons it is not pre-checked.
+    fn prune_rows(&mut self) -> Result<Vec<PruneCandidate>, OrchestrationError> {
+        let sessions = self.store.sessions().to_vec();
+        let repositories: Vec<Repository> = self.repositories.values().cloned().collect();
+        let mut rows = Vec::new();
+        for repository in &repositories {
+            let batch = crate::prune::prune_candidates_against(
+                repository,
+                &sessions,
+                self.effective_base(repository).as_deref(),
+            )
+            .map_err(|error| OrchestrationError::Prune(error.to_string()))?;
+            for candidate in batch.candidates {
+                rows.push(PruneCandidate {
+                    worktree: WorktreeRef {
+                        repo: candidate.repo.clone(),
+                        branch: candidate.branch.clone().unwrap_or_default(),
+                    },
+                    state: match candidate.history {
+                        PruneHistory::Merged => PruneState::Merged,
+                        PruneHistory::UpstreamGone => PruneState::UpstreamGone,
+                        PruneHistory::Unmerged => PruneState::Neither,
+                    },
+                    // The same last-known size the worktree pane serves: the
+                    // walk runs off the request path, and a row pruned before
+                    // its walk answered reports what was known.
+                    size: self.known_size(&candidate.worktree),
+                    blockers: candidate
+                        .reasons
+                        .iter()
+                        .map(|reason| match reason {
+                            PruneDisqualifier::FetchFailed => PruneBlocker::FetchFailed,
+                            PruneDisqualifier::Unmerged => PruneBlocker::Unmerged,
+                            PruneDisqualifier::Dirty => PruneBlocker::Dirty {
+                                files: candidate.dirty_files,
+                            },
+                            PruneDisqualifier::Unpushed { commits } => {
+                                PruneBlocker::Unpushed { commits: *commits }
+                            }
+                            PruneDisqualifier::OwnedByLiveSession { session, .. } => {
+                                let name = sessions
+                                    .iter()
+                                    .find(|stored| stored.id == *session)
+                                    .map(|stored| stored.name.clone())
+                                    .unwrap_or_default();
+                                PruneBlocker::Owned {
+                                    session: session.clone(),
+                                    name,
+                                }
+                            }
+                        })
+                        .collect(),
+                });
+            }
+        }
+        rows.sort_by(|a, b| {
+            (a.worktree.repo.0.as_str(), a.worktree.branch.as_str())
+                .cmp(&(b.worktree.repo.0.as_str(), b.worktree.branch.as_str()))
+        });
+        Ok(rows)
+    }
+
+    /// Prunes the selected rows, one outcome per row (§5). The user may tick
+    /// anything except what is never theirs to tick from this screen: a
+    /// worktree a live session owns is refused here, because ending that
+    /// session is the way to release it. A row that became dirty between
+    /// listing and pruning fails on git's own dirty gate (force_dirty is
+    /// deliberately unset) and is left on disk.
+    fn prune(&mut self, selection: &[WorktreeRef]) -> Result<Event, OrchestrationError> {
+        let sessions = self.store.sessions().to_vec();
+        let mut removed = Vec::new();
+        let mut failed = Vec::new();
+        let mut reclaimed = 0_u64;
+        for want in selection {
+            match self.prune_row(want, &sessions) {
+                Ok(size) => {
+                    removed.push(want.clone());
+                    reclaimed = reclaimed.saturating_add(size);
+                }
+                Err(message) => failed.push((want.clone(), message)),
+            }
+        }
+        Ok(Event::Pruned {
+            removed,
+            failed,
+            reclaimed,
+        })
+    }
+
+    /// One row's removal: the safety facts are re-checked at prune time, not
+    /// trusted from the listing, because the picker lets the user tick unsafe
+    /// rows deliberately and the disk state may have changed since.
+    fn prune_row(&mut self, want: &WorktreeRef, sessions: &[StoredSession]) -> Result<u64, String> {
+        let owned = OwnedWorktree {
+            repo: want.repo.clone(),
+            branch: want.branch.clone(),
+        };
+        if let Some((session, state)) = crate::prune::live_owner(sessions, &owned) {
+            return Err(format!(
+                "session {session:?} ({state:?}) owns this worktree; \
+                 end that session instead"
+            ));
+        }
+        let repository = self
+            .repository(&want.repo)
+            .map_err(|error| error.to_string())?
+            .clone();
+        let checkout = self
+            .find_checkout(&repository, &want.branch)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "worktree does not exist".to_string())?;
+        // The clone is never listed as a candidate; a hand-crafted request
+        // naming it is refused rather than let near the main checkout.
+        if checkout.is_clone {
+            return Err("the repository's own checkout is never pruned".into());
+        }
+        // A checkout with a live terminal is busy: the shell keeps running
+        // after `git worktree remove` would delete its cwd.
+        let foreground = self
+            .terminals
+            .terminal_by_key(&TerminalKey::Worktree(checkout.path.clone()))
+            .and_then(|id| self.terminals.foreground_process(id).ok().flatten());
+        // Last known size: the picker listing started the walk, and any
+        // request since has drained it. A row pruned without a known size
+        // contributes 0 rather than stalling the destructive verb on a walk.
+        let size = self.known_size(&checkout.path);
+        grove_git::remove_worktree(
+            &repository.path,
+            &checkout.path,
+            &RemoveOptions {
+                force_dirty: false,
+                force_busy: false,
+                foreground_process: foreground,
+            },
+        )
+        .map_err(|error| error.to_string())?;
+        // Ownership outlives sessions in the store, including closed ones;
+        // pruning their worktree must forget the claim, or the store would
+        // name an owner for a checkout that no longer exists.
+        if let Some(session) = self.store.owner(&owned).cloned() {
+            self.store
+                .forget_owned(&session, &owned)
+                .map_err(|error| error.to_string())?;
+            self.fire_worktree(
+                LifecycleEvent::WorktreeRemoved,
+                &session,
+                &owned,
+                Some(checkout.path),
+            );
+        }
+        Ok(size)
+    }
+
     /// Re-walks the workspace with the configured `ignore` globs (§5's `scan`)
     /// and adopts the result as the workspace's repositories.
     fn scan_workspace(&mut self) -> Result<(), OrchestrationError> {
@@ -1120,13 +1288,8 @@ impl SessionOrchestrator {
                     });
                 }
                 let repository = self.repository(repo_id)?.clone();
-                // The override wins for its repo; otherwise git answers with
-                // the branch origin advertises as the default.
                 let base = self
-                    .runtime
-                    .repo_override(&repository.name)
-                    .and_then(|rule| rule.base.clone())
-                    .or_else(|| repository.base_branch.clone())
+                    .effective_base(&repository)
                     .ok_or_else(|| OrchestrationError::BaseMissing(repo_id.clone()))?;
                 let path = self.worktree_path(&repository, &stored.name, branch)?;
                 // `branch_slug` is deliberately non-injective: two branch names
@@ -2234,6 +2397,188 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert!(matches!(rows[0].target, TerminalTarget::Scratch { .. }));
         assert!(daemon.terminals().is_alive(*scratch).unwrap());
+    }
+
+    #[test]
+    fn prune_requests_serve_blockers_and_per_row_outcomes() {
+        let temp = TempDir::new();
+        let remote = temp.0.join("remote.git");
+        let clone = temp.0.join("repo-a");
+        fs::create_dir_all(&remote).unwrap();
+        git(&remote, &["init", "--bare", "-q"]);
+        fs::create_dir_all(&clone).unwrap();
+        git(&clone, &["init", "-q", "-b", "main"]);
+        git(&clone, &["config", "user.name", "Grove Test"]);
+        git(&clone, &["config", "user.email", "grove@example.test"]);
+        fs::write(clone.join("tracked"), "base\n").unwrap();
+        git(&clone, &["add", "tracked"]);
+        git(&clone, &["commit", "-qm", "base"]);
+        git(
+            &clone,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        // An advertised default without a real remote: the base_branch read.
+        git(
+            &clone,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+        git(&clone, &["push", "-qu", "origin", "main"]);
+        let done_path = temp.0.join("done");
+        let dirty_path = temp.0.join("dirty");
+        let mine_path = temp.0.join("mine");
+        for (branch, path) in [
+            ("done", &done_path),
+            ("dirty", &dirty_path),
+            ("mine", &mine_path),
+        ] {
+            git(
+                &clone,
+                &["worktree", "add", "-qb", branch, path.to_str().unwrap()],
+            );
+            git(&clone, &["push", "-qu", "origin", branch]);
+        }
+        // The row that will go dirty between listing and pruning.
+        fs::write(dirty_path.join("uncommitted"), "work\n").unwrap();
+
+        let template = temp.0.join("trees/{repo}/{branch_slug}");
+        let template = template.to_string_lossy().into_owned();
+        let mut store = Store::load_at(&temp.0.join("state"), &temp.0, &template);
+        store.create(sid("one"), "one".to_string()).unwrap();
+        store
+            .add_member(&sid("one"), RepoId("repo-a".into()))
+            .unwrap();
+        store
+            .adopt(
+                &sid("one"),
+                OwnedWorktree {
+                    repo: RepoId("repo-a".into()),
+                    branch: "mine".into(),
+                },
+                &mine_path,
+                &clone,
+            )
+            .unwrap();
+        // Live ownership: the open session owns the worktree, which is what
+        // prune refuses to take.
+        store.open(&sid("one")).unwrap();
+        let runtime = DaemonRuntime::load_source(
+            &format!(
+                "local grove = require('grove'); grove.setup({{ worktree_path = {template:?} }})",
+                template = template
+            ),
+            "prune-config",
+        )
+        .runtime;
+        let repositories = vec![Repository {
+            id: RepoId("repo-a".into()),
+            name: "repo-a".into(),
+            path: clone.clone(),
+            base_branch: Some("origin/main".into()),
+        }];
+        let terminals = TerminalManager::new(PathBuf::from("/bin/sh"), temp.0.clone(), 100);
+        let fetch = FetchPolicy::new(2, Duration::from_secs(60));
+        let mut daemon = SessionOrchestrator::new(
+            store,
+            repositories,
+            temp.0.clone(),
+            terminals,
+            fetch,
+            runtime,
+        );
+
+        let events = daemon.handle_request(Request::ListPruneCandidates);
+        let Some(Event::PruneCandidates(rows)) = events.first() else {
+            panic!("expected PruneCandidates, got {events:?}")
+        };
+        // Non-clone checkouts of the repo, in display order. Every row of a
+        // repo whose fetch succeeded can be a candidate.
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.worktree.branch.as_str())
+                .collect::<Vec<_>>(),
+            ["dirty", "done", "mine"]
+        );
+        let done = &rows[1];
+        assert_eq!(done.state, PruneState::Merged);
+        assert!(
+            done.blockers.is_empty(),
+            "merged + clean + pushed + unowned: pre-checked"
+        );
+        let dirty = &rows[0];
+        assert!(
+            dirty
+                .blockers
+                .iter()
+                .any(|blocker| matches!(blocker, PruneBlocker::Dirty { files: 1 }))
+        );
+        let mine = &rows[2];
+        assert!(mine.blockers.iter().any(|blocker| matches!(
+            blocker,
+            PruneBlocker::Owned { name, .. } if name == "one"
+        )));
+
+        // The listing started the background size walks; a later request has
+        // drained them, so the row the picker will remove carries a real size.
+        let _ = daemon.handle_request(Request::ListPruneCandidates);
+
+        let want = |branch: &str| WorktreeRef {
+            repo: RepoId("repo-a".into()),
+            branch: branch.into(),
+        };
+        let events = daemon.handle_request(Request::Prune(vec![
+            want("done"),
+            want("dirty"),
+            want("mine"),
+            want("never-existed"),
+        ]));
+        let Some(Event::Pruned {
+            removed,
+            failed,
+            reclaimed,
+        }) = events.first()
+        else {
+            panic!("expected Pruned, got {events:?}")
+        };
+        assert_eq!(*removed, vec![want("done")]);
+        assert_eq!(failed.len(), 3);
+        // The dirty row failed at prune time and is still on disk.
+        assert!(
+            failed
+                .iter()
+                .any(|(row, message)| row.branch == "dirty" && message.contains("dirty")),
+            "a row that went dirty must fail, got {failed:?}"
+        );
+        assert!(dirty_path.exists(), "the dirty row was removed");
+        // A live session's ownership is not the user's to override here.
+        assert!(
+            failed
+                .iter()
+                .any(|(row, message)| row.branch == "mine" && message.contains("owns")),
+            "a live session's row must be refused, got {failed:?}"
+        );
+        assert!(mine_path.exists());
+        assert!(
+            failed
+                .iter()
+                .any(|(row, message)| row.branch == "never-existed"
+                    && message.contains("does not exist"))
+        );
+        assert!(!done_path.exists(), "the safe row was removed");
+        assert!(
+            *reclaimed > 0,
+            "reclaimed bytes come from the drained size walk"
+        );
+        assert_eq!(
+            daemon.store().owner(&OwnedWorktree {
+                repo: RepoId("repo-a".into()),
+                branch: "done".into(),
+            }),
+            None
+        );
     }
 
     #[test]

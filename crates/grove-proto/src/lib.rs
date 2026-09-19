@@ -260,6 +260,10 @@ pub enum PruneState {
 /// invents.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PruneBlocker {
+    /// The repo fetch failed before the verdict was made, so merged/gone
+    /// cannot be trusted yet. Every row of that repo carries it until a
+    /// listing succeeds.
+    FetchFailed,
     /// Not merged into its base and its upstream still exists.
     Unmerged,
     /// The working tree has uncommitted changes.

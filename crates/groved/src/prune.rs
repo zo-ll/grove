@@ -36,6 +36,9 @@ pub struct PruneCandidate {
     pub branch: Option<String>,
     pub history: PruneHistory,
     pub reasons: Vec<PruneDisqualifier>,
+    /// Uncommitted files, for the wire's `Dirty { files }` blocker. Zero when
+    /// the row is clean; a count is stronger than the bool the rule needs.
+    pub dirty_files: u32,
 }
 
 impl PruneCandidate {
@@ -75,6 +78,20 @@ pub fn prune_candidates(
     repository: &Repository,
     sessions: &[StoredSession],
 ) -> Result<PruneBatch, PruneError> {
+    prune_candidates_against(repository, sessions, repository.base_branch.as_deref())
+}
+
+/// Candidate inspection against an explicit base branch.
+///
+/// `base` is the branch mergedness is judged against — normally the repo's
+/// discovered default, but a repo override (`grove.repo(name, { base = .. })`)
+/// decides for its repo, and pruning must judge the user's integration
+/// branch, not whatever origin advertises (#54).
+pub fn prune_candidates_against(
+    repository: &Repository,
+    sessions: &[StoredSession],
+    base: Option<&str>,
+) -> Result<PruneBatch, PruneError> {
     let worktrees =
         grove_git::worktrees(&repository.path).map_err(|source| PruneError::Worktrees {
             repo: repository.id.clone(),
@@ -98,16 +115,17 @@ pub fn prune_candidates(
     let fetch_failed = fetch_error.is_some();
     let mut candidates = Vec::new();
     for worktree in worktrees.into_iter().filter(|worktree| !worktree.is_clone) {
-        let dirty = grove_git::is_dirty(&worktree.path).map_err(|source| PruneError::Inspect {
-            worktree: worktree.path.clone(),
-            source,
-        })?;
+        let dirty_files =
+            grove_git::dirty_file_count(&worktree.path).map_err(|source| PruneError::Inspect {
+                worktree: worktree.path.clone(),
+                source,
+            })?;
         let tracking =
             grove_git::ahead_behind(&worktree.path).map_err(|source| PruneError::Inspect {
                 worktree: worktree.path.clone(),
                 source,
             })?;
-        let merged = match (&worktree.branch, &repository.base_branch) {
+        let merged = match (&worktree.branch, base) {
             (Some(branch), Some(base)) => grove_git::is_merged(&repository.path, branch, base)
                 .map_err(|source| PruneError::Inspect {
                     worktree: worktree.path.clone(),
@@ -136,13 +154,14 @@ pub fn prune_candidates(
                 },
             )
         });
-        let reasons = disqualifiers(fetch_failed, history, dirty, ahead, owner);
+        let reasons = disqualifiers(fetch_failed, history, dirty_files > 0, ahead, owner);
         candidates.push(PruneCandidate {
             repo: repository.id.clone(),
             worktree: worktree.path,
             branch: worktree.branch,
             history,
             reasons,
+            dirty_files,
         });
     }
     Ok(PruneBatch {
@@ -151,7 +170,7 @@ pub fn prune_candidates(
     })
 }
 
-fn live_owner(
+pub(crate) fn live_owner(
     sessions: &[StoredSession],
     worktree: &OwnedWorktree,
 ) -> Option<(SessionId, SessionState)> {
@@ -227,6 +246,76 @@ mod tests {
             "git {args:?}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[test]
+    fn merged_verdict_follows_the_base_passed_in() {
+        // #54: a repo override's base decides for its repo. A branch merged
+        // into develop but not into main is prunable against the override and
+        // unmerged against origin's advertised default.
+        let temp = TempDir::new();
+        let remote = temp.0.join("remote.git");
+        let clone = temp.0.join("clone");
+        let linked = temp.0.join("linked");
+        fs::create_dir_all(&remote).unwrap();
+        git(&remote, &["init", "--bare", "-q"]);
+        fs::create_dir_all(&clone).unwrap();
+        git(&clone, &["init", "-q", "-b", "main"]);
+        git(&clone, &["config", "user.name", "Grove Test"]);
+        git(&clone, &["config", "user.email", "grove@example.test"]);
+        fs::write(clone.join("tracked"), "base\n").unwrap();
+        git(&clone, &["add", "tracked"]);
+        git(&clone, &["commit", "-qm", "base"]);
+        git(
+            &clone,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&clone, &["push", "-qu", "origin", "main"]);
+        git(
+            &clone,
+            &["worktree", "add", "-qb", "feat", linked.to_str().unwrap()],
+        );
+        fs::write(linked.join("work"), "work\n").unwrap();
+        git(&linked, &["add", "work"]);
+        git(&linked, &["commit", "-qm", "work"]);
+        git(&linked, &["push", "-qu", "origin", "feat"]);
+        // main advances past the branch point, develop takes the merge: the
+        // branch is an ancestor of develop and of nothing on main.
+        git(&clone, &["checkout", "-q", "-b", "develop", "main"]);
+        git(&clone, &["merge", "-q", "--ff-only", "feat"]);
+        git(&clone, &["push", "-qu", "origin", "develop"]);
+        git(&clone, &["checkout", "-q", "main"]);
+        fs::write(clone.join("main-only"), "main\n").unwrap();
+        git(&clone, &["add", "main-only"]);
+        git(&clone, &["commit", "-qm", "main"]);
+
+        let repository = Repository {
+            id: RepoId("repo".into()),
+            name: "repo".into(),
+            path: clone.clone(),
+            base_branch: Some("origin/main".into()),
+        };
+
+        // The discovered default: unmerged, and left unchecked.
+        let batch = prune_candidates(&repository, &[]).unwrap();
+        let row = batch
+            .candidates
+            .iter()
+            .find(|row| row.branch.as_deref() == Some("feat"))
+            .unwrap();
+        assert_eq!(row.history, PruneHistory::Unmerged);
+        assert!(row.reasons.contains(&PruneDisqualifier::Unmerged));
+
+        // The override: the user's integration branch, where the branch is
+        // merged — pre-checked, no blockers.
+        let batch = prune_candidates_against(&repository, &[], Some("origin/develop")).unwrap();
+        let row = batch
+            .candidates
+            .iter()
+            .find(|row| row.branch.as_deref() == Some("feat"))
+            .unwrap();
+        assert_eq!(row.history, PruneHistory::Merged);
+        assert!(row.preselected());
     }
 
     #[test]
