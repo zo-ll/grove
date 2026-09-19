@@ -80,6 +80,34 @@ Also: custom palette commands, extra worktree columns, keymaps, per-repo rules a
 computed paths. This is how forge data gets in without Grove knowing what a forge is —
 you register a `grove.column`, and it renders as yours.
 
+Per-repo rules layer over the global settings:
+
+```lua
+grove.repo("monorepo", {
+  worktree_path = "/mnt/nvme/{repo}/{branch_slug}", -- 8 GB checkouts
+  base          = "origin/develop",                -- new worktrees branch from here
+  setup         = function(wt) grove.run(wt.path, "make bootstrap") end,
+  theme         = { accent = "#89b4fa" },
+})
+
+grove.session_template("frontend", { repos = { "web-app", "design-system" } })
+```
+
+For the named repo only:
+
+- `worktree_path` — string template or `function(repo, branch)` — replaces the
+  global `worktree_path`
+- `base` replaces the branch git advertises as the default (`origin/HEAD`)
+- `setup(wt)` runs when one of the repo's worktrees is created, after every
+  global `worktree_created` hook, in registration order
+- `theme` keys mirror `grove.setup`'s `theme` table and are applied by the TUI;
+  the daemon applies everything else and ignores `theme` — one config file
+  serves both processes
+- registering the same name again layers the new keys over the previous
+  override, and keys left unset fall back to the global setting
+- an override naming a repo that is not in the workspace is reported, not
+  silently ignored
+
 ## Design rules
 
 Two constraints do most of the work in the spec:

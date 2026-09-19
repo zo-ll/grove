@@ -122,6 +122,7 @@ pub struct SessionOrchestrator {
     live: HashMap<SessionId, Vec<LiveTerminal>>,
     hook_reports: Vec<HookReport>,
     notified_exits: HashSet<TerminalId>,
+    unknown_overrides: Vec<String>,
 }
 
 impl SessionOrchestrator {
@@ -139,6 +140,23 @@ impl SessionOrchestrator {
                 .send(TerminalId(terminal), bytes)
                 .map_err(|error| error.to_string())
         });
+        let known: HashSet<&str> = repositories
+            .iter()
+            .map(|repository| repository.name.as_str())
+            .collect();
+        let unknown_overrides: Vec<String> = {
+            let mut names: Vec<String> = runtime
+                .repo_overrides()
+                .iter()
+                .map(|rule| rule.name.clone())
+                .collect();
+            names.sort();
+            names.dedup();
+            names
+                .into_iter()
+                .filter(|name| !known.contains(name.as_str()))
+                .collect()
+        };
         Self {
             store,
             repositories: repositories
@@ -151,6 +169,7 @@ impl SessionOrchestrator {
             live: HashMap::new(),
             hook_reports: Vec::new(),
             notified_exits: HashSet::new(),
+            unknown_overrides,
         }
     }
 
@@ -166,17 +185,36 @@ impl SessionOrchestrator {
     /// effects before returning events, so the socket layer remains transport.
     pub fn handle_request(&mut self, request: Request) -> Vec<Event> {
         self.fire_observed_terminal_exits();
+        let mut events = self.drain_unknown_overrides();
         let context = format!("{request:?}");
-        let mut events = match self.apply_request(request) {
+        events.extend(match self.apply_request(request) {
             Ok(events) => events,
             Err(error) => vec![Event::Failed {
                 context,
                 message: error.to_string(),
             }],
-        };
+        });
         self.hook_reports.extend(self.runtime.drain_reports());
         events.extend(self.hook_reports.drain(..).filter_map(hook_report_event));
         events
+    }
+
+    /// Reports config overrides that name no repository in the workspace.
+    ///
+    /// Checked against the repositories discovered at startup, because that is
+    /// the population an override can ever apply to. An override that cannot
+    /// apply anywhere is reported once rather than silently ignored.
+    fn drain_unknown_overrides(&mut self) -> Vec<Event> {
+        self.unknown_overrides
+            .drain(..)
+            .map(|name| Event::Failed {
+                context: "config: repo override".into(),
+                message: format!(
+                    "no repository named {name:?} is in this workspace; \
+                     its override is ignored"
+                ),
+            })
+            .collect()
     }
 
     fn apply_request(&mut self, request: Request) -> Result<Vec<Event>, OrchestrationError> {
@@ -580,12 +618,16 @@ impl SessionOrchestrator {
                     });
                 }
                 let repository = self.repository(repo_id)?.clone();
-                let base = repository
-                    .base_branch
-                    .as_deref()
+                // The override wins for its repo; otherwise git answers with
+                // the branch origin advertises as the default.
+                let base = self
+                    .runtime
+                    .repo_override(&repository.name)
+                    .and_then(|rule| rule.base.clone())
+                    .or_else(|| repository.base_branch.clone())
                     .ok_or_else(|| OrchestrationError::BaseMissing(repo_id.clone()))?;
                 let path = self.worktree_path(&repository, &stored.name, branch)?;
-                grove_git::create_worktree(&repository.path, &path, branch, base)?;
+                grove_git::create_worktree(&repository.path, &path, branch, &base)?;
                 self.store
                     .own_created(session, worktree.clone(), &path, &repository.path)?;
                 self.fire_worktree(
@@ -810,6 +852,10 @@ fn hook_report_event(report: HookReport) -> Option<Event> {
             context: format!("lifecycle hook {event:?} #{registration}"),
             message,
         }),
+        HookReport::RepoSetupDisabled { repo, message } => Some(Event::Failed {
+            context: format!("repo setup for {repo:?}"),
+            message,
+        }),
         HookReport::CommandFinished {
             job,
             command,
@@ -897,6 +943,140 @@ mod tests {
             repo: RepoId("repo".into()),
             branch: branch.into(),
         }
+    }
+
+    #[test]
+    fn repo_override_changes_path_and_base_for_that_repo_only() {
+        let temp = TempDir::new();
+        let repo_a = temp.0.join("repo-a");
+        let repo_b = temp.0.join("repo-b");
+        for repo in [&repo_a, &repo_b] {
+            fs::create_dir_all(repo).unwrap();
+            git(repo, &["init", "-q", "-b", "main"]);
+            git(repo, &["config", "user.name", "Grove Test"]);
+            git(repo, &["config", "user.email", "grove@example.test"]);
+            fs::write(repo.join("from-main"), "main\n").unwrap();
+            git(repo, &["add", "from-main"]);
+            git(repo, &["commit", "-qm", "main"]);
+        }
+        git(&repo_a, &["branch", "develop"]);
+        git(&repo_a, &["checkout", "-q", "develop"]);
+        fs::write(repo_a.join("from-develop"), "develop\n").unwrap();
+        git(&repo_a, &["add", "from-develop"]);
+        git(&repo_a, &["commit", "-qm", "develop"]);
+        git(&repo_a, &["checkout", "-q", "main"]);
+        // Advance main past the branch point, so only a worktree cut from the
+        // overridden base has the develop file and lacks this one.
+        fs::write(repo_a.join("later-on-main"), "main\n").unwrap();
+        git(&repo_a, &["add", "later-on-main"]);
+        git(&repo_a, &["commit", "-qm", "later"]);
+
+        let template = temp.0.join("global/{repo}/{branch_slug}");
+        let template = template.to_string_lossy().into_owned();
+        let runtime = DaemonRuntime::load_source(
+            &format!(
+                r#"
+                local grove = require('grove')
+                grove.setup({{ worktree_path = {template:?} }})
+                grove.repo('repo-a', {{
+                  worktree_path = {override_template:?},
+                  base = 'develop',
+                }})
+                "#,
+                template = template,
+                override_template = temp
+                    .0
+                    .join("override/{repo}/{branch_slug}")
+                    .to_string_lossy(),
+            ),
+            "repo-override",
+        )
+        .runtime;
+        let mut store = Store::load_at(&temp.0.join("state"), &temp.0, &template);
+        store.create(sid("one"), "one".to_string()).unwrap();
+        store
+            .add_member(&sid("one"), RepoId("repo-a".into()))
+            .unwrap();
+        store
+            .add_member(&sid("one"), RepoId("repo-b".into()))
+            .unwrap();
+        let repositories = vec![
+            Repository {
+                id: RepoId("repo-a".into()),
+                name: "repo-a".into(),
+                path: repo_a.clone(),
+                // The discovered default: the override must win over it.
+                base_branch: Some("main".into()),
+            },
+            Repository {
+                id: RepoId("repo-b".into()),
+                name: "repo-b".into(),
+                path: repo_b.clone(),
+                base_branch: Some("main".into()),
+            },
+        ];
+        let terminals = TerminalManager::new(PathBuf::from("/bin/sh"), temp.0.clone(), 100);
+        let fetch = FetchPolicy::new(2, Duration::from_secs(60));
+        let mut daemon = SessionOrchestrator::new(store, repositories, terminals, fetch, runtime);
+
+        let report = daemon
+            .create_worktrees(
+                &sid("one"),
+                "feature",
+                &[RepoId("repo-a".into()), RepoId("repo-b".into())],
+            )
+            .unwrap();
+        assert!(report.failed.is_empty(), "{report:?}");
+        assert_eq!(report.created.len(), 2);
+
+        // repo-a: the override picked its path and its base.
+        let path_a = &report.created[0].path;
+        assert_eq!(
+            path_a,
+            &temp.0.join("override/repo-a/feature"),
+            "the override path must apply to repo-a"
+        );
+        assert!(
+            path_a.join("from-develop").exists(),
+            "worktree must branch from the overridden base"
+        );
+        assert!(!path_a.join("later-on-main").exists());
+
+        // repo-b: no override, so the global template and discovered base.
+        let path_b = &report.created[1].path;
+        assert_eq!(path_b, &temp.0.join("global/repo-b/feature"));
+        assert!(path_b.join("from-main").exists());
+    }
+
+    #[test]
+    fn override_naming_an_unknown_repo_is_reported_once() {
+        let temp = TempDir::new();
+        let runtime = DaemonRuntime::load_source(
+            "local grove = require('grove')\n\
+             grove.repo('ghost', { base = 'origin/develop' })\n",
+            "unknown-repo",
+        )
+        .runtime;
+        let mut store = Store::load_at(&temp.0.join("state"), &temp.0, "");
+        store.create(sid("one"), "one".to_string()).unwrap();
+        let terminals = TerminalManager::new(PathBuf::from("/bin/sh"), temp.0.clone(), 100);
+        let fetch = FetchPolicy::new(2, Duration::from_secs(60));
+        let mut daemon = SessionOrchestrator::new(store, Vec::new(), terminals, fetch, runtime);
+
+        let events = daemon.handle_request(Request::ListSessions);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Event::Failed { context, message }
+                if context == "config: repo override"
+                    && message.contains("ghost")
+                    && message.contains("ignored")
+        )));
+        // Reported once, not on every request.
+        let events = daemon.handle_request(Request::ListSessions);
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            Event::Failed { context, .. } if context == "config: repo override"
+        )));
     }
 
     #[test]
