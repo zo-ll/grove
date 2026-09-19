@@ -11,4 +11,5 @@ workspace = true
 
 [dependencies]
 grove-domain = { workspace = true }
+ignore = "=0.4.23"
 thiserror = { workspace = true }
