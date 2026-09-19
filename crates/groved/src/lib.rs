@@ -373,11 +373,11 @@ struct LiveFeed {
 }
 
 impl Drop for LiveFeed {
+    // Every way a feed can be lost — detach, re-attach, replacement, or
+    // connection teardown — goes through here, so a client that disconnects
+    // while attached cannot pin the forwarder and the connection writer for
+    // as long as the pty lives.
     fn drop(&mut self) {
-        // Every path that loses a feed — detach, re-attach, replacement, or
-        // the connection ending — goes through here, so a client that
-        // disconnects while attached cannot pin the forwarder and the
-        // connection writer for as long as the pty lives.
         self.stop.store(true, Ordering::Release);
     }
 }
@@ -414,9 +414,7 @@ impl LiveFeed {
 }
 
 // Every way a feed can be lost — detach, re-attach, replacement, connection
-// teardown — goes through Drop, which sets the stop flag; the forwarder exits
-// within its polling window and the abandoned subscriber is cleaned up by the
-// pty reader the next time output arrives.
+// teardown — goes through the Drop below.
 
 fn socket_error(path: &Path, source: io::Error) -> LifecycleError {
     LifecycleError::Socket {
@@ -565,18 +563,24 @@ mod tests {
             }),
         )
         .unwrap();
-        // Screen first, then the terminal empty-chunk, in that order.
+        // Screen first. Live output may interleave from the moment the
+        // screen is sent — the contract permits it — so the scrollback search
+        // skips anything else rather than assuming the next two frames.
         let Event::TerminalScreen { screen, .. } = read_frame(&mut client).unwrap() else {
             panic!("screen must arrive first")
         };
         assert_eq!(screen.rows, 24);
-        let Event::TerminalScrollback {
-            seq, lines, done, ..
-        } = read_frame(&mut client).unwrap()
-        else {
-            panic!("expected scrollback after the screen")
+        let (seq, line_count, done) = loop {
+            match read_frame(&mut client) {
+                Ok(Event::TerminalScrollback {
+                    seq, lines, done, ..
+                }) => break (seq, lines.len(), done),
+                Ok(Event::TerminalOutput { .. }) => continue,
+                Ok(event) => panic!("expected scrollback after the screen, got {event:?}"),
+                Err(error) => panic!("no scrollback after the screen: {error}"),
+            }
         };
-        assert_eq!((seq, lines.len(), done), (0, 0, true));
+        assert_eq!((seq, line_count, done), (0, 0, true));
 
         // Live output interleave: input typed after attach reaches the client
         // as TerminalOutput, through the same writer as every other frame.

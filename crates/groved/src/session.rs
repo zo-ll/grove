@@ -899,7 +899,6 @@ impl SessionOrchestrator {
                             terminal.id,
                         );
                     }
-                    self.notified_exits.insert(terminal.id);
                 }
                 Err(error) => {
                     failed.push(EffectFailure {
