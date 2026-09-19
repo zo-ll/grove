@@ -17,6 +17,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
+pub mod terminal;
+
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Error)]
@@ -269,7 +271,10 @@ fn socket_error(path: &Path, source: io::Error) -> LifecycleError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
     struct TempDir(PathBuf);
     impl TempDir {
@@ -278,7 +283,11 @@ mod tests {
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
-            let path = env::temp_dir().join(format!("groved-lifecycle-{unique}"));
+            let sequence = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+            let path = env::temp_dir().join(format!(
+                "groved-lifecycle-{}-{unique}-{sequence}",
+                std::process::id()
+            ));
             fs::create_dir_all(&path).unwrap();
             Self(path)
         }

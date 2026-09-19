@@ -35,9 +35,10 @@ BACKEND_CRATES="grove-git grove-state"
 GIT_CRATES="gix git2 gitoxide-core libgit2-sys"
 PTY_CRATES="portable-pty pty-process nix-pty"
 RENDER_CRATES="ratatui crossterm tui-term termion vt100"
+UI_ONLY_CRATES="ratatui crossterm tui-term termion"
 
 # A typo that empties one of these would make its rules vacuous.
-for v in BACKEND_CRATES GIT_CRATES PTY_CRATES RENDER_CRATES; do
+for v in BACKEND_CRATES GIT_CRATES PTY_CRATES RENDER_CRATES UI_ONLY_CRATES; do
     if [ -z "${!v:-}" ]; then
         die "$v is empty — a rule would pass vacuously"
     fi
@@ -189,8 +190,8 @@ deny_declared grove-state "backend lane must not render or touch git directly" \
 deny_declared grove "UI lane must not reach backend concerns" \
     $BACKEND_CRATES $GIT_CRATES $PTY_CRATES
 
-deny_declared groved "backend lane must not render" \
-    $RENDER_CRATES
+deny_declared groved "daemon may parse terminals but must not render UI chrome" \
+    $UI_ONLY_CRATES
 
 deny_declared grove-fakedaemon "UI-lane tooling must not reach backend concerns" \
     $BACKEND_CRATES $GIT_CRATES $PTY_CRATES
@@ -210,7 +211,7 @@ done < <(members)
 {
 deny_reach grove "UI lane must not reach backend concerns" \
     $BACKEND_CRATES $GIT_CRATES $PTY_CRATES grove-fakedaemon
-deny_reach groved "backend lane must not render" $RENDER_CRATES
+deny_reach groved "daemon may parse terminals but must not render UI chrome" $UI_ONLY_CRATES
 deny_reach grove-fakedaemon "UI-lane tooling must not reach backend concerns" \
     $BACKEND_CRATES $GIT_CRATES $PTY_CRATES
 deny_reach grove-proto "the contract must not embed implementations" \
