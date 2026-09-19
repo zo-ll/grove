@@ -1,6 +1,6 @@
 //! Pure domain types shared by Grove's UI and daemon.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, ser::Error as _};
 use std::path::PathBuf;
 
 /// Identifies the scan root whose repositories and sessions belong together.
@@ -79,7 +79,12 @@ pub struct Worktree {
 }
 
 /// Classifies who may manage a worktree, while distinguishing the protected clone.
-#[derive(std::clone::Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// The clone classification is daemon-internal state derived by comparing the
+/// worktree path with the repository path. It is neither accepted from wire data nor
+/// directly constructible by downstream crates.
+#[derive(std::clone::Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Ownership {
     /// The open session created or adopted this worktree and may manage it fully.
     Ours,
@@ -88,13 +93,66 @@ pub enum Ownership {
     /// No session owns this worktree, so it may be adopted.
     Unowned,
     /// This is the repository's original checkout and must never become session-owned.
-    Clone,
+    ///
+    /// Downstream crates cannot construct this daemon-derived classification directly:
+    ///
+    /// ```compile_fail
+    /// use grove_domain::Ownership;
+    ///
+    /// let ownership = Ownership::Clone {};
+    /// ```
+    #[non_exhaustive]
+    Clone {},
+}
+
+impl Serialize for Ownership {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        #[derive(Serialize)]
+        enum WireOwnership<'a> {
+            Ours,
+            Other(&'a SessionId),
+            Unowned,
+        }
+
+        match self {
+            Self::Ours => WireOwnership::Ours.serialize(serializer),
+            Self::Other(session) => WireOwnership::Other(session).serialize(serializer),
+            Self::Unowned => WireOwnership::Unowned.serialize(serializer),
+            Self::Clone {} => Err(S::Error::custom(
+                "the clone ownership classification is daemon-internal state",
+            )),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Ownership {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        enum WireOwnership {
+            Ours,
+            Other(SessionId),
+            Unowned,
+        }
+
+        Ok(match WireOwnership::deserialize(deserializer)? {
+            WireOwnership::Ours => Self::Ours,
+            WireOwnership::Other(session) => Self::Other(session),
+            WireOwnership::Unowned => Self::Unowned,
+        })
+    }
 }
 
 /// Ownership states accepted from operations that can change session ownership.
 ///
-/// The protected clone state is deliberately absent. APIs that accept user-driven
-/// ownership changes take this type and therefore cannot express owning the clone.
+/// The protected clone classification is deliberately absent. This prevents callers
+/// from submitting that classification, but `Ours` can still be paired with any path.
+/// The daemon must separately reject attempts to assign `Ours` to the repository path.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OwnableOwnership {
     /// Assign the worktree to the open session.
@@ -178,7 +236,6 @@ mod tests {
         round_trip(&Ownership::Ours);
         round_trip(&Ownership::Other(SessionId("other".into())));
         round_trip(&Ownership::Unowned);
-        round_trip(&Ownership::Clone);
         round_trip(&OwnableOwnership::Ours);
         round_trip(&OwnableOwnership::Other(SessionId("other".into())));
         round_trip(&OwnableOwnership::Unowned);
@@ -190,7 +247,8 @@ mod tests {
     }
 
     #[test]
-    fn user_supplied_ownership_cannot_name_the_clone() {
-        assert!(serde_json::from_str::<OwnableOwnership>(r#""Clone""#).is_err());
+    fn clone_ownership_cannot_cross_the_wire() {
+        assert!(serde_json::from_str::<Ownership>(r#""Clone""#).is_err());
+        assert!(serde_json::to_string(&Ownership::Clone {}).is_err());
     }
 }

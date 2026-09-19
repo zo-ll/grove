@@ -9,6 +9,8 @@ const DEFAULT_DIRTY: &str = "#f9e2af";
 const DEFAULT_ERROR: &str = "#f38ba8";
 const DEFAULT_MUTED: &str = "#7f849c";
 const DEFAULT_WORKTREE_PATH: &str = "~/grove/{repo}/{branch_slug}";
+const MAX_BRANCH_SLUG_BYTES: usize = 120;
+const BRANCH_SLUG_HASH_BYTES: usize = 16;
 
 /// The result of loading a config, including a recoverable evaluation error.
 pub struct LoadOutcome<T> {
@@ -422,6 +424,11 @@ impl DaemonRuntime {
 }
 
 /// Converts a branch name into a deterministic, portable path component.
+///
+/// Normalization is intentionally not injective: for example, `feat/x` and `feat-x`
+/// both become `feat-x`. The daemon must reject a worktree path already claimed by a
+/// different branch. Results longer than 120 bytes are truncated and receive a stable
+/// hash suffix so generated paths remain comfortably below common filesystem limits.
 pub fn branch_slug(branch: &str) -> String {
     let mut slug = String::with_capacity(branch.len());
     let mut last_was_separator = false;
@@ -435,10 +442,18 @@ pub fn branch_slug(branch: &str) -> String {
         }
     }
     let slug = slug.trim_matches(['-', '.']);
-    if slug.is_empty() {
-        "branch".into()
-    } else {
+    let slug = if slug.is_empty() { "branch" } else { slug };
+    if slug.len() <= MAX_BRANCH_SLUG_BYTES {
         slug.into()
+    } else {
+        let hash = branch
+            .as_bytes()
+            .iter()
+            .fold(0xcbf29ce484222325_u64, |hash, byte| {
+                (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+            });
+        let prefix_bytes = MAX_BRANCH_SLUG_BYTES - BRANCH_SLUG_HASH_BYTES - 1;
+        format!("{}-{hash:016x}", &slug[..prefix_bytes])
     }
 }
 
@@ -833,6 +848,15 @@ mod tests {
         );
         assert_eq!(branch_slug("../../bad branch"), "bad-branch");
         assert_eq!(branch_slug("///"), "branch");
+
+        assert_eq!(branch_slug("feat/x"), branch_slug("feat-x"));
+
+        let long_branch = format!("feat/{}", "a".repeat(300));
+        let similar_long_branch = format!("feat/{}b", "a".repeat(300));
+        let long_slug = branch_slug(&long_branch);
+        assert_eq!(long_slug, branch_slug(&long_branch));
+        assert_eq!(long_slug.len(), MAX_BRANCH_SLUG_BYTES);
+        assert_ne!(long_slug, branch_slug(&similar_long_branch));
     }
 
     #[test]
