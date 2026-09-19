@@ -20,7 +20,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use events::{Input, Inputs};
-use grove_proto::{Event as DaemonEvent, Handshake, PROTOCOL_VERSION, Request, accept_welcome};
+use grove_proto::{
+    Event as DaemonEvent, Handshake, PROTOCOL_VERSION, Request, accept_welcome, socket_path,
+};
 use keymap::{Action, Focus, Routed, Router, Screen};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -275,26 +277,6 @@ fn connect(workspace: &Path, inputs: &Inputs) -> State {
     }
 }
 
-/// `$XDG_RUNTIME_DIR/grove/<workspace-hash>.sock`, per SPEC §6.
-fn socket_path(workspace: &Path) -> PathBuf {
-    let dir = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    dir.join("grove").join(format!("{}.sock", hash(workspace)))
-}
-
-/// FNV-1a over the canonical path. Stable across runs and platforms, which is
-/// what matters — two `grove` invocations in one workspace must agree.
-fn hash(path: &Path) -> String {
-    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in canonical.as_os_str().as_encoded_bytes() {
-        h ^= u64::from(*b);
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    format!("{h:016x}")
-}
-
 fn draw(f: &mut ratatui::Frame, state: &State, ui: &Ui) {
     // One row reserved at the bottom for the status bar, per SPEC §4.1.
     let chunks = Layout::default()
@@ -477,19 +459,16 @@ mod tests {
     }
 
     #[test]
-    fn the_socket_path_is_stable_and_workspace_specific() {
-        let a = PathBuf::from("/tmp");
-        let b = PathBuf::from("/usr");
+    fn the_tui_looks_for_the_socket_the_protocol_names() {
+        // Both halves have to name the same file or the TUI connects to a
+        // socket nobody is listening on, and says "no daemon" while one is
+        // running. There is one implementation now, in `grove-proto`; this
+        // asserts the TUI is reaching it rather than a local lookalike.
+        let workspace = PathBuf::from("/tmp");
         assert_eq!(
-            socket_path(&a),
-            socket_path(&a),
-            "must be stable across calls"
+            socket_path(&workspace),
+            grove_proto::socket_path(&workspace)
         );
-        assert_ne!(
-            socket_path(&a),
-            socket_path(&b),
-            "must differ per workspace"
-        );
-        assert!(socket_path(&a).to_string_lossy().ends_with(".sock"));
+        assert!(socket_path(&workspace).to_string_lossy().ends_with(".sock"));
     }
 }
