@@ -458,9 +458,51 @@ deliberately unpublished to crates.io with no API stability guarantee.
 second `grove` on the same workspace attaches to the existing daemon rather than
 starting a second one.
 
-**Protocol.** Session list and state; spawn, kill and resize ptys; input to a pty;
-output streaming; attach and detach; snapshot. Nothing on this list ships in a crate —
-budget for it accordingly.
+**Protocol.** Nothing on this list ships in a crate — budget for it accordingly.
+
+The message set is derived from §4's screens, not from this summary. An earlier
+revision listed only the session and pty operations, and the protocol built to it
+could not carry what the dash, prune picker or diff screen render — a gap that
+survived review because the reviewer was asked whether the code matched this
+paragraph rather than whether it matched the screens.
+
+- **Handshake** — a version exchange before anything else, refused on mismatch
+  rather than guessed at, checked from both sides.
+- **Sessions** — list and state; create, rename, open, detach, close, end. A
+  session row carries its member repos, live terminal count, how long it has
+  held its state and the disk its worktrees hold, because §4.3 renders all four.
+- **Repos** — the workspace's repos with worktree counts, dirtiness, and where
+  each base branch came from, for the REPOS pane and §4.2's provenance line.
+  Re-scanning the workspace is a request of its own.
+- **Worktrees** — every worktree of one repo regardless of owner, plus the clone,
+  each carrying its ownership, ahead/behind, **uncommitted file count**, age,
+  size, attached terminal and foreground command, and whether its refs are
+  stale. A count rather than a flag, because §4.6 warns "9 uncommitted files
+  will be lost" before the only destructive action in the product.
+- **Prune candidates** — with what makes each prunable *and* the reasons it is
+  not safe to remove, so the client renders both columns rather than inferring
+  one from the absence of the other. Pruning itself is a request, and because
+  an unsafe row can still be ticked deliberately the daemon does not overrule
+  the selection — it attempts each and reports per-row outcomes. The exception
+  is a worktree a live session owns, which ending that session is for.
+- **Diff** — file list for a worktree, and hunks for one selected file. Moving
+  the cursor re-requests, so opening the screen does not pay for every patch.
+- **Terminals** — spawn against a worktree *or* unattached for §4.5's scratch
+  shell; kill, resize; input; output streaming; attach and detach. A spawn is
+  answered with the new terminal's id, without which the client cannot attach to
+  what it just created, and the live terminals can be listed so a reattaching
+  client finds the scratch shell again.
+- **Editor** — open a worktree in the configured editor. The daemon runs it: it
+  holds the configuration, and the TUI does not touch the filesystem.
+- **Snapshot** — save and restore.
+- **Fetch** — refresh a session's member repos, per §7's policy. Never on a
+  timer.
+- **Failures** — typed where the UI must act on them. A branch already checked
+  out elsewhere carries the conflicting worktree and path, because §7 requires
+  offering to adopt it and prose cannot be adopted.
+
+Whenever a screen gains something to render, this list and `grove-proto` change
+together.
 
 ---
 
