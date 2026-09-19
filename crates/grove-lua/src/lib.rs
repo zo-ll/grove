@@ -385,6 +385,23 @@ pub const SH_DRAIN: Duration = Duration::from_millis(200);
 /// How long `grove.sh` may block the daemon before its command is killed.
 pub const SH_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Signal a whole process group, best effort.
+///
+/// Directly, not through `/bin/kill`: the group signal is load-bearing — it is
+/// what closes pipes a backgrounded grandchild is still holding — and an
+/// external binary makes that depend on PATH and on the binary existing at all.
+/// On a system without it the signal silently became a no-op and the freeze
+/// came back, which is exactly the failure a best-effort call should not hide.
+/// `killpg` is a safe function in `nix`, so this costs no `unsafe`.
+fn signal_group(pgid: u32) {
+    let Ok(pgid) = i32::try_from(pgid) else {
+        return;
+    };
+    // Best effort by design: the group may already be gone, which is success
+    // by another name.
+    let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pgid), nix::sys::signal::SIGTERM);
+}
+
 /// A contained hook error or the eventual result of an asynchronous command.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HookReport {
@@ -845,28 +862,43 @@ fn install_daemon_module(
                 .map_err(mlua::Error::external)?;
 
             let pgid = child.id();
+            // Channels, not `JoinHandle`s. A reader blocked on a pipe some
+            // grandchild still holds never returns, and `join` has no deadline,
+            // so joining is the freeze again one line further down. A channel
+            // can be given one: whatever arrived by the time the window closes
+            // is the output, and the reader finishes detached or not at all.
             let mut out = child.stdout.take();
             let mut err = child.stderr.take();
-            let stdout = thread::spawn(move || {
+            let (out_tx, out_rx) = mpsc::channel();
+            let (err_tx, err_rx) = mpsc::channel();
+            thread::spawn(move || {
                 let mut buf = Vec::new();
                 if let Some(pipe) = out.as_mut() {
                     let _ = pipe.read_to_end(&mut buf);
                 }
-                buf
+                let _ = out_tx.send(buf);
             });
-            let stderr = thread::spawn(move || {
+            thread::spawn(move || {
                 let mut buf = Vec::new();
                 if let Some(pipe) = err.as_mut() {
                     let _ = pipe.read_to_end(&mut buf);
                 }
-                buf
+                let _ = err_tx.send(buf);
             });
 
             let deadline = Instant::now() + SH_TIMEOUT;
             let mut exited_at: Option<Instant> = None;
+            let mut out_buf: Option<Vec<u8>> = None;
+            let mut err_buf: Option<Vec<u8>> = None;
             let status = loop {
+                if out_buf.is_none() {
+                    out_buf = out_rx.try_recv().ok();
+                }
+                if err_buf.is_none() {
+                    err_buf = err_rx.try_recv().ok();
+                }
                 match child.try_wait().map_err(mlua::Error::external)? {
-                    Some(status) if stdout.is_finished() && stderr.is_finished() => break status,
+                    Some(status) if out_buf.is_some() && err_buf.is_some() => break status,
                     // The shell is gone but a pipe is still held, so something
                     // it spawned outlives it. Its own output has long since
                     // flushed; waiting the full timeout for a background job
@@ -874,9 +906,7 @@ fn install_daemon_module(
                     // Give the readers a moment, then close the pipes by
                     // signalling the group and take what arrived.
                     Some(status) if exited_at.is_some_and(|at| at.elapsed() >= SH_DRAIN) => {
-                        let _ = Command::new("/bin/kill")
-                            .args(["-TERM", &format!("-{pgid}")])
-                            .status();
+                        signal_group(pgid);
                         break status;
                     }
                     Some(_) => {
@@ -886,9 +916,7 @@ fn install_daemon_module(
                     _ if Instant::now() >= deadline => {
                         // Signal the group: killing only the shell leaves its
                         // children running and still holding the pipes.
-                        let _ = Command::new("/bin/kill")
-                            .args(["-TERM", &format!("-{pgid}")])
-                            .status();
+                        signal_group(pgid);
                         let _ = child.kill();
                         let _ = child.wait();
                         return Err(mlua::Error::runtime(format!(
@@ -901,8 +929,17 @@ fn install_daemon_module(
                 }
             };
 
-            let out = stdout.join().unwrap_or_default();
-            let err = stderr.join().unwrap_or_default();
+            // One last window each, so output written just before the signal
+            // still counts. Past it the read is abandoned rather than waited
+            // on: the whole point of the group signal is that the caller is
+            // already free, and a pipe-holder that ignored the signal — or a
+            // signal that never landed — must not be able to take that back.
+            let out = out_buf
+                .or_else(|| out_rx.recv_timeout(SH_DRAIN).ok())
+                .unwrap_or_default();
+            let err = err_buf
+                .or_else(|| err_rx.recv_timeout(SH_DRAIN).ok())
+                .unwrap_or_default();
             if !status.success() {
                 return Err(mlua::Error::runtime(
                     String::from_utf8_lossy(&err).trim().to_owned(),
@@ -1445,6 +1482,32 @@ mod tests {
             elapsed < SH_TIMEOUT + Duration::from_secs(2),
             "grove.sh blocked {elapsed:?} on a backgrounded grandchild; \
              the shell exits at once, so anything near 30s means the pipe held us"
+        );
+    }
+
+    #[test]
+    fn sh_does_not_block_on_a_grandchild_that_ignores_the_signal() {
+        // Closing the pipes by signalling the group only works if the group
+        // takes the signal. A hook that traps TERM — or a system where the
+        // signal never lands at all — must still not freeze the daemon, so the
+        // drain window has to bound the read as well as the signal.
+        let source = "local grove = require('grove')\n\
+                      grove.setup({})\n\
+                      grove.on('session_opened', function() grove.sh('trap \"\" TERM; sleep 30 &') end)\n";
+        let mut runtime = DaemonRuntime::load_source(source, "deaf-grandchild").runtime;
+        let started = Instant::now();
+        let _ = runtime.fire(
+            LifecycleEvent::SessionOpened,
+            &LifecyclePayload::Session {
+                id: "s".into(),
+                name: "s".into(),
+            },
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < SH_TIMEOUT + Duration::from_secs(2),
+            "grove.sh blocked {elapsed:?} on a grandchild that ignored the group signal; \
+             the read must be bounded by the drain window, not by the signal working"
         );
     }
 
