@@ -51,6 +51,11 @@ pub enum Focus {
 }
 
 impl Screen {
+    /// Whether this screen is itself a pty, regardless of pane focus.
+    pub fn is_pty_screen(self) -> bool {
+        matches!(self, Self::Shell)
+    }
+
     /// Whether a pty can hold focus on this screen.
     ///
     /// The dash's third pane is a terminal, and the scratch shell is one
@@ -306,7 +311,12 @@ impl Router {
         // send every keystroke to a terminal the user cannot see. That is
         // latent until #18 allows the screen to change, and silent when it
         // lands.
-        if screen.pty_can_hold_focus() && focus.is_pty() {
+        // The scratch shell *is* a pty — there is no list on that screen to
+        // hold focus — so it takes keys whatever `focus` happens to say. It can
+        // say anything: `focus` is the dash's pane selection, and opening the
+        // shell does not change it. Gating the shell on it stranded every key
+        // in `Ignored`, which is the same mistake as M4 pointing the other way.
+        if screen.is_pty_screen() || (screen.pty_can_hold_focus() && focus.is_pty()) {
             return Routed::ToPty(key);
         }
 
@@ -339,7 +349,7 @@ fn is_prefix(key: &KeyEvent) -> bool {
 fn lookup(screen: Screen, key: KeyEvent, prefixed: bool) -> Option<Action> {
     bindings(screen)
         .find(|bind| {
-            bind.prefixed == prefixed && bind.key == key.code && modifiers_match(bind, key)
+            bind.prefixed == prefixed && key_matches(bind, key) && modifiers_match(bind, key)
         })
         .map(|bind| bind.action)
 }
@@ -352,6 +362,17 @@ fn lookup(screen: Screen, key: KeyEvent, prefixed: bool) -> Option<Action> {
 /// Matching exactly meant `^g X`, `^g S` and `^g ?` worked on terminals that
 /// omit the flag and were silently dead on those that send it — the kind of
 /// bug that looks like a broken keyboard.
+/// Whether the key itself matches, allowing for terminals that spell one key
+/// two ways.
+fn key_matches(bind: &Binding, key: KeyEvent) -> bool {
+    if bind.key == KeyCode::BackTab {
+        key.code == KeyCode::BackTab
+            || (key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::SHIFT))
+    } else {
+        bind.key == key.code
+    }
+}
+
 fn modifiers_match(bind: &Binding, key: KeyEvent) -> bool {
     const DISTINGUISHING: KeyModifiers = KeyModifiers::CONTROL
         .union(KeyModifiers::ALT)
@@ -360,8 +381,13 @@ fn modifiers_match(bind: &Binding, key: KeyEvent) -> bool {
     let declared = bind.modifiers & DISTINGUISHING;
     if matches!(key.code, KeyCode::Char(_)) {
         significant == declared
+    } else if bind.key == KeyCode::BackTab {
+        // Kitty-protocol terminals report shift-tab as Tab + SHIFT rather than
+        // BackTab, so an exact comparison loses `^g shift-tab` on them — the
+        // same family as the dead uppercase bindings.
+        key.modifiers.contains(KeyModifiers::SHIFT) || key.modifiers == bind.modifiers
     } else {
-        // For non-character keys SHIFT is meaningful: shift-tab is not tab.
+        // Otherwise SHIFT is meaningful on a non-character key.
         key.modifiers == bind.modifiers
     }
 }
@@ -531,6 +557,49 @@ mod tests {
         assert_eq!(
             r.route(Screen::Dash, Focus::Terminal, code(KeyCode::BackTab)),
             Routed::Act(Action::CycleFocusBack)
+        );
+    }
+
+    #[test]
+    fn the_scratch_shell_takes_keys_whatever_the_stale_pane_focus_says() {
+        // `focus` is the dash's pane selection and opening the shell does not
+        // change it, so it can still say Repos. The shell is a pty regardless.
+        let mut r = Router::new();
+        for stale in [Focus::Repos, Focus::Worktrees, Focus::Terminal] {
+            assert_eq!(
+                r.route(Screen::Shell, stale, key('n')),
+                Routed::ToPty(key('n')),
+                "the shell must take keys with focus {stale:?}"
+            );
+        }
+        // And the prefix still reaches grove from inside it.
+        r.route(Screen::Shell, Focus::Repos, ctrl('g'));
+        assert_eq!(
+            r.route(Screen::Shell, Focus::Repos, key('s')),
+            Routed::Act(Action::OpenPicker)
+        );
+    }
+
+    #[test]
+    fn shift_tab_works_whether_reported_as_backtab_or_tab_plus_shift() {
+        // Kitty-protocol terminals spell it the second way.
+        let mut r = Router::new();
+        for ev in [
+            KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT),
+        ] {
+            r.route(Screen::Dash, Focus::Terminal, ctrl('g'));
+            assert_eq!(
+                r.route(Screen::Dash, Focus::Terminal, ev),
+                Routed::Act(Action::CycleFocusBack),
+                "shift-tab must work as {ev:?}"
+            );
+        }
+        // Plain tab is still forward, not back.
+        r.route(Screen::Dash, Focus::Terminal, ctrl('g'));
+        assert_eq!(
+            r.route(Screen::Dash, Focus::Terminal, code(KeyCode::Tab)),
+            Routed::Act(Action::CycleFocus)
         );
     }
 
