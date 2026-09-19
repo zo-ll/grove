@@ -424,29 +424,31 @@ pub fn create_worktree(
     base: &str,
 ) -> Result<(), WriteError> {
     refuse_checked_out_branch(repo, branch)?;
+    let path = command_path(path);
     let output = Command::new("git")
         .arg("-C")
         .arg(repo)
         .args([OsStr::new("worktree"), OsStr::new("add")])
-        .arg(path)
+        .arg(&path)
         .args([OsStr::new("-b"), OsStr::new(branch), OsStr::new(base)])
         .output()
         .map_err(|err| command_spawn_failure(WriteOperation::AddWorktree, repo, err))?;
-    classify_add_result(repo, path, branch, output)
+    classify_add_result(repo, &path, branch, output)
 }
 
 /// Checks out an existing branch in a new worktree.
 pub fn add_existing_worktree(repo: &Path, path: &Path, branch: &str) -> Result<(), WriteError> {
     refuse_checked_out_branch(repo, branch)?;
+    let path = command_path(path);
     let output = Command::new("git")
         .arg("-C")
         .arg(repo)
         .args([OsStr::new("worktree"), OsStr::new("add")])
-        .arg(path)
+        .arg(&path)
         .arg(branch)
         .output()
         .map_err(|err| command_spawn_failure(WriteOperation::AddWorktree, repo, err))?;
-    classify_add_result(repo, path, branch, output)
+    classify_add_result(repo, &path, branch, output)
 }
 
 fn refuse_checked_out_branch(repo: &Path, branch: &str) -> Result<(), WriteError> {
@@ -496,8 +498,18 @@ fn classify_add_result(
 }
 
 fn checked_out_path(message: &str) -> Option<PathBuf> {
-    let rest = message.split("already checked out at '").nth(1)?;
+    let rest = ["already checked out at '", "already used by worktree at '"]
+        .into_iter()
+        .find_map(|marker| message.split(marker).nth(1))?;
     Some(PathBuf::from(rest.split_once('\'')?.0))
+}
+
+fn command_path(path: &Path) -> PathBuf {
+    if path.is_relative() && path.as_os_str().as_encoded_bytes().first() == Some(&b'-') {
+        Path::new(".").join(path)
+    } else {
+        path.to_owned()
+    }
 }
 
 /// Removes a linked worktree after enforcing Grove's dirty, busy and clone guards.
@@ -977,6 +989,46 @@ mod tests {
             WriteError::BranchAlreadyCheckedOut { branch, path }
                 if branch == "main" && path == clone
         ));
+    }
+
+    #[test]
+    fn checked_out_race_parser_accepts_old_and_current_git_wording() {
+        for (message, expected) in [
+            (
+                "fatal: 'main' is already checked out at '/work/old'",
+                "/work/old",
+            ),
+            (
+                "fatal: 'main' is already used by worktree at '/work/current'",
+                "/work/current",
+            ),
+        ] {
+            assert_eq!(
+                checked_out_path(message).as_deref(),
+                Some(Path::new(expected))
+            );
+        }
+    }
+
+    #[test]
+    fn fetch_prune_removes_deleted_remote_tracking_ref() {
+        let temp = TempDir::new("fetch-prune");
+        let remote = temp.0.join("remote.git");
+        fs::create_dir_all(&remote).unwrap();
+        git(&remote, &["init", "--bare", "-q"]);
+        let clone = temp.0.join("clone");
+        repo(&clone);
+        git(
+            &clone,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&clone, &["push", "-qu", "origin", "main"]);
+        git(&clone, &["branch", "obsolete"]);
+        git(&clone, &["push", "-q", "origin", "obsolete"]);
+        git(&remote, &["update-ref", "-d", "refs/heads/obsolete"]);
+        assert!(clone.join(".git/refs/remotes/origin/obsolete").exists());
+        fetch_prune(&clone).unwrap();
+        assert!(!clone.join(".git/refs/remotes/origin/obsolete").exists());
     }
 
     #[test]
