@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 const FORMAT_VERSION: u32 = 1;
+const SNAPSHOT_FORMAT_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OwnedWorktree {
@@ -29,6 +30,36 @@ pub struct StoredSession {
     pub members: Vec<RepoId>,
     pub owned: Vec<OwnedWorktree>,
     pub state: SessionState,
+}
+
+/// Metadata needed to recreate a terminal shell after the daemon has stopped.
+/// `last_command` is informational and must never be executed during restore.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotTerminal {
+    pub worktree: PathBuf,
+    pub last_command: Option<String>,
+    pub rows: u16,
+    pub cols: u16,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSnapshot {
+    pub session: SessionId,
+    pub terminals: Vec<SnapshotTerminal>,
+}
+
+/// Existing worktrees can be restored while deleted ones are reported to the UI.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RestorePlan {
+    pub terminals: Vec<SnapshotTerminal>,
+    pub missing: Vec<SnapshotTerminal>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SnapshotFile {
+    version: u32,
+    session: SessionId,
+    terminals: Vec<SnapshotTerminal>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -74,6 +105,18 @@ pub enum Error {
     SessionPathTemplate,
     #[error("could not persist session state at {path}: {source}")]
     Persist { path: PathBuf, source: io::Error },
+    #[error("no snapshot exists for session {session:?} at {path}")]
+    SnapshotMissing { session: SessionId, path: PathBuf },
+    #[error("could not read snapshot at {path}: {source}")]
+    SnapshotRead { path: PathBuf, source: io::Error },
+    #[error("snapshot at {path} uses unsupported format version {version}")]
+    SnapshotVersion { path: PathBuf, version: u32 },
+    #[error("snapshot at {path} belongs to {actual:?}, not {expected:?}")]
+    SnapshotSession {
+        path: PathBuf,
+        expected: SessionId,
+        actual: SessionId,
+    },
     #[error("could not serialize session state: {0}")]
     Serialize(#[from] serde_json::Error),
 }
@@ -259,6 +302,80 @@ impl Store {
             .map(|session| &session.id)
     }
 
+    /// Writes a snapshot only when explicitly called. No lifecycle transition
+    /// invokes this method, so snapshots are never automatic.
+    pub fn save_snapshot(
+        &self,
+        session: &SessionId,
+        terminals: Vec<SnapshotTerminal>,
+    ) -> Result<(), Error> {
+        self.session(session)?;
+        let path = self.snapshot_path(session);
+        let file = SnapshotFile {
+            version: SNAPSHOT_FORMAT_VERSION,
+            session: session.clone(),
+            terminals,
+        };
+        let bytes = serde_json::to_vec_pretty(&file)?;
+        write_atomic(&path, &bytes)
+    }
+
+    pub fn load_snapshot(&self, session: &SessionId) -> Result<SessionSnapshot, Error> {
+        self.session(session)?;
+        let path = self.snapshot_path(session);
+        let bytes = fs::read(&path).map_err(|source| {
+            if source.kind() == io::ErrorKind::NotFound {
+                Error::SnapshotMissing {
+                    session: session.clone(),
+                    path: path.clone(),
+                }
+            } else {
+                Error::SnapshotRead {
+                    path: path.clone(),
+                    source,
+                }
+            }
+        })?;
+        let file: SnapshotFile = serde_json::from_slice(&bytes)?;
+        if file.version != SNAPSHOT_FORMAT_VERSION {
+            return Err(Error::SnapshotVersion {
+                path,
+                version: file.version,
+            });
+        }
+        if file.session != *session {
+            return Err(Error::SnapshotSession {
+                path,
+                expected: session.clone(),
+                actual: file.session,
+            });
+        }
+        Ok(SessionSnapshot {
+            session: session.clone(),
+            terminals: file.terminals,
+        })
+    }
+
+    /// Separates restorable terminals from worktrees deleted since the manual
+    /// snapshot was taken. The caller can restore the first group and surface
+    /// every gap from the second group.
+    pub fn restore_plan(&self, session: &SessionId) -> Result<RestorePlan, Error> {
+        let snapshot = self.load_snapshot(session)?;
+        let (terminals, missing) = snapshot
+            .terminals
+            .into_iter()
+            .partition(|terminal| terminal.worktree.is_dir());
+        Ok(RestorePlan { terminals, missing })
+    }
+
+    pub fn snapshot_path(&self, session: &SessionId) -> PathBuf {
+        self.path
+            .parent()
+            .expect("sessions.json has a parent")
+            .join("snapshots")
+            .join(format!("{}.json", snapshot_filename(session)))
+    }
+
     fn check_movable(&self) -> Result<(), Error> {
         if self.session_paths {
             Err(Error::SessionPathTemplate)
@@ -284,34 +401,55 @@ impl Store {
     }
 
     fn persist(&self) -> Result<(), Error> {
-        let parent = self.path.parent().expect("sessions.json has a parent");
-        fs::create_dir_all(parent).map_err(|source| Error::Persist {
-            path: parent.to_owned(),
-            source,
-        })?;
-        let temporary = self.path.with_extension("json.tmp");
         let bytes = serde_json::to_vec_pretty(&self.state)?;
-        let mut options = OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options.open(&temporary).map_err(|source| Error::Persist {
+        write_atomic(&self.path, &bytes)
+    }
+}
+
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), Error> {
+    let parent = path.parent().expect("state file has a parent");
+    fs::create_dir_all(parent).map_err(|source| Error::Persist {
+        path: parent.to_owned(),
+        source,
+    })?;
+    let temporary = path.with_extension("json.tmp");
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temporary).map_err(|source| Error::Persist {
+        path: temporary.clone(),
+        source,
+    })?;
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|source| Error::Persist {
             path: temporary.clone(),
             source,
         })?;
-        file.write_all(&bytes)
-            .and_then(|()| file.sync_all())
-            .map_err(|source| Error::Persist {
-                path: temporary.clone(),
-                source,
-            })?;
-        fs::rename(&temporary, &self.path).map_err(|source| Error::Persist {
-            path: self.path.clone(),
-            source,
-        })
+    fs::rename(&temporary, path).map_err(|source| Error::Persist {
+        path: path.to_owned(),
+        source,
+    })
+}
+
+fn snapshot_filename(session: &SessionId) -> String {
+    let mut encoded = String::new();
+    for byte in session.0.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_') {
+            encoded.push(char::from(byte));
+        } else {
+            use std::fmt::Write as _;
+            write!(&mut encoded, "%{byte:02X}").expect("writing to a string cannot fail");
+        }
+    }
+    if encoded.is_empty() {
+        "%00".into()
+    } else {
+        encoded
     }
 }
 
@@ -496,5 +634,59 @@ mod tests {
         let ended = store.end(&sid("one")).unwrap();
         assert_eq!(ended.id, sid("one"));
         assert!(store.sessions().is_empty());
+    }
+
+    #[test]
+    fn manual_snapshot_round_trips_and_reports_deleted_worktrees() {
+        let temp = TempDir::new();
+        let existing = temp.0.join("existing");
+        let deleted = temp.0.join("deleted");
+        fs::create_dir_all(&existing).unwrap();
+        fs::create_dir_all(&deleted).unwrap();
+        let mut store = Store::load_at(&temp.0, Path::new("/workspace"), "{repo}/{branch}");
+        store.create(sid("one"), "One".into()).unwrap();
+        let terminals = vec![
+            SnapshotTerminal {
+                worktree: existing.clone(),
+                last_command: Some("cargo test".into()),
+                rows: 24,
+                cols: 80,
+            },
+            SnapshotTerminal {
+                worktree: deleted.clone(),
+                last_command: Some("cargo run".into()),
+                rows: 40,
+                cols: 120,
+            },
+        ];
+        store.save_snapshot(&sid("one"), terminals.clone()).unwrap();
+        assert_eq!(
+            store.load_snapshot(&sid("one")).unwrap(),
+            SessionSnapshot {
+                session: sid("one"),
+                terminals: terminals.clone(),
+            }
+        );
+
+        fs::remove_dir_all(&deleted).unwrap();
+        let plan = store.restore_plan(&sid("one")).unwrap();
+        assert_eq!(plan.terminals, vec![terminals[0].clone()]);
+        assert_eq!(plan.missing, vec![terminals[1].clone()]);
+    }
+
+    #[test]
+    fn snapshot_names_cannot_escape_the_workspace_state_directory() {
+        let temp = TempDir::new();
+        let mut store = Store::load_at(&temp.0, Path::new("/workspace"), "{repo}/{branch}");
+        let hostile = sid("../../other/session");
+        store.create(hostile.clone(), "Hostile".into()).unwrap();
+        store.save_snapshot(&hostile, Vec::new()).unwrap();
+        let path = store.snapshot_path(&hostile);
+        assert_eq!(
+            path.parent(),
+            Some(store.path().parent().unwrap().join("snapshots").as_path())
+        );
+        assert!(path.exists());
+        assert_eq!(store.load_snapshot(&hostile).unwrap().session, hostile);
     }
 }

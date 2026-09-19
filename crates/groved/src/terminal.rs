@@ -1,4 +1,6 @@
+use grove_domain::SessionId;
 use grove_proto::TerminalId;
+use grove_state::{SnapshotTerminal, Store};
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::collections::HashMap;
 use std::fs;
@@ -33,12 +35,20 @@ pub struct Attachment {
     pub output: mpsc::Receiver<Vec<u8>>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RestoreReport {
+    pub restored: Vec<TerminalId>,
+    pub missing: Vec<SnapshotTerminal>,
+}
+
 #[derive(Debug, Error)]
 pub enum TerminalError {
     #[error("a terminal already exists for {0:?}")]
     AlreadyExists(TerminalKey),
     #[error("terminal {0:?} does not exist")]
     Missing(TerminalId),
+    #[error("scratch terminal {0:?} does not belong in a session snapshot")]
+    ScratchSnapshot(TerminalId),
     #[error("terminal size must be non-zero, got {rows}x{cols}")]
     InvalidSize { rows: u16, cols: u16 },
     #[error("could not open or spawn pty: {0}")]
@@ -47,6 +57,8 @@ pub enum TerminalError {
     Io(#[from] io::Error),
     #[error("terminal state lock was poisoned")]
     Poisoned,
+    #[error(transparent)]
+    State(#[from] grove_state::Error),
 }
 
 struct TerminalProcess {
@@ -260,6 +272,51 @@ impl TerminalManager {
             .map(|name| name.trim().to_owned()))
     }
 
+    /// Captures terminal metadata in the session's manual snapshot. Commands
+    /// are recorded for display only; restore never sends them to a PTY.
+    pub fn save_session_snapshot(
+        &self,
+        store: &Store,
+        session: &SessionId,
+        terminals: &[TerminalId],
+    ) -> Result<(), TerminalError> {
+        let terminals = terminals
+            .iter()
+            .map(|id| {
+                let terminal = self.terminal(*id)?;
+                let TerminalKey::Worktree(worktree) = &terminal.key else {
+                    return Err(TerminalError::ScratchSnapshot(*id));
+                };
+                Ok(SnapshotTerminal {
+                    worktree: worktree.clone(),
+                    last_command: self.foreground_process(*id)?,
+                    rows: terminal.rows,
+                    cols: terminal.cols,
+                })
+            })
+            .collect::<Result<Vec<_>, TerminalError>>()?;
+        store.save_snapshot(session, terminals)?;
+        Ok(())
+    }
+
+    /// Starts a fresh shell for every worktree that still exists. The saved
+    /// command is deliberately ignored: a snapshot restores layout, not work.
+    pub fn restore_session_snapshot(
+        &mut self,
+        store: &Store,
+        session: &SessionId,
+    ) -> Result<RestoreReport, TerminalError> {
+        let plan = store.restore_plan(session)?;
+        let mut restored = Vec::with_capacity(plan.terminals.len());
+        for terminal in plan.terminals {
+            restored.push(self.spawn_worktree(&terminal.worktree, terminal.rows, terminal.cols)?);
+        }
+        Ok(RestoreReport {
+            restored,
+            missing: plan.missing,
+        })
+    }
+
     pub fn kill(&mut self, id: TerminalId) -> Result<(), TerminalError> {
         self.terminal(id)?
             .killer
@@ -466,5 +523,60 @@ mod tests {
         assert!(growth < 128 * 1024);
         drop(manager);
         let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[test]
+    fn restore_recreates_existing_terminals_without_executing_saved_commands() {
+        let root = temp_dir();
+        let existing = root.join("existing");
+        let deleted = root.join("deleted");
+        let marker = root.join("must-not-exist");
+        fs::create_dir_all(&existing).unwrap();
+        fs::create_dir_all(&deleted).unwrap();
+        let session = SessionId("restore-test".into());
+        let mut store = Store::load_at(&root, &root, "{repo}/{branch}");
+        store
+            .create(session.clone(), "Restore test".into())
+            .unwrap();
+        store
+            .save_snapshot(
+                &session,
+                vec![
+                    SnapshotTerminal {
+                        worktree: existing.clone(),
+                        last_command: Some(format!("touch {}", marker.display())),
+                        rows: 24,
+                        cols: 80,
+                    },
+                    SnapshotTerminal {
+                        worktree: deleted.clone(),
+                        last_command: Some("cargo test".into()),
+                        rows: 40,
+                        cols: 120,
+                    },
+                ],
+            )
+            .unwrap();
+        fs::remove_dir_all(&deleted).unwrap();
+
+        let mut manager = TerminalManager::new(PathBuf::from("/bin/sh"), root.clone(), 100);
+        let report = manager.restore_session_snapshot(&store, &session).unwrap();
+        assert_eq!(report.restored.len(), 1);
+        assert_eq!(report.missing.len(), 1);
+        assert_eq!(report.missing[0].worktree, deleted);
+        assert_eq!(
+            (
+                manager.snapshot(report.restored[0]).unwrap().rows,
+                manager.snapshot(report.restored[0]).unwrap().cols
+            ),
+            (24, 80)
+        );
+        thread::sleep(Duration::from_millis(50));
+        assert!(
+            !marker.exists(),
+            "saved command was executed during restore"
+        );
+        drop(manager);
+        let _ = fs::remove_dir_all(root);
     }
 }
