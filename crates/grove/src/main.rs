@@ -13,6 +13,7 @@ mod events;
 mod keymap;
 mod statusbar;
 mod terminal;
+mod theme;
 
 use std::io::Stdout;
 use std::os::unix::net::UnixStream;
@@ -20,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use events::{Input, Inputs};
+use grove_lua::{TuiConfig, TuiRuntime};
 use grove_proto::{
     Event as DaemonEvent, Handshake, PROTOCOL_VERSION, Request, accept_welcome, socket_path,
 };
@@ -28,28 +30,71 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::Event as TermEvent;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Padding, Paragraph, Wrap};
+use theme::{Depth, Role, Theme};
 
 /// What the shell is currently able to show. Screens replace this in #18-#30;
 /// until then it is enough to prove the loop, the redraw policy and the
 /// teardown all behave.
-/// Where grove is and what has focus, so routing can depend on both.
+/// Where grove is, what has focus, and what it looks like.
 struct Ui {
     screen: Screen,
     focus: Focus,
     router: Router,
+    theme: Theme,
+    /// What the config could not give us, shown once rather than swallowed.
+    /// SPEC §9: a broken config reports and keeps running.
+    config_note: Option<String>,
 }
 
 impl Ui {
+    #[cfg(test)]
     fn new() -> Self {
+        Self::with_config(&TuiConfig::default(), None, Depth::detect())
+    }
+
+    fn with_config(
+        config: &TuiConfig,
+        error: Option<grove_lua::ConfigError>,
+        depth: Depth,
+    ) -> Self {
+        let (theme, bad) = Theme::resolve(config, depth);
+        // One line, not one per problem: the bar has a few columns, and a user
+        // who mistyped two colours needs to know that, not to read a list.
+        let mut notes: Vec<String> = Vec::new();
+        if let Some(error) = error {
+            notes.push(error.message().to_owned());
+        }
+        notes.extend(bad.iter().map(ToString::to_string));
         Self {
             screen: Screen::Dash,
             focus: Focus::Worktrees,
             router: Router::new(),
+            theme,
+            config_note: (!notes.is_empty()).then(|| notes.join("; ")),
         }
     }
+}
+
+/// `$XDG_CONFIG_HOME/grove/config.lua`, falling back to `~/.config`, per
+/// SPEC §9. A missing file is not an error — it means defaults.
+fn config_path() -> PathBuf {
+    config_path_from(
+        std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
+        std::env::var_os("HOME").map(PathBuf::from),
+    )
+}
+
+/// The lookup itself, taking its inputs rather than reading them, so it can be
+/// tested without setting process-wide environment variables — which race,
+/// since tests share a process.
+fn config_path_from(xdg: Option<PathBuf>, home: Option<PathBuf>) -> PathBuf {
+    xdg.or_else(|| home.map(|home| home.join(".config")))
+        .unwrap_or_else(|| PathBuf::from(".config"))
+        .join("grove")
+        .join("config.lua")
 }
 
 enum State {
@@ -80,9 +125,13 @@ fn main() -> ExitCode {
 }
 
 fn run(workspace: PathBuf) -> std::io::Result<()> {
+    // Before the terminal is taken, so a config error can still be printed if
+    // anything below fails outright.
+    let loaded = TuiRuntime::load(config_path());
+    let mut ui = Ui::with_config(loaded.runtime.config(), loaded.error, Depth::detect());
+
     let inputs = Inputs::new();
     let mut state = connect(&workspace, &inputs);
-    let mut ui = Ui::new();
 
     let (_guard, mut term) = terminal::Guard::new()?;
 
@@ -289,43 +338,54 @@ fn draw(f: &mut ratatui::Frame, state: &State, ui: &Ui) {
             "grove",
             vec![
                 Line::from(vec![
-                    Span::raw("workspace  "),
+                    Span::styled("workspace  ", ui.theme.style(Role::Muted)),
                     Span::styled(
                         workspace.display().to_string(),
-                        Style::default().add_modifier(Modifier::BOLD),
+                        ui.theme.style(Role::Clean).add_modifier(Modifier::BOLD),
                     ),
                 ]),
-                Line::from(format!("daemon     {note}")),
+                Line::from(vec![
+                    Span::styled("daemon     ", ui.theme.style(Role::Muted)),
+                    Span::styled(note.clone(), ui.theme.style(Role::Clean)),
+                ]),
                 Line::from(""),
-                Line::from("screens land in #18-#30"),
-                Line::from("ctrl-q to quit"),
+                Line::styled("screens land in #18-#30", ui.theme.style(Role::Muted)),
+                Line::styled("ctrl-q to quit", ui.theme.style(Role::Muted)),
             ],
         ),
         State::Disconnected { workspace, reason } => (
             "grove — disconnected",
             vec![
                 Line::from(vec![
-                    Span::raw("workspace  "),
+                    Span::styled("workspace  ", ui.theme.style(Role::Muted)),
                     Span::styled(
                         workspace.display().to_string(),
-                        Style::default().add_modifier(Modifier::BOLD),
+                        ui.theme.style(Role::Accent).add_modifier(Modifier::BOLD),
                     ),
                 ]),
                 Line::from(""),
-                Line::from(reason.clone()),
+                Line::styled(reason.clone(), ui.theme.style(Role::Error)),
                 Line::from(""),
                 // Said plainly, because the distinction matters: the daemon
                 // holds the user's running work.
-                Line::from("terminals in a running daemon are unaffected by this."),
-                Line::from("ctrl-q to quit"),
+                Line::styled(
+                    "terminals in a running daemon are unaffected by this.",
+                    ui.theme.style(Role::Muted),
+                ),
+                Line::styled("ctrl-q to quit", ui.theme.style(Role::Muted)),
             ],
         ),
     };
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(title)
-        .title_alignment(Alignment::Left);
+        // Corners are a theme setting, so the border type cannot be a literal
+        // here — this is the one place the setting becomes visible.
+        .border_type(ui.theme.border())
+        .border_style(ui.theme.style(Role::Muted))
+        .title(Span::styled(title, ui.theme.style(Role::Accent)))
+        .title_alignment(Alignment::Left)
+        .padding(Padding::horizontal(ui.theme.padding()));
 
     f.render_widget(
         Paragraph::new(body).block(block).wrap(Wrap { trim: false }),
@@ -344,6 +404,8 @@ fn draw(f: &mut ratatui::Frame, state: &State, ui: &Ui) {
             &context,
             "no session",
             bar_area.width,
+            &ui.theme,
+            ui.config_note.as_deref(),
         )),
         bar_area,
     );
@@ -361,6 +423,57 @@ mod tests {
             workspace: PathBuf::from("/w"),
             note: "connected".into(),
         }
+    }
+
+    #[test]
+    fn a_config_that_throws_leaves_grove_usable_and_says_so() {
+        // SPEC §9: a broken config must never brick grove. It falls back to
+        // defaults entirely, reports, and keeps running — so the assertion is
+        // both halves, the working theme and the message.
+        let loaded = grove_lua::TuiRuntime::load_source("error('boom')", "broken");
+        let ui = Ui::with_config(loaded.runtime.config(), loaded.error, Depth::True);
+        assert_eq!(
+            ui.theme,
+            Theme::resolve(&TuiConfig::default(), Depth::True).0,
+            "a thrown config falls back to defaults entirely"
+        );
+        let note = ui.config_note.expect("the failure must be reported");
+        assert!(
+            note.contains("boom"),
+            "the note must carry the cause: {note}"
+        );
+    }
+
+    #[test]
+    fn a_config_that_loads_but_misspells_a_colour_reports_that_instead() {
+        // A different failure from a throw: the file evaluated, so there is no
+        // ConfigError — only a value this crate could not read. It must still
+        // reach the user, or the setting silently does nothing.
+        let loaded = grove_lua::TuiRuntime::load_source(
+            "local grove = require('grove')\n\
+             grove.setup({ theme = { accent = 'peach' } })",
+            "typo",
+        );
+        assert!(loaded.error.is_none(), "the file itself is valid Lua");
+        let ui = Ui::with_config(loaded.runtime.config(), loaded.error, Depth::True);
+        let note = ui.config_note.expect("a bad colour must be reported");
+        assert!(
+            note.contains("accent"),
+            "the note must name the setting: {note}"
+        );
+    }
+
+    #[test]
+    fn the_config_lives_where_the_spec_says() {
+        assert_eq!(
+            config_path_from(Some(PathBuf::from("/x")), Some(PathBuf::from("/home/u"))),
+            PathBuf::from("/x/grove/config.lua"),
+            "XDG_CONFIG_HOME wins when it is set"
+        );
+        assert_eq!(
+            config_path_from(None, Some(PathBuf::from("/home/u"))),
+            PathBuf::from("/home/u/.config/grove/config.lua")
+        );
     }
 
     #[test]
