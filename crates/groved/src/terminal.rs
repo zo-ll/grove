@@ -125,8 +125,16 @@ impl TerminalManager {
         cols: u16,
     ) -> Result<TerminalId, TerminalError> {
         validate_size(rows, cols)?;
-        if self.keys.contains_key(&key) {
-            return Err(TerminalError::AlreadyExists(key));
+        if let Some(existing) = self.keys.get(&key).copied() {
+            if self
+                .terminals
+                .get(&existing)
+                .is_some_and(|terminal| terminal.alive.load(Ordering::Acquire))
+            {
+                return Err(TerminalError::AlreadyExists(key));
+            }
+            self.keys.remove(&key);
+            self.terminals.remove(&existing);
         }
         let size = PtySize {
             rows,
@@ -333,11 +341,14 @@ impl TerminalManager {
     }
 
     pub fn kill(&mut self, id: TerminalId) -> Result<(), TerminalError> {
-        self.terminal(id)?
-            .killer
-            .lock()
-            .map_err(|_| TerminalError::Poisoned)?
-            .kill()?;
+        let terminal = self.terminal(id)?;
+        if terminal.alive.load(Ordering::Acquire) {
+            terminal
+                .killer
+                .lock()
+                .map_err(|_| TerminalError::Poisoned)?
+                .kill()?;
+        }
         let terminal = self
             .terminals
             .remove(&id)
@@ -487,6 +498,27 @@ mod tests {
             Err(TerminalError::AlreadyExists(TerminalKey::Scratch))
         ));
         drop(manager);
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[test]
+    fn exited_terminal_does_not_permanently_claim_its_worktree() {
+        let cwd = temp_dir();
+        let mut manager = TerminalManager::new(PathBuf::from("/bin/true"), cwd.clone(), 100);
+        let first = manager.spawn_worktree(&cwd, 24, 80).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while manager.is_alive(first).unwrap() {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        let second = manager.spawn_worktree(&cwd, 24, 80).unwrap();
+        assert_ne!(first, second);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while manager.is_alive(second).unwrap() {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        manager.kill(second).unwrap();
         let _ = fs::remove_dir_all(cwd);
     }
 

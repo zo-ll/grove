@@ -17,7 +17,7 @@ use thiserror::Error;
 const FORMAT_VERSION: u32 = 1;
 const SNAPSHOT_FORMAT_VERSION: u32 = 1;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct OwnedWorktree {
     pub repo: RepoId,
     pub branch: String,
@@ -201,6 +201,11 @@ impl Store {
         Ok(())
     }
 
+    pub fn rename(&mut self, session: &SessionId, name: String) -> Result<(), Error> {
+        self.session_mut(session)?.name = name;
+        self.persist()
+    }
+
     pub fn remove_member(&mut self, session: &SessionId, repo: &RepoId) -> Result<(), Error> {
         let target = self.session_mut(session)?;
         target.members.retain(|member| member != repo);
@@ -261,6 +266,28 @@ impl Store {
         clone_path: &Path,
     ) -> Result<(), Error> {
         self.check_movable()?;
+        self.claim(session, worktree, worktree_path, clone_path)
+    }
+
+    /// Records a worktree just created at the configured destination. This is
+    /// not a move, so `{session}` templates do not disable it.
+    pub fn own_created(
+        &mut self,
+        session: &SessionId,
+        worktree: OwnedWorktree,
+        worktree_path: &Path,
+        clone_path: &Path,
+    ) -> Result<(), Error> {
+        self.claim(session, worktree, worktree_path, clone_path)
+    }
+
+    fn claim(
+        &mut self,
+        session: &SessionId,
+        worktree: OwnedWorktree,
+        worktree_path: &Path,
+        clone_path: &Path,
+    ) -> Result<(), Error> {
         if same_path(worktree_path, clone_path) {
             return Err(Error::CloneNotOwnable(worktree_path.to_owned()));
         }
@@ -305,6 +332,10 @@ impl Store {
             .iter()
             .find(|session| session.owned.contains(worktree))
             .map(|session| &session.id)
+    }
+
+    pub fn ownership_movable(&self) -> bool {
+        !self.session_paths
     }
 
     /// Writes a snapshot only when explicitly called. No lifecycle transition
@@ -393,7 +424,7 @@ impl Store {
         }
     }
 
-    fn session(&self, id: &SessionId) -> Result<&StoredSession, Error> {
+    pub fn session(&self, id: &SessionId) -> Result<&StoredSession, Error> {
         self.state
             .sessions
             .iter()
@@ -407,6 +438,26 @@ impl Store {
             .iter_mut()
             .find(|session| &session.id == id)
             .ok_or_else(|| Error::SessionMissing(id.clone()))
+    }
+
+    /// Drops ownership after the daemon has successfully removed a worktree
+    /// while ending a session. Unlike `release`, this never moves a worktree
+    /// and therefore remains valid with a `{session}` path template.
+    pub fn forget_owned(
+        &mut self,
+        session: &SessionId,
+        worktree: &OwnedWorktree,
+    ) -> Result<(), Error> {
+        let target = self.session_mut(session)?;
+        let Some(index) = target.owned.iter().position(|owned| owned == worktree) else {
+            return Err(Error::NotOwned {
+                session: session.clone(),
+                repo: worktree.repo.clone(),
+                branch: worktree.branch.clone(),
+            });
+        };
+        target.owned.remove(index);
+        self.persist()
     }
 
     fn persist(&self) -> Result<(), Error> {
@@ -633,6 +684,19 @@ mod tests {
                 Path::new("/linked"),
                 Path::new("/clone")
             ),
+            Err(Error::SessionPathTemplate)
+        ));
+        store
+            .own_created(
+                &sid("one"),
+                owned("repo", "created"),
+                Path::new("/linked"),
+                Path::new("/clone"),
+            )
+            .unwrap();
+        assert_eq!(store.owner(&owned("repo", "created")), Some(&sid("one")));
+        assert!(matches!(
+            store.release(&sid("one"), &owned("repo", "created")),
             Err(Error::SessionPathTemplate)
         ));
     }
