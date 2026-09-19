@@ -402,6 +402,7 @@ The complete set grove performs. Anything not on this list, grove does not do.
 | list worktrees | `git -C <repo> worktree list --porcelain` |
 | base branch | `git -C <repo> symbolic-ref refs/remotes/origin/HEAD` |
 | dirty state | `git -C <wt> status --porcelain` |
+| branch age | `git -C <wt> show -s --format=%ct HEAD` |
 | ahead / behind | `git -C <wt> rev-list --left-right --count @{upstream}...HEAD` |
 | merged | `git -C <repo> merge-base --is-ancestor <branch> <base>` |
 | upstream gone | absent remote ref after `fetch --prune` |

@@ -3,7 +3,7 @@
 use crate::fetch::{FetchPolicy, FetchResult, FetchStatus, RefFreshness};
 use crate::terminal::{TerminalError, TerminalManager};
 use grove_domain::{Ownership, RepoId, SessionId, SessionState};
-use grove_git::{RemoveOptions, Repository, Tracking, Workspace};
+use grove_git::{RemoveOptions, Repository, SizeTask, Tracking, Workspace};
 use grove_lua::{DaemonRuntime, HookReport, LifecycleEvent, LifecyclePayload, WorktreePathContext};
 use grove_proto::{Event, RepoRow, Request, SessionRow, TerminalId, WorktreeRef, WorktreeRow};
 use grove_state::{OwnedWorktree, Store};
@@ -11,6 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
@@ -135,6 +136,15 @@ pub struct SessionOrchestrator {
     hook_reports: Vec<HookReport>,
     notified_exits: HashSet<TerminalId>,
     unknown_overrides: Vec<String>,
+    /// Size walks in flight, keyed by checkout path. §7's size read is
+    /// cancellable and never blocks a caller, so a request starts the walk and
+    /// reports the last known value; the walk's answer lands on a later
+    /// request.
+    pending_sizes: HashMap<PathBuf, SizeTask>,
+    /// Completed size walks, keyed by checkout path. Scoped to the repo the
+    /// pane is currently showing: bounded memory beats a daemon-lifetime map
+    /// of paths for repos the pane may never show again.
+    known_sizes: HashMap<PathBuf, u64>,
 }
 
 impl SessionOrchestrator {
@@ -184,6 +194,8 @@ impl SessionOrchestrator {
             hook_reports: Vec::new(),
             notified_exits: HashSet::new(),
             unknown_overrides,
+            pending_sizes: HashMap::new(),
+            known_sizes: HashMap::new(),
         }
     }
 
@@ -199,6 +211,7 @@ impl SessionOrchestrator {
     /// effects before returning events, so the socket layer remains transport.
     pub fn handle_request(&mut self, request: Request) -> Vec<Event> {
         self.fire_observed_terminal_exits();
+        self.drain_sizes();
         let mut events = self.drain_unknown_overrides();
         let context = format!("{request:?}");
         events.extend(match self.apply_request(request) {
@@ -347,6 +360,23 @@ impl SessionOrchestrator {
         }
     }
 
+    /// Moves completed size walks into the known cache. A walk that failed —
+    /// typically because its checkout was removed mid-walk — answers nothing
+    /// and is dropped.
+    fn drain_sizes(&mut self) {
+        let mut finished: Vec<(PathBuf, u64)> = Vec::new();
+        self.pending_sizes
+            .retain(|path, task| match task.try_result() {
+                Ok(Some(size)) => {
+                    finished.push((path.clone(), size));
+                    false
+                }
+                Ok(None) => true,
+                Err(_) => false,
+            });
+        self.known_sizes.extend(finished);
+    }
+
     /// The REPOS pane's rows (SPEC §4.1), in display order.
     fn repo_rows(&self) -> Result<Vec<RepoRow>, OrchestrationError> {
         let open_members = self
@@ -356,9 +386,21 @@ impl SessionOrchestrator {
             .map(|stored| &stored.members);
         let mut rows = Vec::new();
         for repository in self.repositories.values() {
-            let checkouts = grove_git::worktrees(&repository.path)?;
-            // The count and dirtiness cover every checkout grove can see,
-            // clone included: the pane reports what exists, not what is owned.
+            // A repo git cannot answer for is omitted from the pane rather
+            // than blanking it with a failure; worktree_rows degrades per row
+            // for the same reason.
+            let Ok(checkouts) = grove_git::worktrees(&repository.path) else {
+                continue;
+            };
+            // The count covers branched work only: the clone is listed on the
+            // WORKTREES pane, but a repo whose checkout is just the clone is
+            // the documented "haven't branched yet" state, and §4.1 renders
+            // it as ·. A count including the clone would make that state
+            // unreachable, since every repo has its clone.
+            let worktrees = checkouts
+                .iter()
+                .filter(|checkout| !checkout.is_clone)
+                .count();
             let dirty = checkouts
                 .iter()
                 .any(|checkout| grove_git::is_dirty(&checkout.path).unwrap_or(false));
@@ -376,7 +418,7 @@ impl SessionOrchestrator {
                 // Provenance the pane renders: only a base that came from
                 // git's advertised default may claim "(from origin/HEAD)".
                 base_from_origin_head: override_base.is_none() && repository.base_branch.is_some(),
-                worktrees: u32::try_from(checkouts.len()).unwrap_or(u32::MAX),
+                worktrees: u32::try_from(worktrees).unwrap_or(u32::MAX),
                 dirty,
                 member: open_members.is_some_and(|members| members.contains(&repository.id)),
             });
@@ -391,7 +433,7 @@ impl SessionOrchestrator {
 
     /// The WORKTREES pane's rows (SPEC §4.1): every checkout of one repo,
     /// regardless of owner, plus the clone.
-    fn worktree_rows(&self, repo: &RepoId) -> Result<Vec<WorktreeRow>, OrchestrationError> {
+    fn worktree_rows(&mut self, repo: &RepoId) -> Result<Vec<WorktreeRow>, OrchestrationError> {
         let repository = self.repository(repo)?.clone();
         // Staleness tracks the repo's fetch, not the branch: refs that are
         // unreadable or too old mean ahead/behind may be wrong, exactly as the
@@ -405,7 +447,10 @@ impl SessionOrchestrator {
             });
         let checkouts = grove_git::worktrees(&repository.path)?;
         let mut rows = Vec::new();
+        let mut paths = HashSet::new();
         for checkout in checkouts {
+            paths.insert(checkout.path.clone());
+            let detached = checkout.branch.is_none();
             let (ahead, behind) = match grove_git::ahead_behind(&checkout.path) {
                 Ok(Tracking::Tracked(counts)) => (counts.ahead, counts.behind),
                 // No upstream is data, not failure; an unreadable checkout
@@ -415,28 +460,63 @@ impl SessionOrchestrator {
             let terminal = self.live_worktree_terminal(&repository.id, checkout.branch.as_deref());
             let foreground =
                 terminal.and_then(|id| self.terminals.foreground_process(id).ok().flatten());
+            let mut degraded = false;
+            let dirty_files = match grove_git::dirty_file_count(&checkout.path) {
+                Ok(count) => count,
+                Err(_) => {
+                    degraded = true;
+                    0
+                }
+            };
+            let age = match grove_git::branch_age(&checkout.path) {
+                Ok(age) => age.unwrap_or_default(),
+                Err(_) => {
+                    degraded = true;
+                    Duration::default()
+                }
+            };
             rows.push(WorktreeRow {
                 worktree: WorktreeRef {
                     repo: repository.id.clone(),
-                    branch: checkout.branch.clone().unwrap_or_else(|| DETACHED.into()),
+                    // A detached HEAD names no branch, and the row must not
+                    // smuggle a sentinel that a real branch could collide
+                    // with: the branch is empty and `detached` says so.
+                    branch: checkout.branch.clone().unwrap_or_default(),
                 },
+                detached,
                 ownership: self.ownership(&repository, &checkout),
                 ahead,
                 behind,
-                dirty_files: grove_git::dirty_file_count(&checkout.path).unwrap_or(0),
-                age: grove_git::ref_age(&checkout.path)
-                    .ok()
-                    .flatten()
-                    .unwrap_or_default()
-                    .as_secs(),
-                size: grove_git::worktree_size_now(&checkout.path).unwrap_or(0),
+                dirty_files,
+                age: age.as_secs(),
+                size: self.known_size(&checkout.path),
                 terminal,
                 foreground,
-                stale: freshness.stale,
+                // A degraded row must not present its confident zeros as
+                // fresh facts, so it is marked stale too.
+                stale: freshness.stale || degraded,
             });
         }
+        // The size cache is scoped to the repo the pane is showing: switching
+        // repos re-measures, and removed checkouts do not linger.
+        self.pending_sizes.retain(|path, _| paths.contains(path));
+        self.known_sizes.retain(|path, _| paths.contains(path));
         rows.sort_by(|a, b| a.worktree.branch.cmp(&b.worktree.branch));
         Ok(rows)
+    }
+
+    /// The last known size of a checkout, starting the background walk when
+    /// none is in flight. The first request after a worktree appears answers
+    /// 0; the walk's answer lands on a later request.
+    fn known_size(&mut self, path: &Path) -> u64 {
+        if let Some(size) = self.known_sizes.get(path) {
+            return *size;
+        }
+        if !self.pending_sizes.contains_key(path) {
+            self.pending_sizes
+                .insert(path.to_path_buf(), grove_git::worktree_size(path));
+        }
+        0
     }
 
     /// Re-walks the workspace with the configured `ignore` globs (§5's `scan`)
@@ -450,6 +530,22 @@ impl SessionOrchestrator {
             .iter()
             .cloned()
             .map(|repository| (repository.id.clone(), repository))
+            .collect();
+        // The scan changed the population an override can apply to, so the
+        // unknown set is recomputed: a rescan is a deliberate re-sync, and its
+        // report is fresh even when a name was reported before the scan.
+        let known: HashSet<&str> = self.repositories.keys().map(|id| id.0.as_str()).collect();
+        let mut names: Vec<String> = self
+            .runtime
+            .repo_overrides()
+            .iter()
+            .map(|rule| rule.name.clone())
+            .collect();
+        names.sort();
+        names.dedup();
+        self.unknown_overrides = names
+            .into_iter()
+            .filter(|name| !known.contains(name.as_str()))
             .collect();
         Ok(())
     }
@@ -1025,9 +1121,6 @@ fn owned_ref(worktree: WorktreeRef) -> OwnedWorktree {
     }
 }
 
-/// What a checkout with no branch checked out is named in display rows.
-const DETACHED: &str = "(detached)";
-
 /// Whether two paths name the same directory, tolerating symlinks and
 /// case-stable mounts on whichever side exists to canonicalize.
 fn paths_equal(a: &Path, b: &Path) -> bool {
@@ -1353,6 +1446,17 @@ mod tests {
             ],
         );
         fs::write(feat_path.join("uncommitted"), "work\n").unwrap();
+        // The age column renders seconds since the branch's tip commit, so
+        // feat gets a tip commit with a known old timestamp.
+        let committed = Command::new("git")
+            .arg("-C")
+            .arg(&feat_path)
+            .env("GIT_AUTHOR_DATE", "2026-01-01T00:00:00Z")
+            .env("GIT_COMMITTER_DATE", "2026-01-01T00:00:00Z")
+            .args(["commit", "--allow-empty", "-qm", "old tip"])
+            .status()
+            .unwrap();
+        assert!(committed.success());
 
         let template = temp.0.join("trees/{repo}/{branch_slug}");
         let template = template.to_string_lossy().into_owned();
@@ -1434,10 +1538,10 @@ mod tests {
             ["repo-a", "repo-b"]
         );
         let row_a = &rows[0];
-        assert_eq!(
-            row_a.worktrees, 3,
-            "the clone counts among visible checkouts"
-        );
+        // Branched work only: the clone is listed on the WORKTREES pane but
+        // never counted, or §4.1's · state ("haven't branched yet") would be
+        // unreachable — every repo has its clone.
+        assert_eq!(row_a.worktrees, 2);
         assert!(row_a.dirty, "the feat worktree has an uncommitted file");
         assert!(row_a.member);
         // The override supplied the base, so the pane may not claim
@@ -1445,7 +1549,9 @@ mod tests {
         assert_eq!(row_a.base_branch, "origin/develop");
         assert!(!row_a.base_from_origin_head);
         let row_b = &rows[1];
-        assert_eq!(row_b.worktrees, 1);
+        // repo-b holds only its clone: the documented zero-worktree state,
+        // rendered · — reachable only when the clone is not counted.
+        assert_eq!(row_b.worktrees, 0);
         assert!(!row_b.dirty);
         assert!(!row_b.member);
         assert_eq!(row_b.base_branch, "origin/main");
@@ -1467,7 +1573,10 @@ mod tests {
         assert_eq!(feat.dirty_files, 1);
         // `open` spawned the terminal of the worktree session one owns.
         assert!(feat.terminal.is_some());
-        assert!(feat.size > 0);
+        // §7's size read never blocks a caller: the first request answers the
+        // last known value, 0, and the walk's answer lands on the next one.
+        assert_eq!(feat.size, 0);
+        assert!(feat.age > 0, "the branch has a tip commit");
         // Open's fetch attempt wrote a FETCH_HEAD, however briefly: the repo's
         // refs count as fresh.
         assert!(!rows[0].stale);
@@ -1476,6 +1585,15 @@ mod tests {
         assert_eq!(main.terminal, None);
         let other = &rows[2];
         assert_eq!(other.ownership, Ownership::Other(sid("two")));
+
+        // The next request has drained the background size walk, so this
+        // refresh carries the measured size.
+        let events = daemon.handle_request(Request::ListWorktrees(RepoId("repo-a".into())));
+        let Some(Event::Worktrees { rows, .. }) = events.into_iter().next() else {
+            panic!("expected Worktrees")
+        };
+        assert!(rows[0].size > 0, "the size walk answered between requests");
+        assert_eq!(rows[0].ownership, Ownership::Ours);
 
         // A repo that was never fetched has no FETCH_HEAD, and unknown refs
         // are stale exactly as the fetch policy judges them.

@@ -23,7 +23,7 @@ use std::process::{Command, Output};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -698,18 +698,29 @@ pub fn worktree_size(path: impl Into<PathBuf>) -> SizeTask {
     }
 }
 
-/// Blocks until the walk completes, unlike [`worktree_size`]. For
-/// request-scoped callers that need one number now and cannot poll; the
-/// cancellable background form remains for everything else.
-pub fn worktree_size_now(path: impl Into<PathBuf>) -> Result<u64, io::Error> {
-    let path = path.into();
-    let cancelled = AtomicBool::new(false);
-    match directory_size(&path, &cancelled) {
-        Some(result) => result,
-        // Unreachable while the flag stays false; a zero is cheaper than a
-        // panic a request handler would have to recover from.
-        None => Ok(0),
+/// Seconds since the checked-out branch was last updated: the tip commit's
+/// creation timestamp. `None` when the checkout has no commit to answer with
+/// (an unborn HEAD). §7's read list names this op; §4.1 renders its result as
+/// the WORKTREES pane's age column.
+pub fn branch_age(worktree: &Path) -> Result<Option<Duration>, Error> {
+    let output = git_output(worktree, &["show", "-s", "--format=%ct", "HEAD"])?;
+    if !output.status.success() {
+        return Ok(None);
     }
+    let seconds = text_output("branch age", worktree, &output.stdout)?
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| Error::MalformedGitOutput {
+            operation: "branch age",
+            path: worktree.to_owned(),
+            message: "HEAD timestamp was not an integer".into(),
+        })?;
+    Ok(Some(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .saturating_sub(Duration::from_secs(seconds)),
+    ))
 }
 
 fn directory_size(path: &Path, cancelled: &AtomicBool) -> Option<Result<u64, io::Error>> {

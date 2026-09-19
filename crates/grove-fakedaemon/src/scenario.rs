@@ -67,6 +67,7 @@ fn wt(
             repo: RepoId(repo.into()),
             branch: branch.into(),
         },
+        detached: false,
         ownership,
         ahead,
         behind,

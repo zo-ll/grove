@@ -203,6 +203,9 @@ pub struct RepoRow {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorktreeRow {
     pub worktree: WorktreeRef,
+    /// True when HEAD is detached: `branch` is then empty, and the checkout
+    /// cannot be adopted or released by branch name.
+    pub detached: bool,
     pub ownership: Ownership,
     pub ahead: u64,
     pub behind: u64,
@@ -213,8 +216,15 @@ pub struct WorktreeRow {
     /// only destructive action in the product. A bool would force the client to
     /// say "some files", which is a weaker warning than the spec asks for.
     pub dirty_files: u32,
-    /// Seconds since the worktree was last touched.
+    /// Seconds since the worktree's branch was last updated: the tip commit's
+    /// timestamp. §4.1's example shows differing per-row ages, which a
+    /// repo-level value can never produce.
     pub age: u64,
+    /// Last known bytes occupied by the checkout.
+    ///
+    /// The walk runs off the request path — §7's size read is cancellable and
+    /// never blocks a caller — so the first rows after a worktree appears
+    /// carry 0, and the next refresh carries the completed walk's answer.
     pub size: u64,
     /// The pty attached to this worktree, if one is running.
     pub terminal: Option<TerminalId>,
@@ -222,6 +232,8 @@ pub struct WorktreeRow {
     /// warning before a worktree is removed.
     pub foreground: Option<String>,
     /// Refs have aged past `stale_after`, so ahead/behind may be wrong.
+    /// Also set when the row's own reads failed, so degraded rows never
+    /// present confident zeros as fresh facts.
     pub stale: bool,
 }
 
@@ -973,6 +985,7 @@ mod tests {
                 repo: rid.clone(),
                 rows: vec![WorktreeRow {
                     worktree: wt.clone(),
+                    detached: false,
                     ownership: Ownership::Other(SessionId("other".into())),
                     ahead: 4,
                     behind: 2,
