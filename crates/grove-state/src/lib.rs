@@ -109,6 +109,11 @@ pub enum Error {
     SnapshotMissing { session: SessionId, path: PathBuf },
     #[error("could not read snapshot at {path}: {source}")]
     SnapshotRead { path: PathBuf, source: io::Error },
+    #[error("could not parse snapshot at {path}: {source}")]
+    SnapshotParse {
+        path: PathBuf,
+        source: serde_json::Error,
+    },
     #[error("snapshot at {path} uses unsupported format version {version}")]
     SnapshotVersion { path: PathBuf, version: u32 },
     #[error("snapshot at {path} belongs to {actual:?}, not {expected:?}")]
@@ -336,7 +341,11 @@ impl Store {
                 }
             }
         })?;
-        let file: SnapshotFile = serde_json::from_slice(&bytes)?;
+        let file: SnapshotFile =
+            serde_json::from_slice(&bytes).map_err(|source| Error::SnapshotParse {
+                path: path.clone(),
+                source,
+            })?;
         if file.version != SNAPSHOT_FORMAT_VERSION {
             return Err(Error::SnapshotVersion {
                 path,
@@ -433,7 +442,15 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), Error> {
     fs::rename(&temporary, path).map_err(|source| Error::Persist {
         path: path.to_owned(),
         source,
-    })
+    })?;
+    #[cfg(unix)]
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|source| Error::Persist {
+            path: parent.to_owned(),
+            source,
+        })?;
+    Ok(())
 }
 
 fn snapshot_filename(session: &SessionId) -> String {
@@ -447,7 +464,7 @@ fn snapshot_filename(session: &SessionId) -> String {
         }
     }
     if encoded.is_empty() {
-        "%00".into()
+        "%".into()
     } else {
         encoded
     }
@@ -688,5 +705,20 @@ mod tests {
         );
         assert!(path.exists());
         assert_eq!(store.load_snapshot(&hostile).unwrap().session, hostile);
+    }
+
+    #[test]
+    fn empty_and_nul_session_ids_have_distinct_snapshot_files() {
+        let temp = TempDir::new();
+        let mut store = Store::load_at(&temp.0, Path::new("/workspace"), "{repo}/{branch}");
+        let empty = sid("");
+        let nul = sid("\0");
+        store.create(empty.clone(), "Empty".into()).unwrap();
+        store.create(nul.clone(), "Nul".into()).unwrap();
+        assert_ne!(store.snapshot_path(&empty), store.snapshot_path(&nul));
+        store.save_snapshot(&empty, Vec::new()).unwrap();
+        store.save_snapshot(&nul, Vec::new()).unwrap();
+        assert_eq!(store.load_snapshot(&empty).unwrap().session, empty);
+        assert_eq!(store.load_snapshot(&nul).unwrap().session, nul);
     }
 }

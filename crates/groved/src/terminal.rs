@@ -39,6 +39,13 @@ pub struct Attachment {
 pub struct RestoreReport {
     pub restored: Vec<TerminalId>,
     pub missing: Vec<SnapshotTerminal>,
+    pub failed: Vec<RestoreFailure>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RestoreFailure {
+    pub terminal: SnapshotTerminal,
+    pub message: String,
 }
 
 #[derive(Debug, Error)]
@@ -308,12 +315,20 @@ impl TerminalManager {
     ) -> Result<RestoreReport, TerminalError> {
         let plan = store.restore_plan(session)?;
         let mut restored = Vec::with_capacity(plan.terminals.len());
+        let mut failed = Vec::new();
         for terminal in plan.terminals {
-            restored.push(self.spawn_worktree(&terminal.worktree, terminal.rows, terminal.cols)?);
+            match self.spawn_worktree(&terminal.worktree, terminal.rows, terminal.cols) {
+                Ok(id) => restored.push(id),
+                Err(error) => failed.push(RestoreFailure {
+                    terminal,
+                    message: error.to_string(),
+                }),
+            }
         }
         Ok(RestoreReport {
             restored,
             missing: plan.missing,
+            failed,
         })
     }
 
@@ -563,6 +578,7 @@ mod tests {
         let report = manager.restore_session_snapshot(&store, &session).unwrap();
         assert_eq!(report.restored.len(), 1);
         assert_eq!(report.missing.len(), 1);
+        assert!(report.failed.is_empty());
         assert_eq!(report.missing[0].worktree, deleted);
         assert_eq!(
             (
@@ -571,11 +587,62 @@ mod tests {
             ),
             (24, 80)
         );
+        manager.input(report.restored[0], b"pwd\r").unwrap();
+        wait_for(&manager, report.restored[0], &existing.to_string_lossy());
         thread::sleep(Duration::from_millis(50));
         assert!(
             !marker.exists(),
             "saved command was executed during restore"
         );
+        drop(manager);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn restore_continues_after_one_terminal_fails() {
+        let root = temp_dir();
+        let first = root.join("first");
+        let invalid = root.join("invalid");
+        let last = root.join("last");
+        for path in [&first, &invalid, &last] {
+            fs::create_dir_all(path).unwrap();
+        }
+        let session = SessionId("partial-restore".into());
+        let mut store = Store::load_at(&root, &root, "{repo}/{branch}");
+        store.create(session.clone(), "Partial".into()).unwrap();
+        store
+            .save_snapshot(
+                &session,
+                vec![
+                    SnapshotTerminal {
+                        worktree: first,
+                        last_command: None,
+                        rows: 24,
+                        cols: 80,
+                    },
+                    SnapshotTerminal {
+                        worktree: invalid.clone(),
+                        last_command: None,
+                        rows: 0,
+                        cols: 80,
+                    },
+                    SnapshotTerminal {
+                        worktree: last,
+                        last_command: None,
+                        rows: 24,
+                        cols: 80,
+                    },
+                ],
+            )
+            .unwrap();
+
+        let mut manager = TerminalManager::new(PathBuf::from("/bin/sh"), root.clone(), 100);
+        let report = manager.restore_session_snapshot(&store, &session).unwrap();
+        assert_eq!(report.restored.len(), 2);
+        assert!(report.missing.is_empty());
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(report.failed[0].terminal.worktree, invalid);
+        assert!(report.failed[0].message.contains("non-zero"));
         drop(manager);
         let _ = fs::remove_dir_all(root);
     }
