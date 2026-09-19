@@ -1,6 +1,6 @@
 //! Pure domain types shared by Grove's UI and daemon.
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer, ser::Error as _};
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// Identifies the scan root whose repositories and sessions belong together.
@@ -78,13 +78,31 @@ pub struct Worktree {
     pub size: u64,
 }
 
-/// Classifies who may manage a worktree, while distinguishing the protected clone.
+/// Who may manage a worktree.
 ///
-/// The clone classification is daemon-internal state derived by comparing the
-/// worktree path with the repository path. It is neither accepted from wire data nor
-/// directly constructible by downstream crates.
-#[derive(std::clone::Clone, Debug, PartialEq, Eq)]
-#[non_exhaustive]
+/// # Where the protection lives
+///
+/// A session must never own the clone — the developer's original checkout —
+/// because `end session` removes everything a session owns. That protection is
+/// deliberately **not** in this type. An earlier revision made the clone state
+/// unconstructible and unserializable: it closed the type-level hole, and in
+/// doing so made the state unreachable by the TUI that must render it
+/// (SPEC §4.1) and unproducible by the daemon that derives it. It also never
+/// addressed the real gap, since `Ours` could be paired with the clone's path
+/// regardless.
+///
+/// The protection sits at the trust boundary instead:
+///
+/// - **No `grove-proto` request carries an `Ownership`.** A client cannot
+///   assert ownership at all — it can only ask to adopt or release a worktree —
+///   so the daemon is the sole writer of this value.
+/// - **The daemon refuses to own the repository path.** It derives
+///   [`Ownership::Clone`] by comparing the worktree path with the repository
+///   path, and rejects any attempt to make that worktree session-owned.
+///
+/// This type is therefore plain data: it travels daemon to client for display,
+/// and never the other way.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Ownership {
     /// The open session created or adopted this worktree and may manage it fully.
     Ours,
@@ -92,85 +110,9 @@ pub enum Ownership {
     Other(SessionId),
     /// No session owns this worktree, so it may be adopted.
     Unowned,
-    /// This is the repository's original checkout and must never become session-owned.
-    ///
-    /// Downstream crates cannot construct this daemon-derived classification directly:
-    ///
-    /// ```compile_fail
-    /// use grove_domain::Ownership;
-    ///
-    /// let ownership = Ownership::Clone {};
-    /// ```
-    #[non_exhaustive]
-    Clone {},
-}
-
-impl Serialize for Ownership {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        #[derive(Serialize)]
-        enum WireOwnership<'a> {
-            Ours,
-            Other(&'a SessionId),
-            Unowned,
-        }
-
-        match self {
-            Self::Ours => WireOwnership::Ours.serialize(serializer),
-            Self::Other(session) => WireOwnership::Other(session).serialize(serializer),
-            Self::Unowned => WireOwnership::Unowned.serialize(serializer),
-            Self::Clone {} => Err(S::Error::custom(
-                "the clone ownership classification is daemon-internal state",
-            )),
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for Ownership {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        enum WireOwnership {
-            Ours,
-            Other(SessionId),
-            Unowned,
-        }
-
-        Ok(match WireOwnership::deserialize(deserializer)? {
-            WireOwnership::Ours => Self::Ours,
-            WireOwnership::Other(session) => Self::Other(session),
-            WireOwnership::Unowned => Self::Unowned,
-        })
-    }
-}
-
-/// Ownership states accepted from operations that can change session ownership.
-///
-/// The protected clone classification is deliberately absent. This prevents callers
-/// from submitting that classification, but `Ours` can still be paired with any path.
-/// The daemon must separately reject attempts to assign `Ours` to the repository path.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum OwnableOwnership {
-    /// Assign the worktree to the open session.
-    Ours,
-    /// Record that a different session owns the worktree.
-    Other(SessionId),
-    /// Leave the worktree available for adoption.
-    Unowned,
-}
-
-impl From<OwnableOwnership> for Ownership {
-    fn from(value: OwnableOwnership) -> Self {
-        match value {
-            OwnableOwnership::Ours => Self::Ours,
-            OwnableOwnership::Other(session) => Self::Other(session),
-            OwnableOwnership::Unowned => Self::Unowned,
-        }
-    }
+    /// The repository's original checkout. Never session-owned, never removed by
+    /// `end session`, and rendered as its own state in the WORKTREES pane.
+    Clone,
 }
 
 /// Describes the process, if any, attached to a worktree.
@@ -186,6 +128,16 @@ pub struct Terminal {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn clone_state_can_reach_the_tui() {
+        // SPEC §4.1 requires the WORKTREES pane to distinguish the clone as one
+        // of four ownership states, so it must survive the wire.
+        let json = serde_json::to_string(&Ownership::Clone {}).expect("clone must serialize");
+        let back: Ownership = serde_json::from_str(&json).expect("clone must deserialize");
+        assert_eq!(back, Ownership::Clone {});
+    }
+
     use super::*;
     use serde::{Serialize, de::DeserializeOwned};
 
@@ -236,19 +188,10 @@ mod tests {
         round_trip(&Ownership::Ours);
         round_trip(&Ownership::Other(SessionId("other".into())));
         round_trip(&Ownership::Unowned);
-        round_trip(&OwnableOwnership::Ours);
-        round_trip(&OwnableOwnership::Other(SessionId("other".into())));
-        round_trip(&OwnableOwnership::Unowned);
         round_trip(&Terminal {
             worktree: worktree(),
             foreground: Some("cargo test".into()),
             alive: true,
         });
-    }
-
-    #[test]
-    fn clone_ownership_cannot_cross_the_wire() {
-        assert!(serde_json::from_str::<Ownership>(r#""Clone""#).is_err());
-        assert!(serde_json::to_string(&Ownership::Clone {}).is_err());
     }
 }
