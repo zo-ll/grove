@@ -2,12 +2,13 @@
 
 use crate::fetch::{FetchPolicy, FetchResult, FetchStatus};
 use crate::terminal::{TerminalError, TerminalManager};
-use grove_domain::{RepoId, SessionId, SessionState};
+use grove_domain::{Ownership, RepoId, SessionId, SessionState};
 use grove_git::{RemoveOptions, Repository};
 use grove_lua::{DaemonRuntime, HookReport, LifecycleEvent, LifecyclePayload, WorktreePathContext};
 use grove_proto::{Event, Request, SessionRow, TerminalId, WorktreeRef};
 use grove_state::{OwnedWorktree, Store};
 use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -94,6 +95,14 @@ pub enum OrchestrationError {
     NotMember { session: SessionId, repo: RepoId },
     #[error("repo {repo:?} still owns worktrees in session {session:?}")]
     MemberOwnsWorktrees { session: SessionId, repo: RepoId },
+    #[error("worktree {0:?} is the repository's own checkout and cannot be session-owned")]
+    CloneNotAdoptable(OwnedWorktree),
+    #[error("worktree path {path:?} is the repository's own checkout")]
+    WorktreePathIsClone { path: PathBuf },
+    #[error("worktree path {path:?} is already claimed by branch {branch:?}")]
+    PathClaimed { path: PathBuf, branch: String },
+    #[error("{0:?} is the repository's own checkout; end session must not remove it")]
+    CloneNotRemovable(OwnedWorktree),
     #[error("terminal operation failed: {0}")]
     Terminal(#[from] TerminalError),
     #[error("git inspection failed: {0}")]
@@ -500,6 +509,18 @@ impl SessionOrchestrator {
         }
         for item in plan.worktrees {
             let repository = self.repository(&item.worktree.repo)?;
+            // `end session` removes everything a session owns, so the
+            // repository's own checkout must never reach this call — not even
+            // from a state file written by a daemon that predates the adopt
+            // guard.
+            if paths_equal(&item.path, &repository.path) {
+                failed.push(EffectFailure {
+                    worktree: Some(item.worktree.clone()),
+                    message: OrchestrationError::CloneNotRemovable(item.worktree.clone())
+                        .to_string(),
+                });
+                continue;
+            }
             let options = RemoveOptions {
                 force_dirty: true,
                 foreground_process: item.foreground.clone(),
@@ -542,7 +563,17 @@ impl SessionOrchestrator {
     ) -> Result<Option<TerminalId>, OrchestrationError> {
         let state = self.store.session(session)?.state;
         let repository = self.repository(&worktree.repo)?.clone();
-        let path = self.resolve_owned_unowned(&worktree)?;
+        let checkout = self
+            .find_checkout(&repository, &worktree.branch)?
+            .ok_or_else(|| OrchestrationError::WorktreeMissing(worktree.clone()))?;
+        // The clone is derived by comparing the checkout's path with the
+        // repository's, not trusted from anywhere. Adopting it would make the
+        // worktree session-owned, and `end session` removes everything a
+        // session owns — so this is where the domain's obligation lands.
+        if checkout.is_clone || paths_equal(&checkout.path, &repository.path) {
+            return Err(OrchestrationError::CloneNotAdoptable(worktree.clone()));
+        }
+        let path = checkout.path;
         self.store
             .adopt(session, worktree.clone(), &path, &repository.path)?;
         self.fire_worktree(
@@ -627,6 +658,21 @@ impl SessionOrchestrator {
                     .or_else(|| repository.base_branch.clone())
                     .ok_or_else(|| OrchestrationError::BaseMissing(repo_id.clone()))?;
                 let path = self.worktree_path(&repository, &stored.name, branch)?;
+                // `branch_slug` is deliberately non-injective: two branch names
+                // can resolve to one path, and the second must not silently
+                // take the first's checkout.
+                if paths_equal(&path, &repository.path) {
+                    return Err(OrchestrationError::WorktreePathIsClone { path: path.clone() });
+                }
+                if let Some(claimant) = grove_git::worktrees(&repository.path)?
+                    .into_iter()
+                    .find(|checkout| paths_equal(&checkout.path, &path))
+                {
+                    return Err(OrchestrationError::PathClaimed {
+                        path: path.clone(),
+                        branch: claimant.branch.unwrap_or_else(|| "<detached HEAD>".into()),
+                    });
+                };
                 grove_git::create_worktree(&repository.path, &path, branch, &base)?;
                 self.store
                     .own_created(session, worktree.clone(), &path, &repository.path)?;
@@ -675,22 +721,46 @@ impl SessionOrchestrator {
             .ok_or_else(|| OrchestrationError::RepositoryMissing(id.clone()))
     }
 
-    fn resolve_owned(&self, worktree: &OwnedWorktree) -> Result<PathBuf, OrchestrationError> {
-        let repository = self.repository(&worktree.repo)?;
-        grove_git::worktrees(&repository.path)?
+    /// The checkout of `branch`, clone included. Callers decide what a clone
+    /// row means; this lookup must not decide for them.
+    fn find_checkout(
+        &self,
+        repository: &Repository,
+        branch: &str,
+    ) -> Result<Option<grove_git::Worktree>, OrchestrationError> {
+        Ok(grove_git::worktrees(&repository.path)?
             .into_iter()
-            .find(|candidate| {
-                !candidate.is_clone && candidate.branch.as_deref() == Some(&worktree.branch)
-            })
-            .map(|candidate| candidate.path)
-            .ok_or_else(|| OrchestrationError::WorktreeMissing(worktree.clone()))
+            .find(|candidate| candidate.branch.as_deref() == Some(branch)))
     }
 
-    fn resolve_owned_unowned(
-        &self,
-        worktree: &OwnedWorktree,
-    ) -> Result<PathBuf, OrchestrationError> {
-        self.resolve_owned(worktree)
+    /// The ownership a client is shown for a checkout.
+    ///
+    /// Derived here, at the trust boundary: `Ownership` is display data that
+    /// travels daemon to client, and clients never assert it.
+    pub fn ownership(&self, repository: &Repository, checkout: &grove_git::Worktree) -> Ownership {
+        if checkout.is_clone || paths_equal(&checkout.path, &repository.path) {
+            return Ownership::Clone;
+        }
+        // A detached HEAD names no branch, so no session can own it.
+        let Some(branch) = checkout.branch.as_ref() else {
+            return Ownership::Unowned;
+        };
+        let worktree = OwnedWorktree {
+            repo: repository.id.clone(),
+            branch: branch.clone(),
+        };
+        match self.store.owner(&worktree) {
+            Some(owner) if self.store.open_session() == Some(owner) => Ownership::Ours,
+            Some(owner) => Ownership::Other(owner.clone()),
+            None => Ownership::Unowned,
+        }
+    }
+
+    fn resolve_owned(&self, worktree: &OwnedWorktree) -> Result<PathBuf, OrchestrationError> {
+        let repository = self.repository(&worktree.repo)?;
+        self.find_checkout(repository, &worktree.branch)?
+            .map(|candidate| candidate.path)
+            .ok_or_else(|| OrchestrationError::WorktreeMissing(worktree.clone()))
     }
 
     fn live_terminal(&self, session: &SessionId, worktree: &OwnedWorktree) -> Option<TerminalId> {
@@ -820,6 +890,15 @@ fn owned_ref(worktree: WorktreeRef) -> OwnedWorktree {
     OwnedWorktree {
         repo: worktree.repo,
         branch: worktree.branch,
+    }
+}
+
+/// Whether two paths name the same directory, tolerating symlinks and
+/// case-stable mounts on whichever side exists to canonicalize.
+fn paths_equal(a: &Path, b: &Path) -> bool {
+    match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
     }
 }
 
@@ -1077,6 +1156,254 @@ mod tests {
             event,
             Event::Failed { context, .. } if context == "config: repo override"
         )));
+    }
+
+    #[test]
+    fn clone_is_derived_and_refused() {
+        let temp = TempDir::new();
+        let clone = temp.0.join("repo");
+        let ours_path = temp.0.join("ours");
+        let other_path = temp.0.join("other");
+        let spare_path = temp.0.join("spare");
+        fs::create_dir_all(&clone).unwrap();
+        git(&clone, &["init", "-q", "-b", "main"]);
+        git(&clone, &["config", "user.name", "Grove Test"]);
+        git(&clone, &["config", "user.email", "grove@example.test"]);
+        fs::write(clone.join("tracked"), "base\n").unwrap();
+        git(&clone, &["add", "tracked"]);
+        git(&clone, &["commit", "-qm", "base"]);
+        for (branch, path) in [
+            ("ours", &ours_path),
+            ("other", &other_path),
+            ("spare", &spare_path),
+        ] {
+            git(
+                &clone,
+                &["worktree", "add", "-qb", branch, path.to_str().unwrap()],
+            );
+        }
+
+        let template = temp.0.join("trees/{repo}/{branch_slug}");
+        let template = template.to_string_lossy().into_owned();
+        let mut store = Store::load_at(&temp.0.join("state"), &temp.0, &template);
+        store.create(sid("one"), "one".to_string()).unwrap();
+        store.create(sid("two"), "two".to_string()).unwrap();
+        store
+            .add_member(&sid("one"), RepoId("repo".into()))
+            .unwrap();
+        store
+            .add_member(&sid("two"), RepoId("repo".into()))
+            .unwrap();
+        store
+            .adopt(&sid("one"), owned("ours"), &ours_path, &clone)
+            .unwrap();
+        store
+            .adopt(&sid("two"), owned("other"), &other_path, &clone)
+            .unwrap();
+        store.open(&sid("one")).unwrap();
+        let repository = Repository {
+            id: RepoId("repo".into()),
+            name: "repo".into(),
+            path: clone.clone(),
+            base_branch: Some("main".into()),
+        };
+        let terminals = TerminalManager::new(PathBuf::from("/bin/sh"), temp.0.clone(), 100);
+        let fetch = FetchPolicy::new(2, Duration::from_secs(60));
+        let runtime = DaemonRuntime::load_source(
+            &format!(
+                "local grove = require('grove'); grove.setup({{ worktree_path = {template:?} }})",
+                template = template
+            ),
+            "ownership-config",
+        )
+        .runtime;
+        let mut daemon =
+            SessionOrchestrator::new(store, vec![repository.clone()], terminals, fetch, runtime);
+
+        // Ownership is derived at the trust boundary: the clone by path
+        // comparison, the rest by the store's records.
+        let checkouts = grove_git::worktrees(&clone).unwrap();
+        let ownership = |branch: &str| {
+            let checkout = checkouts
+                .iter()
+                .find(|row| row.branch.as_deref() == Some(branch))
+                .unwrap();
+            daemon.ownership(&repository, checkout)
+        };
+        assert_eq!(ownership("main"), Ownership::Clone);
+        assert_eq!(ownership("ours"), Ownership::Ours);
+        assert_eq!(ownership("other"), Ownership::Other(sid("two")));
+        assert_eq!(ownership("spare"), Ownership::Unowned);
+
+        // Adopting the clone — whose branch is checked out in the main
+        // checkout — is refused with a reason, not reported as missing.
+        let error = daemon.adopt(&sid("one"), owned("main")).unwrap_err();
+        assert!(
+            matches!(error, OrchestrationError::CloneNotAdoptable(_)),
+            "{error}"
+        );
+        assert_eq!(daemon.store().owner(&owned("main")), None);
+
+        // A worktree template resolving to the repository path is refused
+        // before git ever sees it.
+        let runtime = DaemonRuntime::load_source(
+            &format!(
+                "local grove = require('grove'); grove.setup({{ worktree_path = {clone:?} }})",
+                clone = clone.to_string_lossy()
+            ),
+            "clone-path-config",
+        )
+        .runtime;
+        let mut daemon = SessionOrchestrator::new(
+            Store::load_at(&temp.0.join("state"), &temp.0, &template),
+            vec![repository],
+            TerminalManager::new(PathBuf::from("/bin/sh"), temp.0.clone(), 100),
+            FetchPolicy::new(2, Duration::from_secs(60)),
+            runtime,
+        );
+        let failure = daemon
+            .create_worktrees(&sid("one"), "newbranch", &[RepoId("repo".into())])
+            .unwrap()
+            .failed
+            .remove(0);
+        assert!(
+            failure.message.contains("own checkout"),
+            "expected a clone-path refusal, got {failure:?}"
+        );
+        assert!(clone.is_dir(), "the clone was never touched");
+    }
+
+    #[test]
+    fn slug_collision_refuses_rather_than_reusing_the_first_checkout() {
+        let temp = TempDir::new();
+        let clone = temp.0.join("repo");
+        let colliding_path = temp.0.join("trees/repo/feat-x");
+        fs::create_dir_all(&clone).unwrap();
+        git(&clone, &["init", "-q", "-b", "main"]);
+        git(&clone, &["config", "user.name", "Grove Test"]);
+        git(&clone, &["config", "user.email", "grove@example.test"]);
+        fs::write(clone.join("tracked"), "base\n").unwrap();
+        git(&clone, &["add", "tracked"]);
+        git(&clone, &["commit", "-qm", "base"]);
+        fs::create_dir_all(colliding_path.parent().unwrap()).unwrap();
+        git(
+            &clone,
+            &[
+                "worktree",
+                "add",
+                "-qb",
+                "feat-x",
+                colliding_path.to_str().unwrap(),
+            ],
+        );
+
+        let template = temp.0.join("trees/{repo}/{branch_slug}");
+        let template = template.to_string_lossy().into_owned();
+        let mut store = Store::load_at(&temp.0.join("state"), &temp.0, &template);
+        store.create(sid("one"), "one".to_string()).unwrap();
+        store
+            .add_member(&sid("one"), RepoId("repo".into()))
+            .unwrap();
+        let repository = Repository {
+            id: RepoId("repo".into()),
+            name: "repo".into(),
+            path: clone.clone(),
+            base_branch: Some("main".into()),
+        };
+        let terminals = TerminalManager::new(PathBuf::from("/bin/sh"), temp.0.clone(), 100);
+        let fetch = FetchPolicy::new(2, Duration::from_secs(60));
+        let runtime = DaemonRuntime::load_source(
+            &format!(
+                "local grove = require('grove'); grove.setup({{ worktree_path = {template:?} }})",
+                template = template
+            ),
+            "slug-config",
+        )
+        .runtime;
+        let mut daemon =
+            SessionOrchestrator::new(store, vec![repository], terminals, fetch, runtime);
+
+        // branch_slug("feat/x") and branch_slug("feat-x") are both "feat-x":
+        // the second branch must not silently take the first's checkout.
+        let failure = daemon
+            .create_worktrees(&sid("one"), "feat/x", &[RepoId("repo".into())])
+            .unwrap()
+            .failed
+            .remove(0);
+        assert!(
+            failure.message.contains("feat-x") && failure.message.contains("claimed"),
+            "expected a claim refusal naming the branch, got {failure:?}"
+        );
+        assert!(
+            grove_git::worktrees(&clone)
+                .unwrap()
+                .iter()
+                .any(|row| row.branch.as_deref() == Some("feat-x")),
+            "the first checkout was left untouched"
+        );
+        assert_eq!(daemon.store().owner(&owned("feat/x")), None);
+    }
+
+    #[test]
+    fn end_session_never_removes_the_repository_path() {
+        let temp = TempDir::new();
+        let clone = temp.0.join("repo");
+        fs::create_dir_all(&clone).unwrap();
+        git(&clone, &["init", "-q", "-b", "main"]);
+        git(&clone, &["config", "user.name", "Grove Test"]);
+        git(&clone, &["config", "user.email", "grove@example.test"]);
+        fs::write(clone.join("tracked"), "base\n").unwrap();
+        git(&clone, &["add", "tracked"]);
+        git(&clone, &["commit", "-qm", "base"]);
+
+        // Hand-crafted state as a daemon predating the adopt guard could have
+        // written it: the clone claimed as session-owned. The destructive path
+        // must refuse it rather than trust the file.
+        let state_home = temp.0.join("state");
+        let state_dir = state_home
+            .join("grove")
+            .join(grove_state::workspace_hash(&temp.0));
+        fs::create_dir_all(&state_dir).unwrap();
+        fs::write(
+            state_dir.join("sessions.json"),
+            r#"{"version":1,"sessions":[{"id":"legacy","name":"legacy",
+                 "members":["repo"],"owned":[{"repo":"repo","branch":"main"}],
+                 "state":"Closed"}],"open":null}"#,
+        )
+        .unwrap();
+
+        let template = temp.0.join("trees/{repo}/{branch_slug}");
+        let template = template.to_string_lossy().into_owned();
+        let repository = Repository {
+            id: RepoId("repo".into()),
+            name: "repo".into(),
+            path: clone.clone(),
+            base_branch: Some("main".into()),
+        };
+        let store = Store::load_at(&state_home, &temp.0, &template);
+        let terminals = TerminalManager::new(PathBuf::from("/bin/sh"), temp.0.clone(), 100);
+        let fetch = FetchPolicy::new(2, Duration::from_secs(60));
+        let runtime = DaemonRuntime::load_source(
+            &format!(
+                "local grove = require('grove'); grove.setup({{ worktree_path = {template:?} }})",
+                template = template
+            ),
+            "legacy-config",
+        )
+        .runtime;
+        let mut daemon =
+            SessionOrchestrator::new(store, vec![repository], terminals, fetch, runtime);
+
+        let report = daemon.end_confirmed(&sid("legacy")).unwrap();
+        assert!(!report.ended);
+        assert!(
+            report
+                .failed
+                .iter()
+                .any(|failure| failure.message.contains("must not remove")),
+            "expected a refusal to remove the clone, got {report:?}"
+        );
+        assert!(clone.is_dir(), "end session removed the repository path");
     }
 
     #[test]
