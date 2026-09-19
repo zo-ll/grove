@@ -16,8 +16,8 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
 use std::time::Duration;
 
-use crossterm::event::{self, Event as TermEvent};
 use grove_proto::Event as DaemonEvent;
+use ratatui::crossterm::event::{self, Event as TermEvent};
 
 /// Anything the loop can wake up for.
 #[derive(Debug)]

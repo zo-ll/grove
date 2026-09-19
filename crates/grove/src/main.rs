@@ -10,6 +10,8 @@
 //! into. Screens themselves are #18 through #30.
 
 mod events;
+mod keymap;
+mod statusbar;
 mod terminal;
 
 use std::io::Stdout;
@@ -17,12 +19,13 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use crossterm::event::{Event as TermEvent, KeyCode, KeyEvent, KeyModifiers};
 use events::{Input, Inputs};
 use grove_proto::{Event as DaemonEvent, Handshake, PROTOCOL_VERSION, Request, accept_welcome};
+use keymap::{Action, Focus, Routed, Router, Screen};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::Alignment;
+use ratatui::crossterm::event::Event as TermEvent;
+use ratatui::layout::{Alignment, Constraint, Direction, Layout};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
@@ -30,6 +33,23 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 /// What the shell is currently able to show. Screens replace this in #18-#30;
 /// until then it is enough to prove the loop, the redraw policy and the
 /// teardown all behave.
+/// Where grove is and what has focus, so routing can depend on both.
+struct Ui {
+    screen: Screen,
+    focus: Focus,
+    router: Router,
+}
+
+impl Ui {
+    fn new() -> Self {
+        Self {
+            screen: Screen::Dash,
+            focus: Focus::Worktrees,
+            router: Router::new(),
+        }
+    }
+}
+
 enum State {
     /// Connected, waiting for the first data.
     Connected { workspace: PathBuf, note: String },
@@ -60,6 +80,7 @@ fn main() -> ExitCode {
 fn run(workspace: PathBuf) -> std::io::Result<()> {
     let inputs = Inputs::new();
     let mut state = connect(&workspace, &inputs);
+    let mut ui = Ui::new();
 
     let (_guard, mut term) = terminal::Guard::new()?;
 
@@ -68,7 +89,7 @@ fn run(workspace: PathBuf) -> std::io::Result<()> {
     let mut dirty = true;
     loop {
         if dirty {
-            term.draw(|f| draw(f, &state))?;
+            term.draw(|f| draw(f, &state, &ui))?;
             dirty = false;
         }
 
@@ -84,7 +105,7 @@ fn run(workspace: PathBuf) -> std::io::Result<()> {
         batch.extend(inputs.drain());
 
         for input in batch {
-            match handle(input, &mut state) {
+            match handle(input, &mut state, &mut ui) {
                 Flow::Continue { redraw } => dirty |= redraw,
                 // The reason is carried on the state so main can report it
                 // after the guard has restored the terminal.
@@ -109,15 +130,33 @@ enum Flow {
     Quit,
 }
 
-fn handle(input: Input, state: &mut State) -> Flow {
+fn handle(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
     match input {
-        // `^g q` quits per SPEC §3.2. The prefix itself is #16; until then the
-        // bare chord is enough to leave without killing the terminal.
-        Input::Terminal(TermEvent::Key(KeyEvent {
-            code: KeyCode::Char('q'),
-            modifiers: KeyModifiers::CONTROL,
-            ..
-        })) => Flow::Quit,
+        Input::Terminal(TermEvent::Key(key)) => {
+            match ui.router.route(ui.screen, ui.focus, key) {
+                Routed::Act(Action::Quit) => Flow::Quit,
+                Routed::Act(Action::CycleFocus) => {
+                    ui.focus = ui.focus.next();
+                    Flow::Continue { redraw: true }
+                }
+                Routed::Act(Action::CycleFocusBack) => {
+                    ui.focus = ui.focus.previous();
+                    Flow::Continue { redraw: true }
+                }
+                // Screens are #18-#30. Until they exist an action is
+                // acknowledged with a redraw rather than silently dropped, so
+                // the routing is visibly working.
+                Routed::Act(_) => Flow::Continue { redraw: true },
+                // Forwarding to the daemon is #21; the route is correct now.
+                Routed::ToPty(_) => Flow::Continue { redraw: false },
+                // Half a chord: the status bar shows it, so redraw.
+                Routed::PrefixPending => Flow::Continue { redraw: true },
+                Routed::Unbound => Flow::Continue { redraw: true },
+                // Consumed by the palette in #23; routed correctly now.
+                Routed::Text(_) => Flow::Continue { redraw: false },
+                Routed::Ignored => Flow::Continue { redraw: false },
+            }
+        }
 
         Input::Terminal(TermEvent::Resize(..)) => Flow::Continue { redraw: true },
 
@@ -256,7 +295,13 @@ fn hash(path: &Path) -> String {
     format!("{h:016x}")
 }
 
-fn draw(f: &mut ratatui::Frame, state: &State) {
+fn draw(f: &mut ratatui::Frame, state: &State, ui: &Ui) {
+    // One row reserved at the bottom for the status bar, per SPEC §4.1.
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(f.area());
+    let (body_area, bar_area) = (chunks[0], chunks[1]);
     let (title, body) = match state {
         State::Connected { workspace, note } => (
             "grove",
@@ -302,7 +347,23 @@ fn draw(f: &mut ratatui::Frame, state: &State) {
 
     f.render_widget(
         Paragraph::new(body).block(block).wrap(Wrap { trim: false }),
-        f.area(),
+        body_area,
+    );
+
+    let context = if ui.router.prefix_pending() {
+        "^g …".to_string()
+    } else {
+        String::new()
+    };
+    f.render_widget(
+        Paragraph::new(statusbar::render(
+            ui.screen,
+            ui.focus,
+            &context,
+            "no session",
+            bar_area.width,
+        )),
+        bar_area,
     );
 }
 
@@ -326,7 +387,11 @@ mod tests {
         // still listening. Redrawing on those would turn the idle dashboard
         // into a 4 Hz spinner, which is exactly what the issue forbids.
         let mut s = connected();
-        match handle(Input::Terminal(TermEvent::FocusGained), &mut s) {
+        match handle(
+            Input::Terminal(TermEvent::FocusGained),
+            &mut s,
+            &mut Ui::new(),
+        ) {
             Flow::Continue { redraw } => assert!(!redraw),
             Flow::Quit => panic!("keepalive must not quit"),
         }
@@ -335,7 +400,11 @@ mod tests {
     #[test]
     fn a_resize_causes_a_redraw() {
         let mut s = connected();
-        match handle(Input::Terminal(TermEvent::Resize(80, 24)), &mut s) {
+        match handle(
+            Input::Terminal(TermEvent::Resize(80, 24)),
+            &mut s,
+            &mut Ui::new(),
+        ) {
             Flow::Continue { redraw } => assert!(redraw),
             Flow::Quit => panic!("resize must not quit"),
         }
@@ -345,7 +414,11 @@ mod tests {
     fn losing_the_daemon_keeps_the_tui_up_and_says_so() {
         // Exiting here would imply the user's work went with it. It did not.
         let mut s = connected();
-        match handle(Input::DaemonGone("socket closed".into()), &mut s) {
+        match handle(
+            Input::DaemonGone("socket closed".into()),
+            &mut s,
+            &mut Ui::new(),
+        ) {
             Flow::Continue { redraw } => assert!(redraw),
             Flow::Quit => panic!("losing the daemon must not quit the TUI"),
         }
@@ -360,16 +433,47 @@ mod tests {
         // Nothing to draw on and no way to hear the user; staying up pretends.
         let mut s = connected();
         assert!(matches!(
-            handle(Input::TerminalGone("eof".into()), &mut s),
+            handle(Input::TerminalGone("eof".into()), &mut s, &mut Ui::new()),
             Flow::Quit
         ));
     }
 
     #[test]
-    fn ctrl_q_quits() {
+    fn quitting_goes_through_the_prefix_like_everything_else() {
+        // `^g q` per SPEC §3.2 — and a bare `q` must NOT quit, or a `q` typed
+        // into a focused shell would kill grove out from under it.
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let mut s = connected();
-        let ev = TermEvent::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
-        assert!(matches!(handle(Input::Terminal(ev), &mut s), Flow::Quit));
+        let mut ui = Ui::new();
+        ui.focus = Focus::Terminal;
+
+        let bare = TermEvent::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(
+            !matches!(handle(Input::Terminal(bare), &mut s, &mut ui), Flow::Quit),
+            "a bare q belongs to the focused pty"
+        );
+
+        let prefix = TermEvent::Key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
+        handle(Input::Terminal(prefix), &mut s, &mut ui);
+        let q = TermEvent::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(matches!(
+            handle(Input::Terminal(q), &mut s, &mut ui),
+            Flow::Quit
+        ));
+    }
+
+    #[test]
+    fn tab_moves_focus_and_that_changes_routing() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut s = connected();
+        let mut ui = Ui::new();
+        assert_eq!(ui.focus, Focus::Worktrees);
+
+        let prefix = TermEvent::Key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
+        handle(Input::Terminal(prefix), &mut s, &mut ui);
+        let tab = TermEvent::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        handle(Input::Terminal(tab), &mut s, &mut ui);
+        assert_eq!(ui.focus, Focus::Terminal, "^g tab must move focus");
     }
 
     #[test]
