@@ -16,4 +16,6 @@ grove-proto = { workspace = true }
 grove-lua = { workspace = true }
 grove-git = { workspace = true }
 grove-state = { workspace = true }
+portable-pty = "0.9"
 thiserror = { workspace = true }
+vt100 = "0.16"
