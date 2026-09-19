@@ -781,12 +781,17 @@ impl SessionOrchestrator {
         let repositories: Vec<Repository> = self.repositories.values().cloned().collect();
         let mut rows = Vec::new();
         for repository in &repositories {
-            let batch = crate::prune::prune_candidates_against(
+            // A repo whose inspection fails contributes no rows rather than
+            // blanking the whole picker: its rows would be all-FetchFailed
+            // anyway, and the pane rows omit an unreadable repo for the same
+            // reason.
+            let Ok(batch) = crate::prune::prune_candidates_against(
                 repository,
                 &sessions,
                 self.effective_base(repository).as_deref(),
-            )
-            .map_err(|error| OrchestrationError::Prune(error.to_string()))?;
+            ) else {
+                continue;
+            };
             for candidate in batch.candidates {
                 rows.push(PruneCandidate {
                     worktree: WorktreeRef {
@@ -911,6 +916,12 @@ impl SessionOrchestrator {
             },
         )
         .map_err(|error| error.to_string())?;
+        // A worktree that was never owned leaves no hook trail: the
+        // worktree_removed payload names the owning session, and a row with
+        // none has nothing to put there — so per-worktree cleanup hooks do
+        // not run for rows that never joined a session. Rows a session once
+        // owned do, and the hook sees the session that owned them.
+        //
         // Ownership outlives sessions in the store, including closed ones;
         // pruning their worktree must forget the claim, or the store would
         // name an owner for a checkout that no longer exists.
@@ -1124,8 +1135,9 @@ impl SessionOrchestrator {
     }
 
     /// Executes the destructive action after the caller displayed `end_plan`
-    /// and received confirmation. This is the sole orchestration path that
-    /// invokes `git worktree remove`.
+    /// and received confirmation. One of the two orchestration paths that
+    /// invoke `git worktree remove` — `prune_row` is the other, with its own
+    /// safety facts re-checked at prune time rather than trusting a listing.
     pub fn end_confirmed(&mut self, session: &SessionId) -> Result<EndReport, OrchestrationError> {
         let session_name = self.store.session(session)?.name.clone();
         let plan = self.end_plan(session)?;
@@ -2465,10 +2477,18 @@ mod tests {
         // Live ownership: the open session owns the worktree, which is what
         // prune refuses to take.
         store.open(&sid("one")).unwrap();
+        let removal_log = temp.0.join("removal.log");
         let runtime = DaemonRuntime::load_source(
             &format!(
-                "local grove = require('grove'); grove.setup({{ worktree_path = {template:?} }})",
-                template = template
+                "local grove = require('grove')\n\
+                 grove.setup({{ worktree_path = {template:?} }})\n\
+                 grove.on('worktree_removed', function(wt)\n\
+                   local file = assert(io.open({log:?}, 'a'))\n\
+                   file:write(wt.repo .. ':' .. wt.branch .. ':' .. wt.session .. '\\n')\n\
+                   file:close()\n\
+                 end)\n",
+                template = template,
+                log = removal_log.to_string_lossy()
             ),
             "prune-config",
         )
@@ -2572,12 +2592,34 @@ mod tests {
             *reclaimed > 0,
             "reclaimed bytes come from the drained size walk"
         );
+
+        // A closed session still owns its rows in the store. The picker is
+        // the second chance to prune them — and the only prune path that
+        // forgets a claim and fires worktree_removed, so it is pinned: the
+        // row is removed, the ownership is gone, and the hook carries the
+        // closed session's payload.
+        let _ = daemon.handle_request(Request::CloseSession(sid("one")));
+        let events = daemon.handle_request(Request::Prune(vec![want("mine")]));
+        let Some(Event::Pruned {
+            removed, failed, ..
+        }) = events.first()
+        else {
+            panic!("expected Pruned, got {events:?}")
+        };
+        assert_eq!(*removed, vec![want("mine")]);
+        assert!(failed.is_empty(), "{failed:?}");
+        assert!(!mine_path.exists(), "the closed session's row was removed");
         assert_eq!(
             daemon.store().owner(&OwnedWorktree {
                 repo: RepoId("repo-a".into()),
-                branch: "done".into(),
+                branch: "mine".into(),
             }),
-            None
+            None,
+            "the claim must be forgotten, not left naming a removed checkout"
+        );
+        assert_eq!(
+            fs::read_to_string(&removal_log).unwrap(),
+            "repo-a:mine:one\n"
         );
     }
 
