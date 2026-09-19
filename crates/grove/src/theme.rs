@@ -466,6 +466,33 @@ mod tests {
     }
 
     #[test]
+    fn distinct_colours_stay_distinct_after_degrading() {
+        // SPEC §9's invariant, and not only for the palette that motivated it:
+        // a set-resolution tuned to Catppuccin would be over-fitted. These are
+        // five colours that crowd the same corner of the 16 — four reds and a
+        // near-grey — which is the case the claim has to survive.
+        let crowded = ThemeConfig {
+            accent: "#ff0000".into(),
+            clean: "#e01010".into(),
+            dirty: "#c02020".into(),
+            error: "#a03030".into(),
+            muted: "#606060".into(),
+        };
+        let (theme, bad) = Theme::resolve(&config(crowded), Depth::Ansi16);
+        assert!(bad.is_empty());
+        let mut seen = Vec::new();
+        for role in Role::ALL {
+            let colour = theme.color(role);
+            assert!(
+                !seen.contains(&colour),
+                "{} collapsed onto a colour another role already uses: {colour:?}",
+                role.name()
+            );
+            seen.push(colour);
+        }
+    }
+
+    #[test]
     fn sixteen_colours_keep_the_roles_apart() {
         // The acceptance criterion is legibility in a 16-colour terminal, and
         // legibility here means a user can tell clean from dirty from error at
@@ -681,23 +708,33 @@ mod tests {
         // changing the screen, and nobody finds out until it looks wrong.
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut offenders = Vec::new();
-        for entry in std::fs::read_dir(&src).expect("the crate has a src directory") {
-            let path = entry.expect("readable directory entry").path();
-            if path.file_name().is_some_and(|n| n == "theme.rs") {
-                continue;
-            }
-            if path.extension().is_none_or(|e| e != "rs") {
-                continue;
-            }
-            let text = std::fs::read_to_string(&path).expect("source is readable");
-            for (number, line) in text.lines().enumerate() {
-                if looks_like_a_hex_colour(line) {
-                    offenders.push(format!(
-                        "{}:{}: {}",
-                        path.display(),
-                        number + 1,
-                        line.trim()
-                    ));
+        // The whole tree, not one directory: the crate is flat today and the
+        // screens in #18-#30 will not be, and a guard that silently stops
+        // covering the code is worse than no guard.
+        let mut pending = vec![src];
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).expect("the crate has a src directory") {
+                let path = entry.expect("readable directory entry").path();
+                if path.is_dir() {
+                    pending.push(path);
+                    continue;
+                }
+                if path.file_name().is_some_and(|n| n == "theme.rs") {
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).expect("source is readable");
+                for (number, line) in text.lines().enumerate() {
+                    if looks_like_a_hex_colour(line) {
+                        offenders.push(format!(
+                            "{}:{}: {}",
+                            path.display(),
+                            number + 1,
+                            line.trim()
+                        ));
+                    }
                 }
             }
         }

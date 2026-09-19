@@ -80,7 +80,7 @@ impl Ui {
 
 /// `$XDG_CONFIG_HOME/grove/config.lua`, falling back to `~/.config`, per
 /// SPEC §9. A missing file is not an error — it means defaults.
-fn config_path() -> PathBuf {
+fn config_path() -> Option<PathBuf> {
     config_path_from(
         std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
         std::env::var_os("HOME").map(PathBuf::from),
@@ -90,11 +90,17 @@ fn config_path() -> PathBuf {
 /// The lookup itself, taking its inputs rather than reading them, so it can be
 /// tested without setting process-wide environment variables — which race,
 /// since tests share a process.
-fn config_path_from(xdg: Option<PathBuf>, home: Option<PathBuf>) -> PathBuf {
-    xdg.or_else(|| home.map(|home| home.join(".config")))
-        .unwrap_or_else(|| PathBuf::from(".config"))
-        .join("grove")
-        .join("config.lua")
+///
+/// `None` when neither variable is set, rather than a relative `.config`: that
+/// path would be resolved against the working directory, so a grove started in
+/// a directory someone else populated would execute their Lua. Reading nothing
+/// is also the truer reading of §9 — a config grove cannot find means defaults.
+fn config_path_from(xdg: Option<PathBuf>, home: Option<PathBuf>) -> Option<PathBuf> {
+    Some(
+        xdg.or_else(|| home.map(|home| home.join(".config")))?
+            .join("grove")
+            .join("config.lua"),
+    )
 }
 
 enum State {
@@ -127,8 +133,12 @@ fn main() -> ExitCode {
 fn run(workspace: PathBuf) -> std::io::Result<()> {
     // Before the terminal is taken, so a config error can still be printed if
     // anything below fails outright.
-    let loaded = TuiRuntime::load(config_path());
-    let mut ui = Ui::with_config(loaded.runtime.config(), loaded.error, Depth::detect());
+    let loaded = config_path().map(TuiRuntime::load);
+    let mut ui = match loaded {
+        Some(loaded) => Ui::with_config(loaded.runtime.config(), loaded.error, Depth::detect()),
+        // Nowhere to look, so defaults — see `config_path_from`.
+        None => Ui::with_config(&TuiConfig::default(), None, Depth::detect()),
+    };
 
     let inputs = Inputs::new();
     let mut state = connect(&workspace, &inputs);
@@ -467,13 +477,17 @@ mod tests {
     fn the_config_lives_where_the_spec_says() {
         assert_eq!(
             config_path_from(Some(PathBuf::from("/x")), Some(PathBuf::from("/home/u"))),
-            PathBuf::from("/x/grove/config.lua"),
+            Some(PathBuf::from("/x/grove/config.lua")),
             "XDG_CONFIG_HOME wins when it is set"
         );
         assert_eq!(
             config_path_from(None, Some(PathBuf::from("/home/u"))),
-            PathBuf::from("/home/u/.config/grove/config.lua")
+            Some(PathBuf::from("/home/u/.config/grove/config.lua"))
         );
+        // Not a relative `.config`: that resolves against the working
+        // directory, so a grove started in a directory someone else wrote
+        // would run their Lua.
+        assert_eq!(config_path_from(None, None), None);
     }
 
     #[test]
