@@ -142,9 +142,12 @@ impl TerminalManager {
                         let bytes = buffer[..count].to_vec();
                         if let Ok(mut parser) = reader_parser.lock() {
                             parser.process(&bytes);
-                        }
-                        if let Ok(mut listeners) = reader_subscribers.lock() {
-                            listeners.retain(|listener| listener.try_send(bytes.clone()).is_ok());
+                            // Keep parser update and publication in one critical
+                            // section so attach can take an atomic snapshot.
+                            if let Ok(mut listeners) = reader_subscribers.lock() {
+                                listeners
+                                    .retain(|listener| listener.try_send(bytes.clone()).is_ok());
+                            }
                         }
                     }
                 }
@@ -217,15 +220,17 @@ impl TerminalManager {
         // A slow client is disconnected from live output rather than allowed to
         // grow daemon memory without bound. It can reattach from the parser.
         let (sender, output) = mpsc::sync_channel(64);
+        let mut parser = terminal
+            .parser
+            .lock()
+            .map_err(|_| TerminalError::Poisoned)?;
+        let snapshot = snapshot_from_parser(terminal, &mut parser);
         terminal
             .subscribers
             .lock()
             .map_err(|_| TerminalError::Poisoned)?
             .push(sender);
-        Ok(Attachment {
-            snapshot: snapshot(terminal)?,
-            output,
-        })
+        Ok(Attachment { snapshot, output })
     }
 
     pub fn snapshot(&self, id: TerminalId) -> Result<TerminalSnapshot, TerminalError> {
@@ -256,16 +261,16 @@ impl TerminalManager {
     }
 
     pub fn kill(&mut self, id: TerminalId) -> Result<(), TerminalError> {
+        self.terminal(id)?
+            .killer
+            .lock()
+            .map_err(|_| TerminalError::Poisoned)?
+            .kill()?;
         let terminal = self
             .terminals
             .remove(&id)
             .ok_or(TerminalError::Missing(id))?;
         self.keys.remove(&terminal.key);
-        terminal
-            .killer
-            .lock()
-            .map_err(|_| TerminalError::Poisoned)?
-            .kill()?;
         Ok(())
     }
 
@@ -298,6 +303,13 @@ fn snapshot(terminal: &TerminalProcess) -> Result<TerminalSnapshot, TerminalErro
         .parser
         .lock()
         .map_err(|_| TerminalError::Poisoned)?;
+    Ok(snapshot_from_parser(terminal, &mut parser))
+}
+
+fn snapshot_from_parser(
+    terminal: &TerminalProcess,
+    parser: &mut vt100::Parser,
+) -> TerminalSnapshot {
     parser.screen_mut().set_scrollback(usize::MAX);
     let retained_scrollback_rows = parser.screen().scrollback();
     let mut scrollback = Vec::with_capacity(retained_scrollback_rows);
@@ -312,7 +324,7 @@ fn snapshot(terminal: &TerminalProcess) -> Result<TerminalSnapshot, TerminalErro
         consumed += count;
     }
     parser.screen_mut().set_scrollback(0);
-    Ok(TerminalSnapshot {
+    TerminalSnapshot {
         rows: terminal.rows,
         cols: terminal.cols,
         contents: parser.screen().contents(),
@@ -320,7 +332,7 @@ fn snapshot(terminal: &TerminalProcess) -> Result<TerminalSnapshot, TerminalErro
         scrollback,
         retained_scrollback_rows,
         alive: terminal.alive.load(Ordering::Acquire),
-    })
+    }
 }
 
 fn pty_error(error: impl std::fmt::Display) -> TerminalError {
