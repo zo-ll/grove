@@ -443,6 +443,10 @@ pub struct Attrs {
     pub underline: bool,
     pub reverse: bool,
     pub dim: bool,
+    /// Always `false` for now: vt100 0.16 has no strikethrough attribute, so
+    /// the daemon cannot answer for it. The field exists on the wire so a
+    /// future parser gains it without a protocol change; no client should
+    /// treat `false` as a fact about the cell.
     pub strikethrough: bool,
 }
 

@@ -1,22 +1,41 @@
 //! Session transitions that coordinate persistent state, Git and PTYs.
 
 use crate::fetch::{FetchPolicy, FetchResult, FetchStatus, RefFreshness};
-use crate::terminal::{TerminalError, TerminalManager};
+use crate::terminal::{TerminalError, TerminalKey, TerminalManager};
 use grove_domain::{Ownership, RepoId, SessionId, SessionState};
 use grove_git::{RemoveOptions, Repository, SizeTask, Tracking, Workspace};
 use grove_lua::{DaemonRuntime, HookReport, LifecycleEvent, LifecyclePayload, WorktreePathContext};
-use grove_proto::{Event, RepoRow, Request, SessionRow, TerminalId, WorktreeRef, WorktreeRow};
+use grove_proto::{
+    Attach, Event, RepoRow, Request, ScrollbackRequest, SessionRow, TerminalId, TerminalRow,
+    TerminalTarget, WorktreeRef, WorktreeRow,
+};
 use grove_state::{OwnedWorktree, Store};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 const DEFAULT_ROWS: u16 = 24;
 const DEFAULT_COLS: u16 = 80;
+/// Lines per scrollback chunk. One chunk per line would flood the wire with
+/// headers; all history in one chunk would pay a 10,000-line buffer at once.
+const SCROLLBACK_CHUNK: usize = 200;
+
+/// The parts of an attach answer, in the order the socket layer must send
+/// them: screen, live feed started, then the backfill chunks.
+pub struct AttachOutcome {
+    /// The visible grid, sent first so the pane paints at once.
+    pub screen: Event,
+    /// History, strictly older than the screen, oldest-first, `done` on the
+    /// final chunk. Sent after the live feed is running.
+    pub backfill: Vec<Event>,
+    /// Live output, drained by the socket layer's forwarder.
+    pub output: mpsc::Receiver<Vec<u8>>,
+}
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -272,6 +291,46 @@ impl SessionOrchestrator {
                 repo: repo.clone(),
                 rows: self.worktree_rows(&repo)?,
             }]),
+            Request::SpawnTerminal(target) => {
+                let id = self.spawn_terminal(&target)?;
+                Ok(vec![Event::TerminalSpawned {
+                    target,
+                    terminal: id,
+                }])
+            }
+            Request::KillTerminal(terminal) => {
+                // The pty is gone; its hook still fires once through the
+                // observed-exit drain, and the killer gets one event — not one
+                // per attached client. Other clients attached to the same pty
+                // see their output channel close instead, which is their
+                // signal that the pane ended.
+                self.terminals.kill(terminal)?;
+                Ok(vec![Event::TerminalExited {
+                    terminal,
+                    status: None,
+                }])
+            }
+            Request::ResizeTerminal {
+                terminal,
+                rows,
+                cols,
+            } => {
+                self.terminals.resize(terminal, rows, cols)?;
+                Ok(Vec::new())
+            }
+            Request::Input { terminal, bytes } => {
+                self.terminals.input(terminal, &bytes)?;
+                Ok(Vec::new())
+            }
+            // Detach stops this client's output feed only: the socket layer
+            // owns that feed and drops it before routing the request here. The
+            // pty itself keeps running — only `end` is destructive.
+            //
+            // AttachTerminal never reaches this match: the socket layer routes
+            // it to `attach_terminal`, because its answer includes a live
+            // output stream no Vec<Event> can carry.
+            Request::ListTerminals => Ok(vec![Event::Terminals(self.terminal_rows()?)]),
+            Request::DetachTerminal(_) => Ok(Vec::new()),
             Request::SessionNew { name } => {
                 let session = next_session_id();
                 self.store.create(session.clone(), name)?;
@@ -544,6 +603,163 @@ impl SessionOrchestrator {
         0
     }
 
+    /// Attaches to a terminal: resize to the pane's size, then the parts of
+    /// the reassembly contract, in the order the caller must send them:
+    /// screen, then history chunks.
+    ///
+    /// The split is the point. The socket layer sends the screen, starts the
+    /// live feed, and only then sends the backfill — so output produced while
+    /// history loads drains on the client's own channel instead of being
+    /// evicted by the bounded subscriber buffer and ending the stream
+    /// silently. Live output may interleave from the moment the screen is
+    /// sent; a client that has painted must not go stale while history loads.
+    pub fn attach_terminal(&mut self, attach: Attach) -> Result<AttachOutcome, OrchestrationError> {
+        // The pane's size at attach time: resizing before the screen means the
+        // client never paints a wrongly-sized grid, and vt100 reflows.
+        self.terminals
+            .resize(attach.terminal, attach.rows, attach.cols)?;
+        let attachment = self.terminals.attach(attach.terminal)?;
+        let snapshot = &attachment.snapshot;
+        let screen = Event::TerminalScreen {
+            terminal: attach.terminal,
+            screen: snapshot.screen.clone(),
+        };
+        let lines = match attach.scrollback {
+            ScrollbackRequest::None => Vec::new(),
+            ScrollbackRequest::Lines(count) => {
+                let count = usize::try_from(count).unwrap_or(usize::MAX);
+                let start = snapshot.scrollback.len().saturating_sub(count);
+                snapshot.scrollback[start..].to_vec()
+            }
+            ScrollbackRequest::All => snapshot.scrollback.clone(),
+        };
+        // Chunks are oldest-first, `seq` counts from the oldest, and an empty
+        // backfill is one empty chunk with `done` set — never zero chunks, so
+        // a client that joins with nothing behind the screen still sees a
+        // terminal `done` and does not wait forever.
+        let mut backfill = Vec::new();
+        let mut sent = 0_usize;
+        let total = lines.len();
+        loop {
+            let end = (sent + SCROLLBACK_CHUNK).min(total);
+            let seq = u32::try_from(sent / SCROLLBACK_CHUNK).unwrap_or(u32::MAX);
+            backfill.push(Event::TerminalScrollback {
+                terminal: attach.terminal,
+                seq,
+                lines: lines[sent..end].to_vec(),
+                done: end == total,
+            });
+            sent = end;
+            if end == total {
+                break;
+            }
+        }
+        Ok(AttachOutcome {
+            screen,
+            backfill,
+            output: attachment.output,
+        })
+    }
+
+    /// The scratch shell spawns with no worktree (§4.5); a worktree target
+    /// spawns one terminal for that checkout. A worktree owned by a session
+    /// joins that session's live set, so closing the session kills it.
+    fn spawn_terminal(
+        &mut self,
+        target: &TerminalTarget,
+    ) -> Result<TerminalId, OrchestrationError> {
+        match target {
+            TerminalTarget::Worktree(reference) => {
+                let repository = self.repository(&reference.repo)?.clone();
+                let checkout = self
+                    .find_checkout(&repository, &reference.branch)?
+                    .ok_or_else(|| {
+                        OrchestrationError::WorktreeMissing(OwnedWorktree {
+                            repo: reference.repo.clone(),
+                            branch: reference.branch.clone(),
+                        })
+                    })?;
+                let id =
+                    self.terminals
+                        .spawn_worktree(&checkout.path, DEFAULT_ROWS, DEFAULT_COLS)?;
+                let owned = OwnedWorktree {
+                    repo: reference.repo.clone(),
+                    branch: reference.branch.clone(),
+                };
+                if let Some(session) = self.store.owner(&owned).cloned() {
+                    self.live
+                        .entry(session.clone())
+                        .or_default()
+                        .push(LiveTerminal {
+                            worktree: owned.clone(),
+                            id,
+                        });
+                    self.fire_terminal(LifecycleEvent::TerminalSpawned, &session, &owned, id);
+                }
+                Ok(id)
+            }
+            TerminalTarget::Scratch { cwd } => {
+                let id = match cwd {
+                    Some(cwd) => self.terminals.spawn_scratch_at(
+                        expand_home(cwd),
+                        DEFAULT_ROWS,
+                        DEFAULT_COLS,
+                    )?,
+                    None => self.terminals.spawn_scratch(DEFAULT_ROWS, DEFAULT_COLS)?,
+                };
+                Ok(id)
+            }
+        }
+    }
+
+    /// Every live terminal, so a reattaching client can find the scratch shell
+    /// again. Worktree targets are resolved back through git: the manager
+    /// stores paths, the wire names (repo, branch).
+    fn terminal_rows(&self) -> Result<Vec<TerminalRow>, OrchestrationError> {
+        // One worktree listing per repo for this request, not per terminal:
+        // the manager knows paths, and resolving them one git subprocess per
+        // terminal would run under the service lock for no reason.
+        let mut names: HashMap<PathBuf, TerminalTarget> = HashMap::new();
+        for repository in self.repositories.values() {
+            let Ok(checkouts) = grove_git::worktrees(&repository.path) else {
+                // A repo git cannot answer for contributes no names; the
+                // same degradation the pane rows apply.
+                continue;
+            };
+            for checkout in checkouts {
+                names.insert(
+                    checkout.path,
+                    TerminalTarget::Worktree(WorktreeRef {
+                        repo: repository.id.clone(),
+                        branch: checkout.branch.unwrap_or_default(),
+                    }),
+                );
+            }
+        }
+        let mut rows = Vec::new();
+        for (id, key, alive) in self.terminals.list() {
+            if !alive {
+                continue;
+            }
+            let target = match &key {
+                TerminalKey::Scratch => TerminalTarget::Scratch { cwd: None },
+                // A checkout git no longer names (removed while its terminal
+                // was alive) is omitted from the list.
+                TerminalKey::Worktree(path) => match names.get(path) {
+                    Some(target) => target.clone(),
+                    None => continue,
+                },
+            };
+            let foreground = self.terminals.foreground_process(id).ok().flatten();
+            rows.push(TerminalRow {
+                terminal: id,
+                target,
+                foreground,
+            });
+        }
+        Ok(rows)
+    }
+
     /// Re-walks the workspace with the configured `ignore` globs (§5's `scan`)
     /// and adopts the result as the workspace's repositories.
     fn scan_workspace(&mut self) -> Result<(), OrchestrationError> {
@@ -672,13 +888,17 @@ impl SessionOrchestrator {
             match self.terminals.kill(terminal.id) {
                 Ok(()) => {
                     killed.push(terminal.id);
-                    self.fire_terminal(
-                        LifecycleEvent::TerminalExited,
-                        session,
-                        &terminal.worktree,
-                        terminal.id,
-                    );
-                    self.notified_exits.insert(terminal.id);
+                    // A terminal that exited on its own may already have been
+                    // reported by the drain; the notified set is the single
+                    // record of "fired once", so its answer decides.
+                    if self.notified_exits.insert(terminal.id) {
+                        self.fire_terminal(
+                            LifecycleEvent::TerminalExited,
+                            session,
+                            &terminal.worktree,
+                            terminal.id,
+                        );
+                    }
                 }
                 Err(error) => {
                     failed.push(EffectFailure {
@@ -864,13 +1084,15 @@ impl SessionOrchestrator {
         });
         if let Some(terminal) = terminal {
             self.terminals.kill(terminal.id)?;
-            self.fire_terminal(
-                LifecycleEvent::TerminalExited,
-                session,
-                &terminal.worktree,
-                terminal.id,
-            );
-            self.notified_exits.insert(terminal.id);
+            // Same once-only rule as close(): the drain may have reported it.
+            if self.notified_exits.insert(terminal.id) {
+                self.fire_terminal(
+                    LifecycleEvent::TerminalExited,
+                    session,
+                    &terminal.worktree,
+                    terminal.id,
+                );
+            }
         }
         self.store.release(session, worktree)?;
         Ok(())
@@ -1162,6 +1384,22 @@ fn paths_equal(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// Expands a leading `~` like the daemon's own config does, so a spawn
+/// request naming `~/notes` works without the client resolving it.
+pub fn expand_home(path: &Path) -> PathBuf {
+    if path == Path::new("~") {
+        return std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| path.to_path_buf());
+    }
+    if let Ok(rest) = path.strip_prefix("~/")
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return PathBuf::from(home).join(rest);
+    }
+    path.to_path_buf()
+}
+
 fn next_session_id() -> SessionId {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1234,6 +1472,7 @@ fn fetch_failure_events(results: &[FetchResult]) -> Vec<Event> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use grove_proto::Attach;
     use std::env;
     use std::fs;
     use std::process::Command;
@@ -1762,6 +2001,239 @@ mod tests {
             first, second,
             "rescanning an unchanged workspace must produce the same rows"
         );
+    }
+
+    #[test]
+    fn terminal_requests_serve_spawn_attach_input_and_lifecycle() {
+        let temp = TempDir::new();
+        let clone = temp.0.join("repo");
+        let ours_path = temp.0.join("ours");
+        fs::create_dir_all(&clone).unwrap();
+        git(&clone, &["init", "-q", "-b", "main"]);
+        git(&clone, &["config", "user.name", "Grove Test"]);
+        git(&clone, &["config", "user.email", "grove@example.test"]);
+        fs::write(clone.join("tracked"), "base\n").unwrap();
+        git(&clone, &["add", "tracked"]);
+        git(&clone, &["commit", "-qm", "base"]);
+        git(
+            &clone,
+            &[
+                "worktree",
+                "add",
+                "-qb",
+                "ours",
+                ours_path.to_str().unwrap(),
+            ],
+        );
+
+        let template = temp.0.join("trees/{repo}/{branch_slug}");
+        let template = template.to_string_lossy().into_owned();
+        let mut store = Store::load_at(&temp.0.join("state"), &temp.0, &template);
+        store.create(sid("one"), "one".to_string()).unwrap();
+        store
+            .add_member(&sid("one"), RepoId("repo".into()))
+            .unwrap();
+        store
+            .adopt(&sid("one"), owned("ours"), &ours_path, &clone)
+            .unwrap();
+        let repository = Repository {
+            id: RepoId("repo".into()),
+            name: "repo".into(),
+            path: clone.clone(),
+            base_branch: Some("main".into()),
+        };
+        let terminals = TerminalManager::new(PathBuf::from("/bin/sh"), temp.0.clone(), 200);
+        let fetch = FetchPolicy::new(2, Duration::from_secs(60));
+        let runtime = DaemonRuntime::load_source(
+            &format!(
+                "local grove = require('grove'); grove.setup({{ worktree_path = {template:?} }})",
+                template = template
+            ),
+            "terminal-config",
+        )
+        .runtime;
+        let mut daemon = SessionOrchestrator::new(
+            store,
+            vec![repository],
+            temp.0.clone(),
+            terminals,
+            fetch,
+            runtime,
+        );
+
+        // Spawn: the answer carries the id, and a worktree owned by the open
+        // session joins its live set.
+        let events = daemon.handle_request(Request::SpawnTerminal(TerminalTarget::Worktree(
+            WorktreeRef {
+                repo: RepoId("repo".into()),
+                branch: "ours".into(),
+            },
+        )));
+        let Some(Event::TerminalSpawned { terminal, target }) = events.first() else {
+            panic!("expected TerminalSpawned, got {events:?}")
+        };
+        assert!(matches!(target, TerminalTarget::Worktree(_)));
+        let id = *terminal;
+        assert!(daemon.store().session(&sid("one")).is_ok(),);
+        // One terminal per checkout.
+        let events = daemon.handle_request(Request::SpawnTerminal(TerminalTarget::Worktree(
+            WorktreeRef {
+                repo: RepoId("repo".into()),
+                branch: "ours".into(),
+            },
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Event::Failed { message, .. } if message.contains("already exists")
+        )));
+
+        // Attach: screen first, exactly the visible grid, then one empty
+        // scrollback chunk with `done` set — never zero chunks.
+        let outcome = daemon
+            .attach_terminal(Attach {
+                terminal: id,
+                scrollback: ScrollbackRequest::All,
+                rows: 10,
+                cols: 40,
+            })
+            .unwrap();
+        let output = outcome.output;
+        assert!(matches!(outcome.screen, Event::TerminalScreen { .. }));
+        let events: Vec<Event> = std::iter::once(outcome.screen.clone())
+            .chain(outcome.backfill.clone())
+            .collect();
+        match &events[0] {
+            Event::TerminalScreen { screen, .. } => {
+                assert_eq!((screen.rows, screen.cols), (10, 40));
+                assert_eq!(screen.cells.len(), 10);
+                assert_eq!(screen.cells[0].len(), 40);
+                assert!(screen.cells.iter().all(|row| row.len() == 40));
+            }
+            _ => unreachable!(),
+        }
+        match &events[1] {
+            Event::TerminalScrollback {
+                seq, lines, done, ..
+            } => {
+                assert_eq!((*seq, lines.len(), *done), (0, 0, true));
+            }
+            other => panic!("expected scrollback, got {other:?}"),
+        }
+
+        // Input reaches the right pty: the shell echoes and the screen shows
+        // it. Output produced after attach arrives on the live channel without
+        // waiting for any backfill (there was none to wait for here).
+        daemon
+            .handle_request(Request::Input {
+                terminal: id,
+                bytes: b"echo attached-output\r".to_vec(),
+            })
+            .is_empty();
+        let mut received = false;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !received {
+            match output.recv_timeout(Duration::from_millis(500)) {
+                Ok(bytes) => {
+                    received = bytes.windows(8).any(|window| window == b"attached");
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    assert!(Instant::now() < deadline, "no live output after input");
+                }
+                Err(_) => panic!("the live channel closed before any output"),
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let snapshot = daemon.terminals().snapshot(id).unwrap();
+            if snapshot.contents.contains("attached-output") {
+                break;
+            }
+            assert!(Instant::now() < deadline, "input never reached the pty");
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        // Resize reflows vt100's grid; the next attach reports the new shape.
+        daemon
+            .handle_request(Request::ResizeTerminal {
+                terminal: id,
+                rows: 12,
+                cols: 50,
+            })
+            .is_empty();
+        let outcome = daemon
+            .attach_terminal(Attach {
+                terminal: id,
+                scrollback: ScrollbackRequest::Lines(5),
+                rows: 12,
+                cols: 50,
+            })
+            .unwrap();
+        let events = std::iter::once(&outcome.screen)
+            .chain(outcome.backfill.iter())
+            .collect::<Vec<&Event>>();
+        match &events[0] {
+            Event::TerminalScreen { screen, .. } => {
+                assert_eq!((screen.rows, screen.cols), (12, 50));
+            }
+            _ => unreachable!(),
+        }
+
+        // Detach stops only the feed: the pty keeps running.
+        daemon
+            .handle_request(Request::DetachTerminal(id))
+            .is_empty();
+        assert!(daemon.terminals().is_alive(id).unwrap());
+
+        // Scratch shell spawns with no worktree, and ListTerminals finds both.
+        let events = daemon.handle_request(Request::SpawnTerminal(TerminalTarget::Scratch {
+            cwd: None,
+        }));
+        let Some(Event::TerminalSpawned {
+            terminal: scratch, ..
+        }) = events.first()
+        else {
+            panic!("expected scratch spawn")
+        };
+        let events = daemon.handle_request(Request::ListTerminals);
+        let Some(Event::Terminals(rows)) = events.first() else {
+            panic!("expected Terminals")
+        };
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows.iter()
+                .any(|row| matches!(row.target, TerminalTarget::Scratch { .. }))
+        );
+        let worktree_row = rows.iter().find(|row| row.terminal == id).unwrap();
+        assert!(matches!(
+            &worktree_row.target,
+            TerminalTarget::Worktree(reference) if reference.branch == "ours"
+        ));
+        // The shell itself is the foreground process of a fresh pane.
+        assert!(worktree_row.foreground.is_some());
+
+        // Killing emits TerminalExited exactly once, on the killer's response.
+        let events = daemon.handle_request(Request::KillTerminal(id));
+        let exits = events
+            .iter()
+            .filter(
+                |event| matches!(event, Event::TerminalExited { terminal, .. } if *terminal == id),
+            )
+            .count();
+        assert_eq!(exits, 1);
+        // A killed terminal is not merely dead but gone: a later attach must
+        // be refused, not quietly served a corpse.
+        assert!(matches!(
+            daemon.terminals().is_alive(id),
+            Err(TerminalError::Missing(_))
+        ));
+        // The killed terminal is gone from the list; the scratch is untouched.
+        let events = daemon.handle_request(Request::ListTerminals);
+        let Some(Event::Terminals(rows)) = events.first() else {
+            panic!("expected Terminals")
+        };
+        assert_eq!(rows.len(), 1);
+        assert!(matches!(rows[0].target, TerminalTarget::Scratch { .. }));
+        assert!(daemon.terminals().is_alive(*scratch).unwrap());
     }
 
     #[test]
