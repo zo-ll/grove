@@ -527,10 +527,15 @@ impl SessionOrchestrator {
 
     /// The last known size of a checkout, starting the background walk when
     /// none is in flight. The first request after a worktree appears answers
-    /// 0; the walk's answer lands on a later request.
+    /// 0; the walk's answer lands on a later request. A walk that failed is
+    /// not restarted while its checkout stays listed: its row keeps 0 and is
+    /// marked stale instead of churning a doomed walk every refresh.
     fn known_size(&mut self, path: &Path) -> u64 {
         if let Some(size) = self.known_sizes.get(path) {
             return *size;
+        }
+        if self.failed_sizes.contains(path) {
+            return 0;
         }
         if !self.pending_sizes.contains_key(path) {
             self.pending_sizes
@@ -1714,6 +1719,37 @@ mod tests {
         // Nested repos are repos per SPEC §2.2; the walk prunes only the
         // repository's .git metadata itself.
         assert!(ids.contains(&"gamma/nested"));
+
+        // The recomputed unknown set is keyed like every override lookup, by
+        // name — not by repo id, which for a nested repo is composite. The
+        // quote after "named" makes the check exact: gamma/nested's id would
+        // also contain "nested", but only a failure *about* "nested" counts.
+        // This pair of assertions is the regression test for that bug: keyed
+        // by id, 'nested' is falsely reported unknown and the count of 2 (and
+        // the name check) fail; keyed by name, exactly ghost is reported.
+        let events = daemon.handle_request(Request::ListRepos);
+        let reported: Vec<String> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Failed { context, message } if context == "config: repo override" => {
+                    Some(message.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            reported.len(),
+            1,
+            "exactly one unknown override after the scan: {reported:?}"
+        );
+        assert!(
+            reported[0].contains("ghost"),
+            "the unknown override is ghost: {reported:?}"
+        );
+        assert!(
+            !reported[0].contains("named \"nested\""),
+            "the nested override must be known by name despite its composite id: {reported:?}"
+        );
 
         let events = daemon.handle_request(Request::Scan);
         let Some(Event::Repos(second)) = events
