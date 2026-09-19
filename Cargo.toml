@@ -13,7 +13,11 @@ members = [
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.85"
+# Raised from 1.85 (the edition-2024 floor) because ratatui 0.30 requires
+# 1.88, and 0.30 is not optional: 0.29 pins unicode-width "=0.2.0" while
+# groved's vt100 needs ^0.2.1, so the two crates SPEC §8 names cannot coexist
+# on the older release.
+rust-version = "1.88"
 license = "MIT"
 repository = "https://github.com/zo-ll/grove"
 
