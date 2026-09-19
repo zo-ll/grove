@@ -47,7 +47,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let store =
                 grove_state::Store::load(&workspace, if session_paths { "{session}" } else { "" });
             let terminals = TerminalManager::new(shell, scratch_cwd, scrollback);
-            let service = SessionOrchestrator::new(store, repositories, terminals, fetch, runtime);
+            let service = SessionOrchestrator::new(
+                store,
+                repositories,
+                workspace_view.root().to_path_buf(),
+                terminals,
+                fetch,
+                runtime,
+            );
             daemon.run(service)?;
         }
         BindOutcome::Existing(_) => {}
