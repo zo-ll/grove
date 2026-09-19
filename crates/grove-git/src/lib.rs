@@ -365,6 +365,214 @@ pub fn diff(worktree: &Path, base: &str) -> Result<Vec<DiffFile>, Error> {
     Ok(files)
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RemoveOptions {
+    /// Set only after the caller has shown and confirmed the dirty-worktree warning.
+    pub force_dirty: bool,
+    /// Best current foreground-process description from the daemon's PTY owner.
+    pub foreground_process: Option<String>,
+    /// Set only after the caller has shown and confirmed the busy-terminal warning.
+    pub force_busy: bool,
+}
+
+#[derive(Debug, Error)]
+pub enum WriteError {
+    #[error(transparent)]
+    Read(#[from] Error),
+    #[error("branch {branch:?} is already checked out at {path}")]
+    BranchAlreadyCheckedOut { branch: String, path: PathBuf },
+    #[error("branch {branch:?} already exists")]
+    BranchAlreadyExists { branch: String },
+    #[error("destination {path} already exists")]
+    DestinationExists { path: PathBuf },
+    #[error("refusing to remove dirty worktree {path} without explicit force")]
+    DirtyWorktree { path: PathBuf },
+    #[error("refusing to remove busy worktree {path}; foreground process is {process}")]
+    BusyWorktree { path: PathBuf, process: String },
+    #[error("refusing to remove the repository's main checkout {path}")]
+    MainCheckout { path: PathBuf },
+    #[error("git {operation} failed in {repo}: {message}")]
+    CommandFailed {
+        operation: WriteOperation,
+        repo: PathBuf,
+        message: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteOperation {
+    AddWorktree,
+    RemoveWorktree,
+    FetchPrune,
+}
+
+impl std::fmt::Display for WriteOperation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AddWorktree => formatter.write_str("worktree add"),
+            Self::RemoveWorktree => formatter.write_str("worktree remove"),
+            Self::FetchPrune => formatter.write_str("fetch --prune"),
+        }
+    }
+}
+
+/// Creates a new branch and checks it out in a new worktree.
+pub fn create_worktree(
+    repo: &Path,
+    path: &Path,
+    branch: &str,
+    base: &str,
+) -> Result<(), WriteError> {
+    refuse_checked_out_branch(repo, branch)?;
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args([OsStr::new("worktree"), OsStr::new("add")])
+        .arg(path)
+        .args([OsStr::new("-b"), OsStr::new(branch), OsStr::new(base)])
+        .output()
+        .map_err(|err| command_spawn_failure(WriteOperation::AddWorktree, repo, err))?;
+    classify_add_result(repo, path, branch, output)
+}
+
+/// Checks out an existing branch in a new worktree.
+pub fn add_existing_worktree(repo: &Path, path: &Path, branch: &str) -> Result<(), WriteError> {
+    refuse_checked_out_branch(repo, branch)?;
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args([OsStr::new("worktree"), OsStr::new("add")])
+        .arg(path)
+        .arg(branch)
+        .output()
+        .map_err(|err| command_spawn_failure(WriteOperation::AddWorktree, repo, err))?;
+    classify_add_result(repo, path, branch, output)
+}
+
+fn refuse_checked_out_branch(repo: &Path, branch: &str) -> Result<(), WriteError> {
+    if let Some(existing) = worktrees(repo)?
+        .into_iter()
+        .find(|worktree| worktree.branch.as_deref() == Some(branch))
+    {
+        return Err(WriteError::BranchAlreadyCheckedOut {
+            branch: branch.to_owned(),
+            path: existing.path,
+        });
+    }
+    Ok(())
+}
+
+fn classify_add_result(
+    repo: &Path,
+    destination: &Path,
+    branch: &str,
+    output: Output,
+) -> Result<(), WriteError> {
+    if output.status.success() {
+        return Ok(());
+    }
+    let message = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    if let Some(path) = checked_out_path(&message) {
+        return Err(WriteError::BranchAlreadyCheckedOut {
+            branch: branch.to_owned(),
+            path,
+        });
+    }
+    if message.contains("already exists") && message.contains("branch named") {
+        return Err(WriteError::BranchAlreadyExists {
+            branch: branch.to_owned(),
+        });
+    }
+    if message.contains("already exists") {
+        return Err(WriteError::DestinationExists {
+            path: destination.to_owned(),
+        });
+    }
+    Err(WriteError::CommandFailed {
+        operation: WriteOperation::AddWorktree,
+        repo: repo.to_owned(),
+        message,
+    })
+}
+
+fn checked_out_path(message: &str) -> Option<PathBuf> {
+    let rest = message.split("already checked out at '").nth(1)?;
+    Some(PathBuf::from(rest.split_once('\'')?.0))
+}
+
+/// Removes a linked worktree after enforcing Grove's dirty, busy and clone guards.
+pub fn remove_worktree(
+    repo: &Path,
+    path: &Path,
+    options: &RemoveOptions,
+) -> Result<(), WriteError> {
+    let repo_path = fs::canonicalize(repo).unwrap_or_else(|_| repo.to_owned());
+    let target_path = fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
+    if repo_path == target_path {
+        return Err(WriteError::MainCheckout {
+            path: path.to_owned(),
+        });
+    }
+    if !options.force_busy {
+        if let Some(process) = &options.foreground_process {
+            return Err(WriteError::BusyWorktree {
+                path: path.to_owned(),
+                process: process.clone(),
+            });
+        }
+    }
+    if is_dirty(path)? && !options.force_dirty {
+        return Err(WriteError::DirtyWorktree {
+            path: path.to_owned(),
+        });
+    }
+
+    let mut command = Command::new("git");
+    command.arg("-C").arg(repo).args(["worktree", "remove"]);
+    if options.force_dirty {
+        command.arg("--force");
+    }
+    let output = command
+        .arg(path)
+        .output()
+        .map_err(|err| command_spawn_failure(WriteOperation::RemoveWorktree, repo, err))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(WriteError::CommandFailed {
+            operation: WriteOperation::RemoveWorktree,
+            repo: repo.to_owned(),
+            message: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        })
+    }
+}
+
+pub fn fetch_prune(repo: &Path) -> Result<(), WriteError> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["fetch", "--prune"])
+        .output()
+        .map_err(|err| command_spawn_failure(WriteOperation::FetchPrune, repo, err))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(WriteError::CommandFailed {
+            operation: WriteOperation::FetchPrune,
+            repo: repo.to_owned(),
+            message: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        })
+    }
+}
+
+fn command_spawn_failure(operation: WriteOperation, repo: &Path, error: io::Error) -> WriteError {
+    WriteError::CommandFailed {
+        operation,
+        repo: repo.to_owned(),
+        message: error.to_string(),
+    }
+}
+
 fn parse_numstat(value: Option<&[u8]>) -> Option<u64> {
     let value = value?;
     if value == b"-" {
@@ -755,5 +963,87 @@ mod tests {
             assert!(Instant::now() < deadline);
             thread::yield_now();
         }
+    }
+
+    #[test]
+    fn checked_out_branch_error_carries_the_conflicting_path() {
+        let temp = TempDir::new("branch-conflict");
+        let clone = temp.0.join("clone");
+        let destination = temp.0.join("other");
+        repo(&clone);
+        let error = add_existing_worktree(&clone, &destination, "main").unwrap_err();
+        assert!(matches!(
+            error,
+            WriteError::BranchAlreadyCheckedOut { branch, path }
+                if branch == "main" && path == clone
+        ));
+    }
+
+    #[test]
+    fn creates_new_and_existing_branch_worktrees() {
+        let temp = TempDir::new("create-worktree");
+        let clone = temp.0.join("clone");
+        let first = temp.0.join("first");
+        let second = temp.0.join("second");
+        repo(&clone);
+        create_worktree(&clone, &first, "new-topic", "main").unwrap();
+        assert!(first.join(".git").is_file());
+        git(&clone, &["branch", "existing-topic"]);
+        add_existing_worktree(&clone, &second, "existing-topic").unwrap();
+        assert!(second.join(".git").is_file());
+    }
+
+    #[test]
+    fn dirty_worktree_needs_explicit_force() {
+        let temp = TempDir::new("dirty-remove");
+        let clone = temp.0.join("clone");
+        let linked = temp.0.join("linked");
+        repo(&clone);
+        git(&clone, &["branch", "topic"]);
+        add_existing_worktree(&clone, &linked, "topic").unwrap();
+        fs::write(linked.join("untracked"), "work").unwrap();
+        assert!(matches!(
+            remove_worktree(&clone, &linked, &RemoveOptions::default()),
+            Err(WriteError::DirtyWorktree { path }) if path == linked
+        ));
+        remove_worktree(
+            &clone,
+            &linked,
+            &RemoveOptions {
+                force_dirty: true,
+                ..RemoveOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(!linked.exists());
+    }
+
+    #[test]
+    fn busy_worktree_needs_explicit_confirmation() {
+        let temp = TempDir::new("busy-remove");
+        let clone = temp.0.join("clone");
+        let linked = temp.0.join("linked");
+        repo(&clone);
+        git(&clone, &["branch", "topic"]);
+        add_existing_worktree(&clone, &linked, "topic").unwrap();
+        let options = RemoveOptions {
+            foreground_process: Some("cargo test".into()),
+            ..RemoveOptions::default()
+        };
+        assert!(matches!(
+            remove_worktree(&clone, &linked, &options),
+            Err(WriteError::BusyWorktree { process, .. }) if process == "cargo test"
+        ));
+        assert!(linked.exists());
+    }
+
+    #[test]
+    fn main_checkout_can_never_be_removed() {
+        let temp = TempDir::new("clone-remove");
+        repo(&temp.0);
+        assert!(matches!(
+            remove_worktree(&temp.0, &temp.0, &RemoveOptions::default()),
+            Err(WriteError::MainCheckout { .. })
+        ));
     }
 }
