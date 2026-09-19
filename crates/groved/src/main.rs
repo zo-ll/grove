@@ -71,16 +71,5 @@ fn config_path() -> PathBuf {
 }
 
 fn expand_home(value: &str) -> PathBuf {
-    if value == "~" {
-        return std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("~"));
-    }
-    if let Some(rest) = value.strip_prefix("~/") {
-        return std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("~"))
-            .join(rest);
-    }
-    Path::new(value).to_owned()
+    groved::session::expand_home(Path::new(value))
 }

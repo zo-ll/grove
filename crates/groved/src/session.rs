@@ -24,6 +24,18 @@ const DEFAULT_COLS: u16 = 80;
 /// Lines per scrollback chunk. One chunk per line would flood the wire with
 /// headers; all history in one chunk would pay a 10,000-line buffer at once.
 const SCROLLBACK_CHUNK: usize = 200;
+
+/// The parts of an attach answer, in the order the socket layer must send
+/// them: screen, live feed started, then the backfill chunks.
+pub struct AttachOutcome {
+    /// The visible grid, sent first so the pane paints at once.
+    pub screen: Event,
+    /// History, strictly older than the screen, oldest-first, `done` on the
+    /// final chunk. Sent after the live feed is running.
+    pub backfill: Vec<Event>,
+    /// Live output, drained by the socket layer's forwarder.
+    pub output: mpsc::Receiver<Vec<u8>>,
+}
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -591,29 +603,27 @@ impl SessionOrchestrator {
         0
     }
 
-    /// Attaches to a terminal: resize to the pane's size first, then screen,
-    /// then backfill chunks, and the live output stream the socket layer
-    /// forwards from now on.
+    /// Attaches to a terminal: resize to the pane's size, then the parts of
+    /// the reassembly contract, in the order the caller must send them:
+    /// screen, then history chunks.
     ///
-    /// The ordering is the protocol's reassembly contract: the screen arrives
-    /// first and carries exactly the visible grid; history follows as chunks
-    /// strictly older than it; live output may interleave the moment the
-    /// screen is sent — it is never withheld for backfill, and a client that
-    /// has painted must not go stale while history loads.
-    pub fn attach_terminal(
-        &mut self,
-        attach: Attach,
-    ) -> Result<(Vec<Event>, mpsc::Receiver<Vec<u8>>), OrchestrationError> {
+    /// The split is the point. The socket layer sends the screen, starts the
+    /// live feed, and only then sends the backfill — so output produced while
+    /// history loads drains on the client's own channel instead of being
+    /// evicted by the bounded subscriber buffer and ending the stream
+    /// silently. Live output may interleave from the moment the screen is
+    /// sent; a client that has painted must not go stale while history loads.
+    pub fn attach_terminal(&mut self, attach: Attach) -> Result<AttachOutcome, OrchestrationError> {
         // The pane's size at attach time: resizing before the screen means the
         // client never paints a wrongly-sized grid, and vt100 reflows.
         self.terminals
             .resize(attach.terminal, attach.rows, attach.cols)?;
         let attachment = self.terminals.attach(attach.terminal)?;
         let snapshot = &attachment.snapshot;
-        let mut events = vec![Event::TerminalScreen {
+        let screen = Event::TerminalScreen {
             terminal: attach.terminal,
             screen: snapshot.screen.clone(),
-        }];
+        };
         let lines = match attach.scrollback {
             ScrollbackRequest::None => Vec::new(),
             ScrollbackRequest::Lines(count) => {
@@ -627,12 +637,13 @@ impl SessionOrchestrator {
         // backfill is one empty chunk with `done` set — never zero chunks, so
         // a client that joins with nothing behind the screen still sees a
         // terminal `done` and does not wait forever.
+        let mut backfill = Vec::new();
         let mut sent = 0_usize;
         let total = lines.len();
         loop {
             let end = (sent + SCROLLBACK_CHUNK).min(total);
             let seq = u32::try_from(sent / SCROLLBACK_CHUNK).unwrap_or(u32::MAX);
-            events.push(Event::TerminalScrollback {
+            backfill.push(Event::TerminalScrollback {
                 terminal: attach.terminal,
                 seq,
                 lines: lines[sent..end].to_vec(),
@@ -643,7 +654,11 @@ impl SessionOrchestrator {
                 break;
             }
         }
-        Ok((events, attachment.output))
+        Ok(AttachOutcome {
+            screen,
+            backfill,
+            output: attachment.output,
+        })
     }
 
     /// The scratch shell spawns with no worktree (§4.5); a worktree target
@@ -701,6 +716,26 @@ impl SessionOrchestrator {
     /// again. Worktree targets are resolved back through git: the manager
     /// stores paths, the wire names (repo, branch).
     fn terminal_rows(&self) -> Result<Vec<TerminalRow>, OrchestrationError> {
+        // One worktree listing per repo for this request, not per terminal:
+        // the manager knows paths, and resolving them one git subprocess per
+        // terminal would run under the service lock for no reason.
+        let mut names: HashMap<PathBuf, TerminalTarget> = HashMap::new();
+        for repository in self.repositories.values() {
+            let Ok(checkouts) = grove_git::worktrees(&repository.path) else {
+                // A repo git cannot answer for contributes no names; the
+                // same degradation the pane rows apply.
+                continue;
+            };
+            for checkout in checkouts {
+                names.insert(
+                    checkout.path,
+                    TerminalTarget::Worktree(WorktreeRef {
+                        repo: repository.id.clone(),
+                        branch: checkout.branch.unwrap_or_default(),
+                    }),
+                );
+            }
+        }
         let mut rows = Vec::new();
         for (id, key, alive) in self.terminals.list() {
             if !alive {
@@ -708,8 +743,10 @@ impl SessionOrchestrator {
             }
             let target = match &key {
                 TerminalKey::Scratch => TerminalTarget::Scratch { cwd: None },
-                TerminalKey::Worktree(path) => match self.worktree_target(path) {
-                    Some(target) => target,
+                // A checkout git no longer names (removed while its terminal
+                // was alive) is omitted from the list.
+                TerminalKey::Worktree(path) => match names.get(path) {
+                    Some(target) => target.clone(),
                     None => continue,
                 },
             };
@@ -721,28 +758,6 @@ impl SessionOrchestrator {
             });
         }
         Ok(rows)
-    }
-
-    /// Names a checkout path on the wire, or `None` when git no longer knows
-    /// the checkout (removed while its terminal was alive).
-    fn worktree_target(&self, path: &Path) -> Option<TerminalTarget> {
-        for repository in self.repositories.values() {
-            let Ok(checkouts) = grove_git::worktrees(&repository.path) else {
-                // A repo git cannot answer for contributes no names; the
-                // same degradation the pane rows apply.
-                continue;
-            };
-            if let Some(checkout) = checkouts
-                .into_iter()
-                .find(|checkout| checkout.path == *path)
-            {
-                return Some(TerminalTarget::Worktree(WorktreeRef {
-                    repo: repository.id.clone(),
-                    branch: checkout.branch.unwrap_or_default(),
-                }));
-            }
-        }
-        None
     }
 
     /// Re-walks the workspace with the configured `ignore` globs (§5's `scan`)
@@ -873,12 +888,17 @@ impl SessionOrchestrator {
             match self.terminals.kill(terminal.id) {
                 Ok(()) => {
                     killed.push(terminal.id);
-                    self.fire_terminal(
-                        LifecycleEvent::TerminalExited,
-                        session,
-                        &terminal.worktree,
-                        terminal.id,
-                    );
+                    // A terminal that exited on its own may already have been
+                    // reported by the drain; the notified set is the single
+                    // record of "fired once", so its answer decides.
+                    if self.notified_exits.insert(terminal.id) {
+                        self.fire_terminal(
+                            LifecycleEvent::TerminalExited,
+                            session,
+                            &terminal.worktree,
+                            terminal.id,
+                        );
+                    }
                     self.notified_exits.insert(terminal.id);
                 }
                 Err(error) => {
@@ -1065,13 +1085,15 @@ impl SessionOrchestrator {
         });
         if let Some(terminal) = terminal {
             self.terminals.kill(terminal.id)?;
-            self.fire_terminal(
-                LifecycleEvent::TerminalExited,
-                session,
-                &terminal.worktree,
-                terminal.id,
-            );
-            self.notified_exits.insert(terminal.id);
+            // Same once-only rule as close(): the drain may have reported it.
+            if self.notified_exits.insert(terminal.id) {
+                self.fire_terminal(
+                    LifecycleEvent::TerminalExited,
+                    session,
+                    &terminal.worktree,
+                    terminal.id,
+                );
+            }
         }
         self.store.release(session, worktree)?;
         Ok(())
@@ -1365,7 +1387,7 @@ fn paths_equal(a: &Path, b: &Path) -> bool {
 
 /// Expands a leading `~` like the daemon's own config does, so a spawn
 /// request naming `~/notes` works without the client resolving it.
-fn expand_home(path: &Path) -> PathBuf {
+pub fn expand_home(path: &Path) -> PathBuf {
     if path == Path::new("~") {
         return std::env::var_os("HOME")
             .map(PathBuf::from)
@@ -2068,7 +2090,7 @@ mod tests {
 
         // Attach: screen first, exactly the visible grid, then one empty
         // scrollback chunk with `done` set — never zero chunks.
-        let (events, output) = daemon
+        let outcome = daemon
             .attach_terminal(Attach {
                 terminal: id,
                 scrollback: ScrollbackRequest::All,
@@ -2076,7 +2098,11 @@ mod tests {
                 cols: 40,
             })
             .unwrap();
-        assert!(matches!(events[0], Event::TerminalScreen { .. }));
+        let output = outcome.output;
+        assert!(matches!(outcome.screen, Event::TerminalScreen { .. }));
+        let events: Vec<Event> = std::iter::once(outcome.screen.clone())
+            .chain(outcome.backfill.clone())
+            .collect();
         match &events[0] {
             Event::TerminalScreen { screen, .. } => {
                 assert_eq!((screen.rows, screen.cols), (10, 40));
@@ -2135,7 +2161,7 @@ mod tests {
                 cols: 50,
             })
             .is_empty();
-        let (events, _) = daemon
+        let outcome = daemon
             .attach_terminal(Attach {
                 terminal: id,
                 scrollback: ScrollbackRequest::Lines(5),
@@ -2143,6 +2169,9 @@ mod tests {
                 cols: 50,
             })
             .unwrap();
+        let events = std::iter::once(&outcome.screen)
+            .chain(outcome.backfill.iter())
+            .collect::<Vec<&Event>>();
         match &events[0] {
             Event::TerminalScreen { screen, .. } => {
                 assert_eq!((screen.rows, screen.cols), (12, 50));

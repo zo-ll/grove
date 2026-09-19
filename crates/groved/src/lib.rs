@@ -284,9 +284,10 @@ fn serve_client_with(
     // replaces or drops the old one.
     let mut live: Option<LiveFeed> = None;
     let handle_attach = |stream_feed: &mut Option<LiveFeed>, attach: &grove_proto::Attach| {
-        if let Some(feed) = stream_feed.take() {
-            feed.stop();
-        }
+        // Replacement and detach both end the old feed by dropping it; Drop
+        // sets the stop flag, the forwarder exits within its polling window,
+        // and the abandoned subscriber is cleaned up by the pty reader.
+        let _ = stream_feed.take();
         let response = if let Some(service) = &service {
             match service.lock() {
                 Ok(mut service) => service
@@ -298,13 +299,25 @@ fn serve_client_with(
             Err("request handling is not installed yet".into())
         };
         match response {
-            Ok((events, output)) => {
-                for event in events {
+            Ok(outcome) => {
+                // The order is the eviction fix: the screen goes out, the
+                // live feed starts, and only then does the backfill go out —
+                // so output produced while history loads drains on this
+                // client's channel instead of piling up behind the bounded
+                // subscriber buffer and ending the stream silently.
+                if outbound.send(outcome.screen).is_err() {
+                    return;
+                }
+                *stream_feed = Some(LiveFeed::spawn(
+                    attach.terminal,
+                    outcome.output,
+                    outbound.clone(),
+                ));
+                for event in outcome.backfill {
                     if outbound.send(event).is_err() {
                         return;
                     }
                 }
-                *stream_feed = Some(LiveFeed::spawn(attach.terminal, output, outbound.clone()));
             }
             Err(message) => {
                 let _ = outbound.send(Event::Failed {
@@ -322,9 +335,7 @@ fn serve_client_with(
                 // Dropping the feed ends only this client's stream: the pty
                 // keeps running, and the subscriber is cleaned up by the pty
                 // reader the next time output arrives.
-                if let Some(feed) = live.take() {
-                    feed.stop();
-                }
+                let _ = live.take();
             }
             _ => {
                 let events = if let Some(service) = &service {
@@ -361,6 +372,16 @@ struct LiveFeed {
     stop: Arc<AtomicBool>,
 }
 
+impl Drop for LiveFeed {
+    fn drop(&mut self) {
+        // Every path that loses a feed — detach, re-attach, replacement, or
+        // the connection ending — goes through here, so a client that
+        // disconnects while attached cannot pin the forwarder and the
+        // connection writer for as long as the pty lives.
+        self.stop.store(true, Ordering::Release);
+    }
+}
+
 impl LiveFeed {
     fn spawn(
         terminal: TerminalId,
@@ -390,11 +411,12 @@ impl LiveFeed {
         });
         Self { stop }
     }
-
-    fn stop(self) {
-        self.stop.store(true, Ordering::Release);
-    }
 }
+
+// Every way a feed can be lost — detach, re-attach, replacement, connection
+// teardown — goes through Drop, which sets the stop flag; the forwarder exits
+// within its polling window and the abandoned subscriber is cleaned up by the
+// pty reader the next time output arrives.
 
 fn socket_error(path: &Path, source: io::Error) -> LifecycleError {
     LifecycleError::Socket {
