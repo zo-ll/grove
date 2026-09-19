@@ -25,8 +25,9 @@ resolve it with these.
    dirty state and merge status are computed on demand, never cached to disk. Grove's
    own state file can never contradict git, because it does not store anything git
    knows.
-3. **Only one action destroys anything.** `end session` removes worktrees. Everything
-   else — detach, close, release, quit, reboot — leaves the filesystem alone.
+3. **Two actions destroy anything.** `end session` removes its worktrees, and the
+   prune picker removes worktrees you tick. Everything else — detach, close, release,
+   quit, reboot — leaves the filesystem alone.
 4. **Defaults cannot lose work.** Any pre-selection grove makes (notably prune) must be
    provably safe. Unsafe items stay visible with their reason, selectable only by hand.
 5. **Six screens, one keymap.** New functionality becomes a palette command, not a
@@ -93,7 +94,7 @@ Transitions:
 ●  attached ──detach──> ◐ detached      terminals keep running
 ●  attached ──close───> ○ closed        terminals killed, worktrees kept
 ◐○ ──────────resume───> ● attached      respawns shells if it was closed
-any ─────────end──────> gone            worktrees removed (only destructive act)
+any ─────────end──────> gone            worktrees removed (one of two destructive acts)
 ```
 
 A reboot with no snapshot puts every session in `○ closed`: the daemon died with every
@@ -349,7 +350,9 @@ Pre-checks a row **only** if all of these hold:
 - no attached or detached session owns it.
 
 Everything else is listed with its disqualifying reason visible and unchecked. It can
-still be ticked deliberately.
+still be ticked deliberately — with one exception: a worktree a live session owns is
+refused at prune time (§2.4: another session's worktrees are read-only), because
+ending that session is how its worktrees are released.
 
 ```
 ❯ prune                                              4 selected · 1.0 GB

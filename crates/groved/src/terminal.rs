@@ -439,6 +439,12 @@ impl TerminalManager {
         rows
     }
 
+    /// The terminal of a checkout, if one is held. Callers use it for the
+    /// busy check before a destructive verb on the checkout.
+    pub fn terminal_by_key(&self, key: &TerminalKey) -> Option<TerminalId> {
+        self.keys.get(key).copied()
+    }
+
     /// Returns process exits observed since the previous drain without waiting.
     pub fn drain_exited(&self) -> Vec<TerminalId> {
         self.exits.try_iter().collect()
