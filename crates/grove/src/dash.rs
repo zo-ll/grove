@@ -144,15 +144,24 @@ impl Panes {
         from
     }
 
-    /// The same visibility with one pane hidden, without touching what the
-    /// user asked for.
+    /// The visibility the empty state draws with.
     ///
-    /// Used for the empty state, where §4.1 draws two panes rather than three:
-    /// nothing is selected, so there is no terminal to show, and the guidance
-    /// needs the width more than an empty box does.
-    pub fn hiding(self, pane: Pane) -> Self {
+    /// §4.1 draws two panes there rather than three: nothing is selected, so
+    /// there is no terminal to show, and the guidance needs the width more
+    /// than an empty box does. REPOS stays as the user left it.
+    ///
+    /// WORKTREES is forced on, which is what keeps the at-least-one rule true
+    /// for a derived set. The toggles enforce that invariant as the user
+    /// presses them, and deriving a *different* set behind their back walked
+    /// straight past it: with no repos, hiding REPOS and then WORKTREES is two
+    /// legal toggles — the terminal is still visible, so neither is refused —
+    /// and hiding the terminal here left a screen with nothing on it at all.
+    /// The guidance is also the only thing left to read in this state, so the
+    /// pane that holds it is not one to lose.
+    pub fn for_guidance(self) -> Self {
         let mut panes = self;
-        panes.set(pane, false);
+        panes.set(Focus::Worktrees, true);
+        panes.set(Focus::Terminal, false);
         panes
     }
 
@@ -787,6 +796,52 @@ mod tests {
             list_under_arrows(Screen::Dash, Focus::Terminal, Panes::default(), 40),
             None,
             "a pane too narrow to draw"
+        );
+    }
+
+    #[test]
+    fn the_empty_layout_never_draws_nothing() {
+        // The review's medium. The toggles refuse to hide the last pane, but
+        // a derived set does not go through them: with no repos, `^g 1` then
+        // `^g 2` are both legal — the terminal is still visible — and the
+        // empty state hid the terminal, leaving a blank screen.
+        for hidden in [
+            vec![],
+            vec![Focus::Repos],
+            vec![Focus::Worktrees],
+            vec![Focus::Terminal],
+            vec![Focus::Repos, Focus::Worktrees],
+            vec![Focus::Repos, Focus::Terminal],
+            vec![Focus::Worktrees, Focus::Terminal],
+        ] {
+            let mut panes = Panes::default();
+            for pane in &hidden {
+                let _ = panes.toggle(*pane);
+            }
+            let drawn = panes.for_guidance();
+            assert!(
+                drawn.count() >= 1,
+                "hiding {hidden:?} left the empty dash with no panes"
+            );
+            assert!(
+                drawn.visible(Focus::Worktrees),
+                "the guidance has nowhere to go with {hidden:?} hidden"
+            );
+        }
+    }
+
+    #[test]
+    fn the_empty_layout_leaves_the_users_own_toggles_alone() {
+        // It decides what is drawn in this state, not what the user asked
+        // for: REPOS stays hidden if they hid it, and everything comes back
+        // when the dash fills.
+        let mut panes = Panes::default();
+        assert!(panes.toggle(Focus::Repos));
+        let drawn = panes.for_guidance();
+        assert!(!drawn.visible(Focus::Repos));
+        assert!(
+            !panes.visible(Focus::Repos) && panes.visible(Focus::Terminal),
+            "the user's own set is untouched"
         );
     }
 
