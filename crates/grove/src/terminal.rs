@@ -66,7 +66,7 @@ impl Guard {
         if !std::io::IsTerminal::is_terminal(&io::stdout()) {
             return Err(io::Error::other(
                 "grove needs a terminal: stdout is not a tty. \
-                 The daemon runs headless — `groved <workspace>` — but the TUI \
+                 Run `groved <workspace>` for the headless half; the TUI \
                  has to be attached to one.",
             ));
         }
