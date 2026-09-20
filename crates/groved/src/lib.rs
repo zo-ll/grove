@@ -28,6 +28,19 @@ pub mod terminal;
 
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Whether a read failed because nothing was said, rather than because the
+/// connection is gone.
+///
+/// Both kinds appear: a socket with a read timeout reports `WouldBlock` on
+/// some platforms and `TimedOut` on others, and which one arrives is not a
+/// property worth depending on.
+fn idle(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    )
+}
+
 #[derive(Debug, Error)]
 pub enum LifecycleError {
     #[error("XDG_RUNTIME_DIR is not set")]
@@ -275,11 +288,23 @@ fn serve_client(stream: UnixStream) -> Result<(), grove_proto::FrameError> {
 }
 
 fn serve_client_with(
-    mut stream: UnixStream,
+    stream: UnixStream,
     service: Option<Arc<Mutex<session::SessionOrchestrator>>>,
 ) -> Result<(), grove_proto::FrameError> {
-    stream.set_read_timeout(Some(IO_TIMEOUT))?;
-    stream.set_write_timeout(Some(IO_TIMEOUT))?;
+    serve_client_for(stream, service, IO_TIMEOUT)
+}
+
+/// A client's connection, with the read timeout the caller wants.
+///
+/// The timeout is a parameter only so the tests can be quick about proving
+/// what it does — and, more to the point, what it does not do.
+fn serve_client_for(
+    mut stream: UnixStream,
+    service: Option<Arc<Mutex<session::SessionOrchestrator>>>,
+    timeout: Duration,
+) -> Result<(), grove_proto::FrameError> {
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
     let hello: Request = read_frame(&mut stream)?;
     // The capability is a workspace fact, decided by the service the socket
     // serves: when a session-scoped path template makes worktree location
@@ -379,7 +404,22 @@ fn serve_client_with(
         }
     };
 
-    while let Ok(request) = read_frame::<_, Request>(&mut stream) {
+    loop {
+        let request = match read_frame::<_, Request>(&mut stream) {
+            Ok(request) => request,
+            // A client with nothing to say is the normal case, not a dead
+            // one. grove is a dashboard: it connects, asks for the workspace,
+            // and then sits there for as long as the user is doing something
+            // else. This loop used to be `while let Ok(..)`, so the read
+            // timeout dropped every idle client after five seconds — the TUI
+            // would draw the dash, and then go grey while nobody touched it.
+            //
+            // The timeout is here so a peer that vanished without closing
+            // cannot pin this thread forever. That is a different question
+            // from how long a user may look at the screen.
+            Err(grove_proto::FrameError::Io(error)) if idle(&error) => continue,
+            Err(_) => break,
+        };
         match &request {
             Request::AttachTerminal(attach) => handle_attach(&mut live, attach),
             Request::DetachTerminal(_) => {
@@ -570,6 +610,43 @@ mod tests {
                 & 0o777,
             0o700
         );
+    }
+
+    #[test]
+    fn a_client_that_says_nothing_is_still_connected() {
+        // grove is a dashboard. It connects, asks what is in the workspace,
+        // and then sits there while the user does something else — which is
+        // most of the time it is open. The read timeout used to end the
+        // connection on the first silence, so the TUI drew the dash once and
+        // went grey five seconds later without anyone touching it.
+        let (client, server) = UnixStream::pair().unwrap();
+        let quick = Duration::from_millis(100);
+        let worker = thread::spawn(move || serve_client_for(server, None, quick));
+        let mut client = client;
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        write_frame(
+            &mut client,
+            &Request::Hello {
+                version: PROTOCOL_VERSION,
+            },
+        )
+        .unwrap();
+        let _: Event = read_frame(&mut client).unwrap();
+
+        // Several times the timeout, saying nothing at all.
+        thread::sleep(quick * 4);
+
+        // And it is still there to be asked.
+        write_frame(&mut client, &Request::ListRepos).unwrap();
+        let answer: Result<Event, _> = read_frame(&mut client);
+        assert!(
+            answer.is_ok(),
+            "an idle client must not be hung up on: {answer:?}"
+        );
+        drop(client);
+        let _ = worker.join();
     }
 
     #[test]
