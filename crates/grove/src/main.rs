@@ -16,6 +16,7 @@ mod repos;
 mod statusbar;
 mod terminal;
 mod theme;
+mod worktrees;
 
 use std::io::Stdout;
 use std::os::unix::net::UnixStream;
@@ -38,6 +39,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Padding, Paragraph, Wrap};
 use repos::Repos;
 use theme::{Depth, Role, Theme};
+use worktrees::{Intent, Worktrees};
 
 /// What the shell is currently able to show. Screens replace this in #18-#30;
 /// until then it is enough to prove the loop, the redraw policy and the
@@ -50,9 +52,18 @@ struct Ui {
     /// Which dash panes are on screen. Focus is kept consistent with this:
     /// see `Panes::refocus`.
     panes: Panes,
-    /// The session's member repos and the cursor in them, which is what the
-    /// WORKTREES pane will follow in #20.
+    /// The session's member repos and the cursor in them. The WORKTREES pane
+    /// follows this selection.
     repos: Repos,
+    /// Every worktree of the selected repo, whoever owns it.
+    worktrees: Worktrees,
+    /// Something to say about the last thing the user pressed — a refusal, or
+    /// a failure to reach the daemon. Cleared by the next successful action.
+    note: Option<String>,
+    /// The open session, learned from the daemon's `Sessions` event. Adopt and
+    /// release name it, because ownership is a session's and the daemon will
+    /// not infer which one asked.
+    session: Option<grove_domain::SessionId>,
     /// The terminal's current width, because whether a pane is on screen
     /// depends on it: below a certain width the dash drops panes it cannot
     /// draw, and focus must not cycle onto one of those.
@@ -88,6 +99,9 @@ impl Ui {
             router: Router::new(),
             panes: Panes::default(),
             repos: Repos::default(),
+            worktrees: Worktrees::default(),
+            session: None,
+            note: None,
             width: 80,
             theme,
             config_note: (!notes.is_empty()).then(|| notes.join("; ")),
@@ -122,7 +136,13 @@ fn config_path_from(xdg: Option<PathBuf>, home: Option<PathBuf>) -> Option<PathB
 
 enum State {
     /// Connected, waiting for the first data.
-    Connected { workspace: PathBuf, note: String },
+    Connected {
+        workspace: PathBuf,
+        note: String,
+        /// The write half of the daemon connection. `None` only in tests that
+        /// exercise the loop without a socket.
+        daemon: Option<UnixStream>,
+    },
     /// Could not reach a daemon, or lost it. The TUI stays up to say so: the
     /// user's terminals are still running inside a daemon it can no longer see,
     /// and exiting silently would suggest otherwise.
@@ -199,6 +219,61 @@ fn run(workspace: PathBuf) -> std::io::Result<()> {
     }
 }
 
+/// Carry out what the WORKTREES pane decided `^g a` or `^g r` means.
+///
+/// A refusal is as much an outcome as a request: it goes on the status bar,
+/// because a key that does nothing at all reads as grove being broken rather
+/// than as grove protecting something.
+fn act_on_worktree(intent: Option<Intent>, state: &mut State, ui: &mut Ui) -> bool {
+    let Some(intent) = intent else {
+        // Nothing under the cursor — an empty pane, not a refusal.
+        return false;
+    };
+    let request = match intent {
+        Intent::Refused(why) => {
+            ui.note = Some(why);
+            return true;
+        }
+        Intent::Adopt(worktree) => ui
+            .session
+            .clone()
+            .map(|session| Request::AdoptWorktree { session, worktree }),
+        Intent::Release(worktree) => ui
+            .session
+            .clone()
+            .map(|session| Request::ReleaseWorktree { session, worktree }),
+    };
+    let Some(request) = request else {
+        // Ownership belongs to a session, so with none open there is nothing
+        // to adopt *into*. Said rather than silently dropped.
+        ui.note = Some("no open session to adopt into".into());
+        return true;
+    };
+    match send(state, &request) {
+        Ok(()) => {
+            // The pane does not change here: ownership is the daemon's to
+            // write, and the row updates when it says so.
+            ui.note = None;
+            false
+        }
+        Err(e) => {
+            ui.note = Some(format!("could not reach the daemon: {e}"));
+            true
+        }
+    }
+}
+
+/// Send a request on the daemon connection.
+fn send(state: &mut State, request: &Request) -> Result<(), String> {
+    match state {
+        State::Connected {
+            daemon: Some(socket),
+            ..
+        } => grove_proto::write_frame(socket, request).map_err(|e| e.to_string()),
+        _ => Err("not connected to a daemon".into()),
+    }
+}
+
 /// Report anything the user should know, once the terminal is usable again.
 fn finish(state: &State) -> std::io::Result<()> {
     match state {
@@ -251,6 +326,37 @@ fn handle(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
                         redraw: ui.repos.move_up(),
                     }
                 }
+                Routed::Act(Action::MoveDown)
+                    if dash::list_under_arrows(ui.screen, ui.focus, ui.panes, ui.width)
+                        == Some(Focus::Worktrees) =>
+                {
+                    Flow::Continue {
+                        redraw: ui.worktrees.move_down(),
+                    }
+                }
+                Routed::Act(Action::MoveUp)
+                    if dash::list_under_arrows(ui.screen, ui.focus, ui.panes, ui.width)
+                        == Some(Focus::Worktrees) =>
+                {
+                    Flow::Continue {
+                        redraw: ui.worktrees.move_up(),
+                    }
+                }
+                // Adopt and release act on the row under the WORKTREES cursor,
+                // and say why when they cannot — a key that silently does
+                // nothing reads as grove being broken.
+                Routed::Act(Action::Adopt) if ui.screen == Screen::Dash => {
+                    let intent = ui.worktrees.adopt();
+                    Flow::Continue {
+                        redraw: act_on_worktree(intent, state, ui),
+                    }
+                }
+                Routed::Act(Action::Release) if ui.screen == Screen::Dash => {
+                    let intent = ui.worktrees.release();
+                    Flow::Continue {
+                        redraw: act_on_worktree(intent, state, ui),
+                    }
+                }
                 Routed::Act(Action::TogglePane(index)) => {
                     let Some(pane) = Panes::addressed(index) else {
                         return Flow::Continue { redraw: false };
@@ -296,8 +402,25 @@ fn handle(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
         // The REPOS pane's data. Kept ahead of the catch-all below because
         // that one only narrates the event on the status line, which for a
         // list of repos would say a lot and show nothing.
+        // Which session is open decides what adopt and release name. The
+        // daemon is the authority on it; the TUI only remembers the answer.
+        Input::Daemon(DaemonEvent::Sessions(rows)) => {
+            ui.session = rows
+                .iter()
+                .find(|row| row.state == grove_domain::SessionState::Attached)
+                .map(|row| row.id.clone());
+            Flow::Continue { redraw: true }
+        }
+
         Input::Daemon(DaemonEvent::Repos(rows)) => {
             ui.repos.set(rows);
+            Flow::Continue { redraw: true }
+        }
+
+        // Rows for whichever repo the daemon was asked about. The pane takes
+        // them whole: which repo they belong to is the REPOS cursor's business.
+        Input::Daemon(DaemonEvent::Worktrees { rows, .. }) => {
+            ui.worktrees.set(rows);
             Flow::Continue { redraw: true }
         }
 
@@ -389,6 +512,10 @@ fn connect(workspace: &Path, inputs: &Inputs) -> State {
                 State::Connected {
                     workspace: workspace.to_path_buf(),
                     note: "connected".into(),
+                    // Kept so the TUI can ask for things rather than only
+                    // listen. Everything grove does to a repo is a request on
+                    // this half.
+                    daemon: Some(write_half),
                 }
             }
             Handshake::Mismatch { daemon, client } => State::Disconnected {
@@ -428,25 +555,30 @@ fn draw(f: &mut ratatui::Frame, state: &State, ui: &Ui) {
             ui.repos
                 .render(f.buffer_mut(), area, &ui.theme, ui.focus == Focus::Repos);
         }
-        // #20 and #21 fill these; until then each says so in its own pane
-        // rather than the dash claiming to be finished.
-        for (pane, area) in [
-            (Focus::Worktrees, inner.worktrees),
-            (Focus::Terminal, inner.terminal),
-        ] {
-            if let Some(area) = area {
-                f.render_widget(
-                    Paragraph::new(dash::placeholder_line(pane, &ui.theme)),
-                    area,
-                );
-            }
+        if let Some(area) = inner.worktrees {
+            ui.worktrees.render(
+                f.buffer_mut(),
+                area,
+                &ui.theme,
+                ui.focus == Focus::Worktrees,
+            );
+        }
+        // #21 fills this one; until then it says so rather than the dash
+        // claiming to be finished.
+        if let Some(area) = inner.terminal {
+            f.render_widget(
+                Paragraph::new(dash::placeholder_line(Focus::Terminal, &ui.theme)),
+                area,
+            );
         }
         status_bar(f, bar_area, ui);
         return;
     }
 
     let (title, body) = match state {
-        State::Connected { workspace, note } => (
+        State::Connected {
+            workspace, note, ..
+        } => (
             "grove",
             vec![
                 Line::from(vec![
@@ -514,6 +646,9 @@ fn status_bar(f: &mut ratatui::Frame, area: Rect, ui: &Ui) {
     } else {
         String::new()
     };
+    // A refusal outranks the config note: it is about the key just pressed,
+    // and the config note has been true since startup.
+    let note = ui.note.as_deref().or(ui.config_note.as_deref());
     f.render_widget(
         Paragraph::new(statusbar::render(
             ui.screen,
@@ -522,7 +657,7 @@ fn status_bar(f: &mut ratatui::Frame, area: Rect, ui: &Ui) {
             "no session",
             area.width,
             &ui.theme,
-            ui.config_note.as_deref(),
+            note,
         )),
         area,
     );
@@ -540,6 +675,7 @@ mod tests {
         State::Connected {
             workspace: PathBuf::from("/w"),
             note: "connected".into(),
+            daemon: None,
         }
     }
 
@@ -797,6 +933,137 @@ mod tests {
             }
             Flow::Quit => panic!("an arrow must not quit"),
         }
+    }
+
+    fn worktree_row(branch: &str, ownership: grove_domain::Ownership) -> grove_proto::WorktreeRow {
+        grove_proto::WorktreeRow {
+            worktree: grove_proto::WorktreeRef {
+                repo: grove_domain::RepoId("repo".into()),
+                branch: branch.into(),
+            },
+            detached: false,
+            ownership,
+            ahead: 0,
+            behind: 0,
+            dirty_files: 0,
+            age: 0,
+            size: 0,
+            terminal: None,
+            foreground: None,
+            stale: false,
+        }
+    }
+
+    #[test]
+    fn a_refused_adopt_says_why_on_the_status_bar() {
+        // A key that silently does nothing reads as grove being broken. The
+        // clone can never be adopted, and the user has to learn that from the
+        // key rather than from the spec.
+        let mut s = connected();
+        let mut ui = Ui::new();
+        handle(
+            Input::Daemon(DaemonEvent::Worktrees {
+                repo: grove_domain::RepoId("repo".into()),
+                rows: vec![worktree_row("main", grove_domain::Ownership::Clone)],
+            }),
+            &mut s,
+            &mut ui,
+        );
+        ui.focus = Focus::Worktrees;
+
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('a')), &mut s, &mut ui);
+        let note = ui.note.expect("a refusal must be reported");
+        assert!(note.contains("clone"), "{note}");
+    }
+
+    #[test]
+    fn adopting_without_an_open_session_says_so_rather_than_silently_failing() {
+        // Ownership belongs to a session, so with none open there is nothing
+        // to adopt *into*.
+        let mut s = connected();
+        let mut ui = Ui::new();
+        handle(
+            Input::Daemon(DaemonEvent::Worktrees {
+                repo: grove_domain::RepoId("repo".into()),
+                rows: vec![worktree_row("free", grove_domain::Ownership::Unowned)],
+            }),
+            &mut s,
+            &mut ui,
+        );
+        ui.focus = Focus::Worktrees;
+        assert!(ui.session.is_none());
+
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('a')), &mut s, &mut ui);
+        let note = ui.note.expect("must say why nothing happened");
+        assert!(note.contains("session"), "{note}");
+    }
+
+    #[test]
+    fn the_open_session_comes_from_the_daemon() {
+        let mut s = connected();
+        let mut ui = Ui::new();
+        handle(
+            Input::Daemon(DaemonEvent::Sessions(vec![
+                grove_proto::SessionRow {
+                    id: grove_domain::SessionId("closed-one".into()),
+                    name: "old".into(),
+                    members: vec![],
+                    state: grove_domain::SessionState::Closed,
+                    terminals: 0,
+                    since: 0,
+                    size: 0,
+                },
+                grove_proto::SessionRow {
+                    id: grove_domain::SessionId("open-one".into()),
+                    name: "current".into(),
+                    members: vec![],
+                    state: grove_domain::SessionState::Attached,
+                    terminals: 2,
+                    since: 0,
+                    size: 0,
+                },
+            ])),
+            &mut s,
+            &mut ui,
+        );
+        assert_eq!(
+            ui.session.as_ref().map(|s| s.0.as_str()),
+            Some("open-one"),
+            "the attached session is the open one"
+        );
+    }
+
+    #[test]
+    fn arrows_drive_the_worktrees_list_when_it_has_focus() {
+        let mut s = connected();
+        let mut ui = Ui::new();
+        handle(
+            Input::Daemon(DaemonEvent::Worktrees {
+                repo: grove_domain::RepoId("repo".into()),
+                rows: vec![
+                    worktree_row("a", grove_domain::Ownership::Ours),
+                    worktree_row("b", grove_domain::Ownership::Ours),
+                ],
+            }),
+            &mut s,
+            &mut ui,
+        );
+        ui.focus = Focus::Worktrees;
+        handle(key(KeyCode::Down), &mut s, &mut ui);
+        assert_eq!(
+            ui.worktrees.selected().map(|r| r.worktree.branch.as_str()),
+            Some("b")
+        );
+
+        ui.focus = Focus::Repos;
+        handle(key(KeyCode::Up), &mut s, &mut ui);
+        assert_eq!(
+            ui.worktrees.selected().map(|r| r.worktree.branch.as_str()),
+            Some("b"),
+            "an arrow in another pane must not move this list"
+        );
     }
 
     #[test]
