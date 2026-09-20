@@ -3163,6 +3163,26 @@ mod tests {
     }
 
     #[test]
+    fn a_session_name_can_contain_a_space() {
+        // The mock's own session is called "invoice split". Typing it gave
+        // `invoicesplit`: space is bound to toggle on the palette screen, and
+        // `session new` was handed an empty picker to toggle, so the key did
+        // nothing at all and the character was lost.
+        let mut s = connected();
+        let mut ui = Ui::new();
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('/')), &mut s, &mut ui);
+        for c in "session new".chars() {
+            handle(key(KeyCode::Char(c)), &mut s, &mut ui);
+        }
+        handle(key(KeyCode::Enter), &mut s, &mut ui);
+        for c in "invoice split".chars() {
+            handle(key(KeyCode::Char(c)), &mut s, &mut ui);
+        }
+        assert_eq!(ui.palette.argument(), Some("invoice split"));
+    }
+
+    #[test]
     fn a_first_run_is_told_to_start_a_session_before_adding_repos() {
         // Found by running it: the dash said "add repos to this session" with
         // no session open, and `^g /  add` answered "no open session to add
