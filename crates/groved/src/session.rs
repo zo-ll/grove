@@ -338,13 +338,11 @@ impl SessionOrchestrator {
                         ),
                     });
                 }
+                // One worktree listing per repo for this request, not one
+                // git subprocess per terminal per repo under the lock.
+                let index = self.worktree_index();
                 for restored in &report.restored {
-                    // The snapshot records paths; the live set and the spawn
-                    // hook speak (repo, branch), resolved back through git.
-                    // A checkout git cannot name is still restored — it is
-                    // simply not tracked by the session until it is one of
-                    // the workspace's repos again.
-                    if let Some(owned) = self.resolvable_worktree(&restored.worktree) {
+                    if let Some(owned) = index.get(&restored.worktree) {
                         self.live
                             .entry(session.clone())
                             .or_default()
@@ -355,10 +353,19 @@ impl SessionOrchestrator {
                         self.fire_terminal(
                             LifecycleEvent::TerminalSpawned,
                             &session,
-                            &owned,
+                            owned,
                             restored.terminal,
                         );
                     }
+                }
+                // §2.3's table: a session with live terminals is detached,
+                // not closed. The reboot case lands exactly here — the
+                // daemon restart made every session closed, and restoring
+                // brings its terminals back to life.
+                if !report.restored.is_empty()
+                    && self.store.session(&session)?.state == SessionState::Closed
+                {
+                    self.store.detach(&session)?;
                 }
                 events.push(Event::Sessions(self.session_rows()?));
                 Ok(events)
@@ -1166,24 +1173,26 @@ impl SessionOrchestrator {
         Ok(Event::SessionChanged(self.session_row(session)?))
     }
 
-    /// Whether the checkout belongs to a workspace repository, answered as
-    /// the (repo, branch) pair the live set and hooks speak.
-    fn resolvable_worktree(&self, path: &Path) -> Option<OwnedWorktree> {
+    /// One worktree listing per repo, as the path-to-identity index the
+    /// snapshot restore and terminal listing speak. Per repo, not per
+    /// terminal: O(T x R) git subprocesses would run inline under the lock.
+    fn worktree_index(&self) -> HashMap<PathBuf, OwnedWorktree> {
+        let mut index = HashMap::new();
         for repository in self.repositories.values() {
             let Ok(checkouts) = grove_git::worktrees(&repository.path) else {
                 continue;
             };
-            if let Some(checkout) = checkouts
-                .into_iter()
-                .find(|checkout| checkout.path == *path)
-            {
-                return Some(OwnedWorktree {
-                    repo: repository.id.clone(),
-                    branch: checkout.branch.unwrap_or_default(),
-                });
+            for checkout in checkouts {
+                index.insert(
+                    checkout.path,
+                    OwnedWorktree {
+                        repo: repository.id.clone(),
+                        branch: checkout.branch.unwrap_or_default(),
+                    },
+                );
             }
         }
-        None
+        index
     }
 
     /// Every session as the picker renders it — the same answer the list
@@ -3690,9 +3699,19 @@ mod snapshot_tests {
         assert!(saved_at.exists(), "only an explicit SaveSnapshot writes");
         assert!(matches!(events.first(), Some(Event::Sessions(_))));
 
-        // Drop the snapshot from disk: restore without a snapshot is a
-        // plan with no terminals, reported as nothing.
-        let _ = daemon.handle_request(Request::RestoreSnapshot(session.clone()));
+        // A session with no snapshot at all: the typed report, not a panic,
+        // and not a ghost of a restore.
+        fs::remove_file(&saved_at).unwrap();
+        let events = daemon.handle_request(Request::RestoreSnapshot(session.clone()));
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                Event::Failed { message, .. } if message.contains("no snapshot exists")
+            )),
+            "a missing snapshot must be reported: {events:?}"
+        );
+
+        // Re-create the session and its worktrees so the save has content.
 
         // End the session: its worktrees go, its live terminals die — then
         // re-create the session and save again, break one worktree, restore.
@@ -3807,5 +3826,140 @@ mod snapshot_tests {
             )),
             "the second restore reports the covered rows: {events:?}"
         );
+    }
+
+    #[test]
+    fn restoring_into_the_reboot_case_spawns_joins_and_detaches() {
+        // §6's reboot case: the daemon restarted, so every session is closed,
+        // no pty survived, and the grouping survived. A restore must bring
+        // the recorded terminals back as live ones — spawned, joined to the
+        // session, and the state moved off Closed — without anyone having
+        // opened first.
+        let temp = temp_dir("reboot");
+        let clone = temp.join("repo");
+        fs::create_dir_all(&clone).unwrap();
+        git(&clone, &["init", "-q", "-b", "main"]);
+        git(&clone, &["config", "user.name", "Grove Test"]);
+        git(&clone, &["config", "user.email", "grove@example.test"]);
+        fs::write(clone.join("tracked"), "base\n").unwrap();
+        git(&clone, &["add", "tracked"]);
+        git(&clone, &["commit", "-qm", "base"]);
+        let kept_path = temp.join("kept");
+        git(
+            &clone,
+            &[
+                "worktree",
+                "add",
+                "-qb",
+                "kept",
+                kept_path.to_str().unwrap(),
+            ],
+        );
+
+        let template = "trees/{repo}/{branch_slug}";
+        let mut store = Store::load_at(&temp.join("state"), &temp, template);
+        let session = SessionId("reboot".into());
+        store.create(session.clone(), "reboot".to_string()).unwrap();
+        store.add_member(&session, RepoId("repo".into())).unwrap();
+        store
+            .adopt(&session, owned("kept"), &kept_path, &clone)
+            .unwrap();
+        let spawn_log = temp.join("spawns.log");
+        let mut daemon = SessionOrchestrator::new(
+            store,
+            vec![Repository {
+                id: RepoId("repo".into()),
+                name: "repo".into(),
+                path: clone.clone(),
+                base_branch: None,
+            }],
+            temp.clone(),
+            TerminalManager::new(PathBuf::from("/bin/sh"), temp.clone(), 100),
+            FetchPolicy::new(2, Duration::from_secs(60)),
+            DaemonRuntime::load_source(
+                &format!(
+                    "local grove = require('grove')\n\
+                     grove.on('terminal_spawned', function(t)\n\
+                       local file = assert(io.open({log:?}, 'a'))\n\
+                       file:write(t.repo .. ':' .. t.branch .. '\\n')\n\
+                       file:close()\n\
+                     end)",
+                    log = spawn_log.to_string_lossy()
+                ),
+                "reboot-config",
+            )
+            .runtime,
+        );
+        let opened = daemon.open(&session).unwrap();
+        assert_eq!(opened.terminals.len(), 1);
+        // The save's answer is the picker rows; the empty check belongs to
+        // the spawn flow, where nothing else can be riding along.
+        assert!(matches!(
+            daemon
+                .handle_request(Request::SaveSnapshot(session.clone()))
+                .first(),
+            Some(Event::Sessions(_))
+        ));
+
+        // The reboot: a fresh orchestrator over the persisted state. The
+        // store's loader closed every session and dropped every pty.
+        let mut rebooted = SessionOrchestrator::new(
+            Store::load_at(&temp.join("state"), &temp, template),
+            vec![Repository {
+                id: RepoId("repo".into()),
+                name: "repo".into(),
+                path: clone.clone(),
+                base_branch: None,
+            }],
+            temp.clone(),
+            TerminalManager::new(PathBuf::from("/bin/sh"), temp.clone(), 100),
+            FetchPolicy::new(2, Duration::from_secs(60)),
+            DaemonRuntime::load_source(
+                "local grove = require('grove'); grove.setup({})",
+                "reboot-config-2",
+            )
+            .runtime,
+        );
+        // Nothing is live: the reboot's session is closed, as §6 promises.
+        let events = rebooted.handle_request(Request::ListSessions);
+        let Some(Event::Sessions(rows)) = events.first() else {
+            panic!("expected Sessions")
+        };
+        let row = rows.iter().find(|row| row.id == session).unwrap();
+        assert_eq!(row.state, SessionState::Closed);
+        assert_eq!(row.terminals, 0);
+
+        let events = rebooted.handle_request(Request::RestoreSnapshot(session.clone()));
+        let Some(Event::Sessions(rows)) = events
+            .iter()
+            .find(|event| matches!(event, Event::Sessions(_)))
+        else {
+            panic!("expected Sessions")
+        };
+        let row = rows.iter().find(|row| row.id == session).unwrap();
+        // Restored, not opened: the terminal count comes from the restore.
+        assert_eq!(
+            row.terminals, 1,
+            "the restore spawned the recorded terminal"
+        );
+        assert_eq!(
+            row.state,
+            SessionState::Detached,
+            "live terminals contradict Closed (§2.3)"
+        );
+        // The spawn hook saw it, with the (repo, branch) identity.
+        assert_eq!(fs::read_to_string(&spawn_log).unwrap(), "repo:kept\n");
+        // The join is real: closing the session kills what the restore made.
+        let closed = rebooted.close(&session).unwrap();
+        assert_eq!(
+            closed.killed.len(),
+            1,
+            "close kills what the restore joined"
+        );
+        // A killed terminal is gone, not merely dead.
+        assert!(matches!(
+            rebooted.terminals().is_alive(closed.killed[0]),
+            Err(TerminalError::Missing(_))
+        ));
     }
 }
