@@ -558,12 +558,17 @@ mod tests {
         // toggles: a zero-width pane is the arrows-drive-an-invisible-list bug
         // arrived at from the layout rather than from the toggle.
         for width in 0..=120u16 {
+            // Every subset, not a sample: the two I first left out were the
+            // ones where the surviving pane is not the leftmost.
             for hidden in [
                 vec![],
                 vec![Focus::Repos],
                 vec![Focus::Worktrees],
                 vec![Focus::Terminal],
+                vec![Focus::Repos, Focus::Worktrees],
                 vec![Focus::Repos, Focus::Terminal],
+                vec![Focus::Worktrees, Focus::Terminal],
+                vec![Focus::Repos, Focus::Worktrees, Focus::Terminal],
             ] {
                 let mut panes = Panes::default();
                 for pane in hidden {
