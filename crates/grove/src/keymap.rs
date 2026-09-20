@@ -153,6 +153,38 @@ const fn b(prefixed: bool, key: KeyCode, action: Action, label: &'static str) ->
     }
 }
 
+/// How the keymap spells the key that performs `action`, as the status bar
+/// and the empty state both show it.
+///
+/// Derived rather than written out, so guidance cannot name a key that has
+/// moved: a user who presses what the screen told them and gets nothing now
+/// distrusts everything else on it.
+pub fn key_label(action: Action) -> String {
+    let binding = GLOBAL
+        .iter()
+        .chain(DASH)
+        .find(|binding| binding.action == action);
+    match binding {
+        Some(binding) => {
+            let key = match binding.key {
+                KeyCode::Char(c) => c.to_string(),
+                KeyCode::Enter => "enter".into(),
+                KeyCode::Tab => "tab".into(),
+                other => format!("{other:?}").to_lowercase(),
+            };
+            if binding.prefixed {
+                format!("^g {key}")
+            } else {
+                key
+            }
+        }
+        // Unreachable for anything in the tables above, and a caller asking
+        // about an unbound action deserves to see that rather than a plausible
+        // guess.
+        None => "(unbound)".into(),
+    }
+}
+
 /// Bindings available on every screen, per SPEC §3.2. All prefixed: they must
 /// work while a pty has focus, which is the whole point of the prefix.
 const GLOBAL: &[Binding] = &[

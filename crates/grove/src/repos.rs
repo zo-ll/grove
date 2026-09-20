@@ -20,6 +20,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 use unicode_width::UnicodeWidthStr;
 
+use crate::empty::Empty;
 use crate::text::truncate;
 use crate::theme::{Role, Theme};
 
@@ -35,6 +36,11 @@ const COUNT_NONE: &str = "·";
 pub struct Repos {
     rows: Vec<RepoRow>,
     cursor: usize,
+    /// Every repository the daemon found, members or not. The pane lists only
+    /// members, but the difference between "no repositories anywhere" and
+    /// "none of them in this session" is two different pieces of advice — see
+    /// `empty`.
+    workspace: usize,
 }
 
 impl Repos {
@@ -48,6 +54,7 @@ impl Repos {
         let previous = self.selected().map(|row| row.repo.clone());
         // Only members: §4.1 is explicit that this pane is the session's, not
         // the workspace's, and the workspace list belongs to the palette.
+        self.workspace = rows.len();
         self.rows = rows.into_iter().filter(|row| row.member).collect();
         self.cursor = previous
             .and_then(|repo| self.rows.iter().position(|row| row.repo == repo))
@@ -64,6 +71,16 @@ impl Repos {
     #[cfg(test)]
     pub fn rows(&self) -> &[RepoRow] {
         &self.rows
+    }
+
+    /// How many repositories exist under the workspace, whoever holds them.
+    pub fn workspace_count(&self) -> usize {
+        self.workspace
+    }
+
+    /// How many this session holds.
+    pub fn member_count(&self) -> usize {
+        self.rows.len()
     }
 
     /// The selected repo, which is what the WORKTREES pane follows.
@@ -101,7 +118,17 @@ impl Repos {
     /// whole-dash affair with numbered guidance, and half of it rendered in one
     /// pane would be worse than the space it fills. That is #22.
     pub fn render(&self, buf: &mut Buffer, area: Rect, theme: &Theme, focused: bool) {
-        if area.width == 0 || area.height == 0 || self.rows.is_empty() {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        if self.rows.is_empty() {
+            // The guidance itself lives in the WORKTREES pane (§4.1); this
+            // pane says only why it is empty, so the two do not repeat each
+            // other in the narrowest column on screen.
+            if let Some(empty) = Empty::of(self.workspace, 0) {
+                Paragraph::new(Line::styled(empty.repos_note(), theme.style(Role::Muted)))
+                    .render(area, buf);
+            }
             return;
         }
         let lines: Vec<Line> = self
@@ -338,13 +365,19 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_member_list_draws_nothing_and_defers_to_the_dash() {
-        // Acceptance: the empty state is a whole-dash affair with numbered
-        // guidance (#22). Half of it inside one pane would be worse than the
-        // space it fills.
-        let repos = Repos::default();
+    fn an_empty_member_list_says_why_rather_than_drawing_nothing() {
+        // The numbered guidance is the WORKTREES pane's (#22); this pane says
+        // only which of the two empty states it is in, so the narrowest column
+        // on screen does not repeat what is beside it.
+        let mut repos = Repos::default();
         assert!(repos.selected().is_none());
-        assert!(painted(&repos, 20, true).is_empty());
+        assert_eq!(painted(&repos, 24, true), vec!["no repos found"]);
+
+        // Repos exist; none of them are in this session.
+        let mut outsider = row("elsewhere", 2, false);
+        outsider.member = false;
+        repos.set(vec![outsider]);
+        assert_eq!(painted(&repos, 24, true), vec!["none in session"]);
     }
 
     #[test]

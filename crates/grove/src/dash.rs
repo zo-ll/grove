@@ -144,6 +144,18 @@ impl Panes {
         from
     }
 
+    /// The same visibility with one pane hidden, without touching what the
+    /// user asked for.
+    ///
+    /// Used for the empty state, where §4.1 draws two panes rather than three:
+    /// nothing is selected, so there is no terminal to show, and the guidance
+    /// needs the width more than an empty box does.
+    pub fn hiding(self, pane: Pane) -> Self {
+        let mut panes = self;
+        panes.set(pane, false);
+        panes
+    }
+
     /// The panes that actually fit, which is not always the panes the user
     /// asked for.
     ///
