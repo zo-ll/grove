@@ -714,6 +714,7 @@ mod tests {
     /// The cost is a hand-kept list, so `the_guard_covers_every_source` holds
     /// it to the tree.
     const SCANNED: &[(&str, &str)] = &[
+        ("dash.rs", include_str!("dash.rs")),
         ("events.rs", include_str!("events.rs")),
         ("keymap.rs", include_str!("keymap.rs")),
         ("main.rs", include_str!("main.rs")),

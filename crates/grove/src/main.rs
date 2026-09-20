@@ -9,6 +9,7 @@
 //! See `SPEC.md` §3 and §4. This is issue #14: the shell every screen mounts
 //! into. Screens themselves are #18 through #30.
 
+mod dash;
 mod events;
 mod keymap;
 mod statusbar;
@@ -20,6 +21,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use dash::Panes;
 use events::{Input, Inputs};
 use grove_lua::{TuiConfig, TuiRuntime};
 use grove_proto::{
@@ -29,7 +31,7 @@ use keymap::{Action, Focus, Routed, Router, Screen};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::Event as TermEvent;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Padding, Paragraph, Wrap};
@@ -43,6 +45,13 @@ struct Ui {
     screen: Screen,
     focus: Focus,
     router: Router,
+    /// Which dash panes are on screen. Focus is kept consistent with this:
+    /// see `Panes::refocus`.
+    panes: Panes,
+    /// The terminal's current width, because whether a pane is on screen
+    /// depends on it: below a certain width the dash drops panes it cannot
+    /// draw, and focus must not cycle onto one of those.
+    width: u16,
     theme: Theme,
     /// What the config could not give us, shown once rather than swallowed.
     /// SPEC §9: a broken config reports and keeps running.
@@ -72,6 +81,8 @@ impl Ui {
             screen: Screen::Dash,
             focus: Focus::Worktrees,
             router: Router::new(),
+            panes: Panes::default(),
+            width: 80,
             theme,
             config_note: (!notes.is_empty()).then(|| notes.join("; ")),
         }
@@ -144,6 +155,12 @@ fn run(workspace: PathBuf) -> std::io::Result<()> {
     let mut state = connect(&workspace, &inputs);
 
     let (_guard, mut term) = terminal::Guard::new()?;
+    // Whether a pane fits depends on the width, so start from the real one
+    // rather than assuming the default until the first resize.
+    if let Ok(size) = term.size() {
+        ui.width = size.width;
+        ui.focus = ui.panes.drawable(size.width).refocus(ui.focus);
+    }
 
     // Redraw only on change. A dashboard of idle terminals must not spin, so
     // nothing here loops on a timer: the loop blocks until a source produces.
@@ -196,13 +213,28 @@ fn handle(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
         Input::Terminal(TermEvent::Key(key)) => {
             match ui.router.route(ui.screen, ui.focus, key) {
                 Routed::Act(Action::Quit) => Flow::Quit,
+                // Cycling consults visibility rather than the enum's own
+                // order: focus on a hidden pane means the arrows drive a list
+                // that is not on screen.
                 Routed::Act(Action::CycleFocus) => {
-                    ui.focus = ui.focus.next();
+                    ui.focus = ui.panes.drawable(ui.width).next_visible(ui.focus);
                     Flow::Continue { redraw: true }
                 }
                 Routed::Act(Action::CycleFocusBack) => {
-                    ui.focus = ui.focus.previous();
+                    ui.focus = ui.panes.drawable(ui.width).previous_visible(ui.focus);
                     Flow::Continue { redraw: true }
+                }
+                Routed::Act(Action::TogglePane(index)) => {
+                    let Some(pane) = Panes::addressed(index) else {
+                        return Flow::Continue { redraw: false };
+                    };
+                    // A refused toggle — the last visible pane — changes
+                    // nothing, so it must not cost a frame either.
+                    let changed = ui.panes.toggle(pane);
+                    if changed {
+                        ui.focus = ui.panes.drawable(ui.width).refocus(ui.focus);
+                    }
+                    Flow::Continue { redraw: changed }
                 }
                 // Screens are #18-#30. Until they exist an action is
                 // acknowledged with a redraw rather than silently dropped, so
@@ -219,7 +251,13 @@ fn handle(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
             }
         }
 
-        Input::Terminal(TermEvent::Resize(..)) => Flow::Continue { redraw: true },
+        Input::Terminal(TermEvent::Resize(width, _)) => {
+            ui.width = width;
+            // A resize can take a pane off screen, so focus is rechecked here
+            // rather than only when the user presses something.
+            ui.focus = ui.panes.drawable(width).refocus(ui.focus);
+            Flow::Continue { redraw: true }
+        }
 
         // Focus events arrive as keepalives from the reader and mean nothing to
         // the user; redrawing on them would defeat the redraw-on-change rule.
@@ -343,6 +381,18 @@ fn draw(f: &mut ratatui::Frame, state: &State, ui: &Ui) {
         .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(f.area());
     let (body_area, bar_area) = (chunks[0], chunks[1]);
+
+    // The dash is a frame of panes rather than a paragraph, so it takes the
+    // body whole. Everything the shell says about its own state — no daemon,
+    // no connection yet — still goes through the block below, because those
+    // are not screens and #22's empty state is about a workspace with nothing
+    // in it, not about a daemon grove cannot reach.
+    if matches!(state, State::Connected { .. }) && ui.screen == Screen::Dash {
+        dash::render(f.buffer_mut(), body_area, ui.panes, ui.focus, &ui.theme);
+        status_bar(f, bar_area, ui);
+        return;
+    }
+
     let (title, body) = match state {
         State::Connected { workspace, note } => (
             "grove",
@@ -402,6 +452,11 @@ fn draw(f: &mut ratatui::Frame, state: &State, ui: &Ui) {
         body_area,
     );
 
+    status_bar(f, bar_area, ui);
+}
+
+/// The one row along the bottom, drawn the same way whatever is above it.
+fn status_bar(f: &mut ratatui::Frame, area: Rect, ui: &Ui) {
     let context = if ui.router.prefix_pending() {
         "^g …".to_string()
     } else {
@@ -413,11 +468,11 @@ fn draw(f: &mut ratatui::Frame, state: &State, ui: &Ui) {
             ui.focus,
             &context,
             "no session",
-            bar_area.width,
+            area.width,
             &ui.theme,
             ui.config_note.as_deref(),
         )),
-        bar_area,
+        area,
     );
 }
 
@@ -427,6 +482,7 @@ type Backend = Terminal<CrosstermBackend<Stdout>>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     fn connected() -> State {
         State::Connected {
@@ -490,6 +546,111 @@ mod tests {
         assert_eq!(config_path_from(None, None), None);
     }
 
+    fn key(code: KeyCode) -> Input {
+        Input::Terminal(TermEvent::Key(KeyEvent::new(code, KeyModifiers::NONE)))
+    }
+
+    fn prefix() -> Input {
+        Input::Terminal(TermEvent::Key(KeyEvent::new(
+            KeyCode::Char('g'),
+            KeyModifiers::CONTROL,
+        )))
+    }
+
+    #[test]
+    fn hiding_a_pane_from_the_keyboard_moves_focus_off_it() {
+        // End to end through the router, because the wiring is where this can
+        // go wrong: the layout already refuses to strand focus, and a `handle`
+        // that forgets to call `refocus` would leave the arrows driving a list
+        // that is no longer drawn.
+        let mut s = connected();
+        let mut ui = Ui::new();
+        ui.focus = Focus::Repos;
+
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('1')), &mut s, &mut ui);
+
+        assert!(!ui.panes.visible(Focus::Repos), "^g 1 hides REPOS");
+        assert_ne!(ui.focus, Focus::Repos, "focus must leave a hidden pane");
+        assert!(ui.panes.visible(ui.focus));
+    }
+
+    #[test]
+    fn refusing_to_hide_the_last_pane_costs_no_frame() {
+        // A redraw that changes nothing is a frame spent to paint the same
+        // pixels, and the loop's whole redraw policy is change-driven.
+        let mut s = connected();
+        let mut ui = Ui::new();
+        for pane in ['1', '2'] {
+            handle(prefix(), &mut s, &mut ui);
+            handle(key(KeyCode::Char(pane)), &mut s, &mut ui);
+        }
+        assert_eq!(ui.panes.count(), 1);
+
+        handle(prefix(), &mut s, &mut ui);
+        match handle(key(KeyCode::Char('3')), &mut s, &mut ui) {
+            Flow::Continue { redraw } => assert!(!redraw, "a refusal must not redraw"),
+            Flow::Quit => panic!("toggling a pane must not quit"),
+        }
+        assert_eq!(ui.panes.count(), 1, "the last pane stays");
+    }
+
+    #[test]
+    fn cycling_focus_skips_hidden_panes() {
+        let mut s = connected();
+        let mut ui = Ui::new();
+        ui.focus = Focus::Repos;
+
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('2')), &mut s, &mut ui);
+        assert!(!ui.panes.visible(Focus::Worktrees));
+
+        ui.focus = Focus::Repos;
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Tab), &mut s, &mut ui);
+        assert_eq!(
+            ui.focus,
+            Focus::Terminal,
+            "^g tab must pass over the hidden WORKTREES pane"
+        );
+    }
+
+    #[test]
+    fn focus_never_cycles_onto_a_pane_too_narrow_to_draw() {
+        // The review's finding, wired end to end: at 40 columns the dash drops
+        // the terminal pane, so `^g tab` must pass over it exactly as it
+        // passes over one the user hid.
+        let mut s = connected();
+        let mut ui = Ui::new();
+        handle(Input::Terminal(TermEvent::Resize(40, 24)), &mut s, &mut ui);
+        ui.focus = Focus::Worktrees;
+
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Tab), &mut s, &mut ui);
+        assert_eq!(
+            ui.focus,
+            Focus::Repos,
+            "the terminal pane does not fit at 40 columns, so focus must skip it"
+        );
+    }
+
+    #[test]
+    fn shrinking_the_terminal_moves_focus_off_a_pane_that_no_longer_fits() {
+        // Focus can be left behind by a resize as easily as by a toggle, and
+        // the resize path is the one nobody presses a key for.
+        let mut s = connected();
+        let mut ui = Ui::new();
+        handle(Input::Terminal(TermEvent::Resize(200, 40)), &mut s, &mut ui);
+        ui.focus = Focus::Terminal;
+
+        handle(Input::Terminal(TermEvent::Resize(40, 24)), &mut s, &mut ui);
+        assert_ne!(ui.focus, Focus::Terminal, "that pane is no longer drawn");
+        assert!(
+            ui.panes.drawable(ui.width).visible(ui.focus),
+            "focus must land somewhere that fits"
+        );
+    }
+
     #[test]
     fn keepalives_do_not_cause_a_redraw() {
         // The terminal reader emits a focus event to check whether anyone is
@@ -551,7 +712,6 @@ mod tests {
     fn quitting_goes_through_the_prefix_like_everything_else() {
         // `^g q` per SPEC §3.2 — and a bare `q` must NOT quit, or a `q` typed
         // into a focused shell would kill grove out from under it.
-        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let mut s = connected();
         let mut ui = Ui::new();
         ui.focus = Focus::Terminal;
@@ -573,7 +733,6 @@ mod tests {
 
     #[test]
     fn tab_moves_focus_and_that_changes_routing() {
-        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let mut s = connected();
         let mut ui = Ui::new();
         assert_eq!(ui.focus, Focus::Worktrees);
