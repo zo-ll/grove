@@ -721,6 +721,8 @@ mod tests {
         ("repos.rs", include_str!("repos.rs")),
         ("statusbar.rs", include_str!("statusbar.rs")),
         ("terminal.rs", include_str!("terminal.rs")),
+        ("text.rs", include_str!("text.rs")),
+        ("worktrees.rs", include_str!("worktrees.rs")),
     ];
 
     #[test]
