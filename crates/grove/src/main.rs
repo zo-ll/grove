@@ -207,6 +207,14 @@ impl Ui {
                 None => said.join("; "),
             });
         }
+        self.palette.with_user(
+            runtime
+                .registrations()
+                .commands
+                .iter()
+                .map(|registration| registration.name.clone())
+                .collect(),
+        );
         self.lua = Some(runtime);
     }
 
@@ -374,7 +382,7 @@ fn run(workspace: PathBuf) -> std::io::Result<()> {
 /// today. The rest are honest about it rather than closing the palette and
 /// doing nothing: a command line that swallows `enter` teaches the user that
 /// grove is unreliable, which is a harder thing to unlearn than a wait.
-fn run_command(chosen: Option<&'static palette::Command>, state: &mut State, ui: &mut Ui) -> bool {
+fn run_command(chosen: Option<palette::Entry>, state: &mut State, ui: &mut Ui) -> bool {
     // Already collecting an argument: `enter` means "do it", not "choose it".
     if ui.palette.arguing().is_some() {
         return confirm_argument(state, ui);
@@ -392,7 +400,7 @@ fn run_command(chosen: Option<&'static palette::Command>, state: &mut State, ui:
         return true;
     }
 
-    let request = match command.name {
+    let request = match command.name.as_str() {
         "scan" => Some(Request::Scan),
         // The picker opens on the daemon's answer, not on the keystroke: its
         // whole point is that the safe rows are the daemon's judgement, and an
@@ -514,9 +522,15 @@ fn act_on_session(intent: Option<sessions::Intent>, state: &mut State, ui: &mut 
 /// it becomes a member, so the two requests go together rather than leaving
 /// the user to do it twice.
 fn confirm_argument(state: &mut State, ui: &mut Ui) -> bool {
-    let Some(command) = ui.palette.arguing() else {
+    let Some(command) = ui.palette.arguing().cloned() else {
         return false;
     };
+    // A user's command is its own implementation: grove hands over what was
+    // typed and gets out of the way.
+    if let Some(index) = command.user {
+        let argument = ui.palette.argument().unwrap_or_default().to_string();
+        return run_user_command(index, &argument, ui);
+    }
     let argument = ui.palette.argument().unwrap_or_default().to_string();
     let Some(session) = ui.session.clone() else {
         ui.note = Some(format!("no open session to {} in", command.name));
@@ -530,7 +544,7 @@ fn confirm_argument(state: &mut State, ui: &mut Ui) -> bool {
         .unwrap_or_default();
 
     let mut requests: Vec<Request> = Vec::new();
-    match command.name {
+    match command.name.as_str() {
         "new" => {
             if argument.trim().is_empty() {
                 ui.note = Some("name the branch first".into());
@@ -700,6 +714,31 @@ fn refresh_user_columns(ui: &mut Ui) {
         ui.note = Some(note);
     }
     ui.lua = Some(runtime);
+}
+
+/// Run a user's palette command, containing whatever it does.
+///
+/// Same containment as a keymap's: bounded in time, and a throw takes the
+/// command out of the palette rather than failing again next time it is run.
+fn run_user_command(index: usize, argument: &str, ui: &mut Ui) -> bool {
+    let Some(runtime) = ui.lua.as_ref() else {
+        return false;
+    };
+    match runtime.call_command(index, argument, USER_CALLBACK_BUDGET) {
+        Ok(()) => {
+            ui.screen = Screen::Dash;
+            ui.note = None;
+            true
+        }
+        Err(grove_lua::CallError::Timeout) => {
+            ui.note = Some("that command ran too long and was stopped".into());
+            true
+        }
+        Err(grove_lua::CallError::Failed(why)) => {
+            ui.note = Some(format!("command failed: {why}"));
+            true
+        }
+    }
 }
 
 /// Run a user keymap's callback, containing whatever it does.
@@ -1670,28 +1709,22 @@ fn draw(f: &mut ratatui::Frame, state: &State, ui: &Ui) {
     }
 
     if matches!(state, State::Connected { .. }) && ui.screen == Screen::EndSession {
-        let inner = dash::render(f.buffer_mut(), body_area, ui.panes, ui.focus, &ui.theme);
-        if let Some(area) = inner.worktrees.or(inner.repos).or(inner.terminal) {
-            ui.ending.render(f.buffer_mut(), area, &ui.theme);
-        }
+        let area = overlay(f, body_area, " end session ", ui);
+        ui.ending.render(f.buffer_mut(), area, &ui.theme);
         status_bar(f, bar_area, ui);
         return;
     }
 
     if matches!(state, State::Connected { .. }) && ui.screen == Screen::Picker {
-        let inner = dash::render(f.buffer_mut(), body_area, ui.panes, ui.focus, &ui.theme);
-        if let Some(area) = inner.worktrees.or(inner.repos).or(inner.terminal) {
-            ui.sessions.render(f.buffer_mut(), area, &ui.theme);
-        }
+        let area = overlay(f, body_area, " sessions ", ui);
+        ui.sessions.render(f.buffer_mut(), area, &ui.theme);
         status_bar(f, bar_area, ui);
         return;
     }
 
     if matches!(state, State::Connected { .. }) && ui.screen == Screen::Prune {
-        let inner = dash::render(f.buffer_mut(), body_area, ui.panes, ui.focus, &ui.theme);
-        if let Some(area) = inner.worktrees.or(inner.repos).or(inner.terminal) {
-            ui.prune.render(f.buffer_mut(), area, &ui.theme);
-        }
+        let area = overlay(f, body_area, " prune ", ui);
+        ui.prune.render(f.buffer_mut(), area, &ui.theme);
         status_bar(f, bar_area, ui);
         return;
     }
@@ -1700,11 +1733,8 @@ fn draw(f: &mut ratatui::Frame, state: &State, ui: &Ui) {
         // Over the dash rather than beside it: §4.2 calls it grove's command
         // line, and a command line that moves the screen under it makes the
         // thing you were looking at harder to act on.
-        let inner = dash::render(f.buffer_mut(), body_area, ui.panes, ui.focus, &ui.theme);
-        let over = inner.worktrees.or(inner.repos).or(inner.terminal);
-        if let Some(area) = over {
-            ui.palette.render(f.buffer_mut(), area, &ui.theme);
-        }
+        let area = overlay(f, body_area, " palette ", ui);
+        ui.palette.render(f.buffer_mut(), area, &ui.theme);
         status_bar(f, bar_area, ui);
         return;
     }
@@ -1782,6 +1812,23 @@ fn bytes(n: u64) -> String {
         n if n >= MB => format!("{} MB", n / MB),
         n => format!("{} KB", (n / 1024).max(1)),
     }
+}
+
+/// Frame an overlay that owns the body, and hand back the inside.
+///
+/// The palette, the pickers and the confirm are all lists that need width:
+/// drawing them into the WORKTREES pane fitted them into twenty-odd columns
+/// and truncated every summary, which is how the palette shipped until a test
+/// painted it at a real size.
+fn overlay(f: &mut ratatui::Frame, area: Rect, title: &'static str, ui: &Ui) -> Rect {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(ui.theme.border())
+        .border_style(ui.theme.style(Role::Muted))
+        .title(Span::styled(title, ui.theme.style(Role::Accent)));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    inner
 }
 
 /// The one row along the bottom, drawn the same way whatever is above it.
@@ -2798,7 +2845,10 @@ mod tests {
             handle(key(KeyCode::Char(c)), &mut s, &mut ui);
         }
         assert_eq!(ui.palette.input(), "sca");
-        assert_eq!(ui.palette.selected().map(|c| c.name), Some("scan"));
+        assert_eq!(
+            ui.palette.selected().map(|c| c.name),
+            Some("scan".to_string())
+        );
 
         // A command line you cannot correct is a worse command line than one
         // you cannot filter.
@@ -2859,7 +2909,10 @@ mod tests {
         handle(key(KeyCode::Enter), &mut s, &mut ui);
 
         assert_eq!(ui.screen, Screen::Palette, "still open, now arguing");
-        assert_eq!(ui.palette.arguing().map(|c| c.name), Some("add"));
+        assert_eq!(
+            ui.palette.arguing().map(|c| c.name.clone()),
+            Some("add".to_string())
+        );
         let rows: Vec<&str> = ui
             .palette
             .select()
@@ -3479,6 +3532,72 @@ mod tests {
     }
 
     #[test]
+    fn a_user_command_is_listed_beside_the_built_ins_and_runs() {
+        // Acceptance: invocable from the palette, and visibly the user's.
+        let (mut s, mut theirs) = wired();
+        let mut ui = with_lua(
+            "local grove = require('grove')\n             grove.command('review', function(pr) end)\n",
+        );
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('/')), &mut s, &mut ui);
+
+        let screen = painted_dash(&s, &ui, 100, 20).join("\n");
+        assert!(screen.contains("review"), "{screen}");
+        assert!(
+            screen.contains("from your config"),
+            "marked as theirs: {screen}"
+        );
+        // And beside the built-ins, not in a section of its own.
+        assert!(screen.contains("scan"), "{screen}");
+
+        for c in "review".chars() {
+            handle(key(KeyCode::Char(c)), &mut s, &mut ui);
+        }
+        handle(key(KeyCode::Enter), &mut s, &mut ui);
+        assert_eq!(
+            ui.palette.arguing().map(|c| c.name.clone()),
+            Some("review".to_string()),
+            "it takes whatever is typed after the name"
+        );
+        for c in "4471".chars() {
+            handle(key(KeyCode::Char(c)), &mut s, &mut ui);
+        }
+        handle(key(KeyCode::Enter), &mut s, &mut ui);
+        assert_eq!(ui.screen, Screen::Dash, "it ran, so the palette closed");
+        assert!(ui.note.is_none(), "and said nothing, because it worked");
+        assert!(
+            sent(&mut theirs).is_empty(),
+            "a user command is its own implementation"
+        );
+    }
+
+    #[test]
+    fn a_user_command_that_hangs_leaves_the_tui_responsive() {
+        let mut s = connected();
+        let mut ui = with_lua(
+            "local grove = require('grove')\n             grove.command('hang', function() while true do end end)\n",
+        );
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('/')), &mut s, &mut ui);
+        for c in "hang".chars() {
+            handle(key(KeyCode::Char(c)), &mut s, &mut ui);
+        }
+        handle(key(KeyCode::Enter), &mut s, &mut ui);
+        let started = std::time::Instant::now();
+        handle(key(KeyCode::Enter), &mut s, &mut ui);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "held for {:?}",
+            started.elapsed()
+        );
+        assert!(
+            ui.note.clone().is_some_and(|n| n.contains("ran too long")),
+            "{:?}",
+            ui.note
+        );
+    }
+
+    #[test]
     fn a_user_column_is_computed_when_the_rows_arrive_and_painted_with_them() {
         // Acceptance: it renders without blocking navigation, because it is
         // computed at the invalidation point rather than during a frame.
@@ -3906,7 +4025,10 @@ mod tests {
     }
 
     #[test]
-    fn the_palette_draws_over_the_dash() {
+    fn the_palette_takes_the_body_so_its_summaries_are_readable() {
+        // It used to draw into the WORKTREES pane, which is twenty-odd
+        // columns wide: every summary came out truncated and a user command's
+        // marker was cut off entirely. A command line needs the width.
         let mut s = connected();
         let mut ui = Ui::new();
         handle(
@@ -3918,13 +4040,14 @@ mod tests {
         handle(key(KeyCode::Char('/')), &mut s, &mut ui);
 
         let screen = painted_dash(&s, &ui, 100, 20).join("\n");
+        assert!(screen.contains("scan"), "{screen}");
         assert!(
-            screen.contains("scan"),
-            "the command list is on screen: {screen}"
+            screen.contains("re-walk the workspace for repos"),
+            "the summary is not truncated: {screen}"
         );
         assert!(
-            screen.contains("REPOS"),
-            "over the dash, not instead of it: {screen}"
+            screen.contains("palette"),
+            "and it says what it is: {screen}"
         );
     }
 
