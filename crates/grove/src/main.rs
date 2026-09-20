@@ -1170,6 +1170,12 @@ fn handle(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
 
         Input::Daemon(DaemonEvent::TerminalExited { terminal, .. }) => {
             ui.terminals.exited(terminal);
+            if ui.scratch == Some(terminal) {
+                // Forgotten here as well as in `Terminals`, or `^g i` would
+                // re-attach to a dead id for the rest of the session instead
+                // of opening a new shell.
+                ui.scratch = None;
+            }
             Flow::Continue { redraw: true }
         }
 
@@ -3132,6 +3138,50 @@ mod tests {
                 Request::AttachTerminal(a) if a.terminal == grove_proto::TerminalId(5)
             )),
             "it re-attaches to the one that exists: {asked:?}"
+        );
+    }
+
+    #[test]
+    fn a_scratch_shell_that_exits_is_forgotten_so_the_next_one_opens() {
+        // Found while writing up #28: the terminal was forgotten in
+        // `Terminals` but not here, so `^g i` after the shell died would
+        // re-attach to a dead id for the rest of the session.
+        let (mut s, mut theirs) = wired();
+        let mut ui = Ui::new();
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('i')), &mut s, &mut ui);
+        handle(
+            Input::Daemon(DaemonEvent::TerminalSpawned {
+                target: grove_proto::TerminalTarget::Scratch { cwd: None },
+                terminal: grove_proto::TerminalId(5),
+            }),
+            &mut s,
+            &mut ui,
+        );
+        handle(
+            Input::Daemon(DaemonEvent::TerminalExited {
+                terminal: grove_proto::TerminalId(5),
+                status: Some(0),
+            }),
+            &mut s,
+            &mut ui,
+        );
+        assert!(ui.scratch.is_none(), "the dead shell is forgotten");
+
+        // Leave the overlay — it is still open over a pty that is gone — and
+        // come back.
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('i')), &mut s, &mut ui);
+        assert_eq!(ui.screen, Screen::Dash);
+        let _ = sent(&mut theirs);
+
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('i')), &mut s, &mut ui);
+        assert!(
+            sent(&mut theirs)
+                .iter()
+                .any(|r| matches!(r, Request::SpawnTerminal(_))),
+            "so the next ^g i opens a new one"
         );
     }
 
