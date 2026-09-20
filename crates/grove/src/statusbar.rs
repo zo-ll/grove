@@ -21,6 +21,11 @@ use crate::theme::{Ink, Role, Theme};
 /// How the bar spells one key.
 fn key_of(b: &Binding) -> String {
     match b.key {
+        // Before anything else: a space spelled as itself is a hint that
+        // reads `  toggle`, which looks like a missing key rather than the
+        // space bar. The mock writes it out, and so does every other key
+        // here that has a name rather than a glyph.
+        KeyCode::Char(' ') => "space".into(),
         KeyCode::Char(c) => c.to_string(),
         KeyCode::Tab => "tab".into(),
         KeyCode::BackTab => "shift-tab".into(),
@@ -254,6 +259,18 @@ mod tests {
             .find(|h| h.label == "file")
             .expect("the diff's arrows");
         assert_eq!(file.keys, "↑↓", "two arrows are one entry");
+    }
+
+    #[test]
+    fn a_key_with_a_name_is_written_out_rather_than_typed() {
+        // `space toggle` reads as a key and a verb. A literal space reads as
+        // a verb with nothing in front of it — the bar looks broken, and the
+        // one key the prune list most needs to teach is the one it hides.
+        let toggle = hints(Screen::Prune)
+            .into_iter()
+            .find(|hint| hint.label == "toggle")
+            .expect("space toggles a prune row");
+        assert_eq!(toggle.keys, "space");
     }
 
     #[test]
