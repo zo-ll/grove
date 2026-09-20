@@ -86,8 +86,25 @@ impl DaemonSocket {
             .mode(0o600)
             .open(&lock_path)
             .map_err(|source| socket_error(&lock_path, source))?;
-        lock.lock_exclusive()
-            .map_err(|source| socket_error(&lock_path, source))?;
+        // flock blocks until the holder releases, but it can also be
+        // interrupted by a signal and return EINTR — once in a long run of
+        // runs, on a loaded machine, which is exactly the shape of the
+        // unrepeatable failure this file's tests saw once. A lock
+        // acquisition is seconds-cheap to retry, so interrupting a signal
+        // costs a retry, not a daemon lifecycle.
+        let lock_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match lock.lock_exclusive() {
+                Ok(()) => break,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                    assert!(
+                        Instant::now() < lock_deadline,
+                        "socket lock acquisition was interrupted for five seconds"
+                    );
+                }
+                Err(source) => return Err(socket_error(&lock_path, source)),
+            }
+        }
 
         if socket_path.exists() {
             match configured_stream(&socket_path) {
@@ -469,13 +486,19 @@ mod tests {
         let path = socket_path_at(&temp.0, Path::new("/workspace"));
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         drop(UnixListener::bind(&path).unwrap());
+        // Every test in this file holds its own runtime directory, named by
+        // pid, timestamp and sequence — so no leftover socket from any other
+        // run or test can ever be probed here, which is the isolation the
+        // reported one-off failure asked for. The probe itself is a bounded
+        // wait, not a busy spin: under a loaded suite, yield_now is a hot
+        // loop for as long as the deadline runs.
         let deadline = Instant::now() + Duration::from_secs(1);
         while UnixStream::connect(&path).is_ok() {
             assert!(
                 Instant::now() < deadline,
                 "closed listener stayed connectable"
             );
-            thread::yield_now();
+            thread::sleep(Duration::from_millis(1));
         }
         let outcome = DaemonSocket::bind_at(&temp.0, Path::new("/workspace")).unwrap();
         let BindOutcome::Owner(owner) = outcome else {
