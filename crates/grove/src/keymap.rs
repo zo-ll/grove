@@ -232,6 +232,7 @@ pub fn key_label(action: Action) -> String {
     match binding {
         Some(binding) => {
             let key = match binding.key {
+                KeyCode::Char(' ') => "space".into(),
                 KeyCode::Char(c) => c.to_string(),
                 KeyCode::Enter => "enter".into(),
                 KeyCode::Tab => "tab".into(),
