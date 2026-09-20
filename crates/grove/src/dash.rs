@@ -35,10 +35,6 @@ const REPOS_MIN: u16 = 14;
 const WORKTREES_MIN: u16 = 26;
 const TERMINAL_MIN: u16 = 24;
 
-/// The narrowest a pane can be and still be a pane: two borders and a column
-/// of content.
-const DRAWABLE_MIN: u16 = 3;
-
 /// The width below which a pane is not worth drawing at all.
 fn floor(pane: Pane) -> u16 {
     match pane {
