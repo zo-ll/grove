@@ -715,6 +715,7 @@ mod tests {
     /// it to the tree.
     const SCANNED: &[(&str, &str)] = &[
         ("dash.rs", include_str!("dash.rs")),
+        ("diff.rs", include_str!("diff.rs")),
         ("empty.rs", include_str!("empty.rs")),
         ("endsession.rs", include_str!("endsession.rs")),
         ("events.rs", include_str!("events.rs")),
