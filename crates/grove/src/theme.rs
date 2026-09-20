@@ -721,6 +721,7 @@ mod tests {
         ("main.rs", include_str!("main.rs")),
         ("palette.rs", include_str!("palette.rs")),
         ("repos.rs", include_str!("repos.rs")),
+        ("select.rs", include_str!("select.rs")),
         ("statusbar.rs", include_str!("statusbar.rs")),
         ("terminal.rs", include_str!("terminal.rs")),
         ("terminals.rs", include_str!("terminals.rs")),

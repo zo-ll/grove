@@ -15,6 +15,7 @@ mod events;
 mod keymap;
 mod palette;
 mod repos;
+mod select;
 mod statusbar;
 mod terminal;
 mod terminals;
@@ -67,6 +68,10 @@ struct Ui {
     terminals: Terminals,
     /// grove's command line, while it is open.
     palette: Palette,
+    /// A `new` that hit a branch already checked out somewhere else, and the
+    /// worktree it collided with. §7 says the flow offers to adopt that
+    /// worktree rather than refusing and leaving the user to find it.
+    conflict: Option<(grove_proto::WorktreeRef, std::path::PathBuf)>,
     /// The terminal's current height, for sizing the pty. Width is `width`.
     height: u16,
     /// The last size the terminal pane actually had, kept so hiding the pane
@@ -160,6 +165,7 @@ impl Ui {
             worktrees: Worktrees::default(),
             terminals: Terminals::default(),
             palette: Palette::default(),
+            conflict: None,
             session: None,
             note: None,
             width: 80,
@@ -288,15 +294,20 @@ fn run(workspace: PathBuf) -> std::io::Result<()> {
 /// doing nothing: a command line that swallows `enter` teaches the user that
 /// grove is unreliable, which is a harder thing to unlearn than a wait.
 fn run_command(chosen: Option<&'static palette::Command>, state: &mut State, ui: &mut Ui) -> bool {
+    // Already collecting an argument: `enter` means "do it", not "choose it".
+    if ui.palette.arguing().is_some() {
+        return confirm_argument(state, ui);
+    }
     let Some(command) = chosen else {
         // Nothing matched what was typed. The palette already says so.
         return false;
     };
-    if let Takes::Argument(what) = command.takes {
-        ui.note = Some(format!(
-            "{} needs {what} — argument mode is #24",
-            command.name
-        ));
+    if matches!(command.takes, Takes::Argument(_)) {
+        // Step into argument mode rather than running: the picker is built
+        // from the repos the daemon last sent, which is why this needs the UI
+        // rather than only the command.
+        let repos = ui.repos.all().to_vec();
+        ui.palette.argue(command, &repos);
         return true;
     }
 
@@ -327,6 +338,101 @@ fn run_command(chosen: Option<&'static palette::Command>, state: &mut State, ui:
             true
         }
     }
+}
+
+/// Carry out a command that has its argument.
+///
+/// Every one of these names the open session, because membership and
+/// worktrees belong to a session rather than to the workspace. Checking a
+/// non-member in `new`'s picker adds it first — §4.2 says picking one is how
+/// it becomes a member, so the two requests go together rather than leaving
+/// the user to do it twice.
+fn confirm_argument(state: &mut State, ui: &mut Ui) -> bool {
+    let Some(command) = ui.palette.arguing() else {
+        return false;
+    };
+    let argument = ui.palette.argument().unwrap_or_default().to_string();
+    let Some(session) = ui.session.clone() else {
+        ui.note = Some(format!("no open session to {} in", command.name));
+        return true;
+    };
+
+    let picked: Vec<select::Row> = ui
+        .palette
+        .select()
+        .map(|select| select.checked().into_iter().cloned().collect())
+        .unwrap_or_default();
+
+    let mut requests: Vec<Request> = Vec::new();
+    match command.name {
+        "new" => {
+            if argument.trim().is_empty() {
+                ui.note = Some("name the branch first".into());
+                return true;
+            }
+            if picked.is_empty() {
+                ui.note = Some("no repos checked — space toggles a row".into());
+                return true;
+            }
+            // A checked non-member joins the session before it gets a
+            // worktree, because a worktree belongs to a member.
+            for row in picked.iter().filter(|row| !row.member) {
+                requests.push(Request::AddMember {
+                    session: session.clone(),
+                    repo: row.repo.clone(),
+                });
+            }
+            requests.push(Request::NewWorktrees {
+                session: session.clone(),
+                branch: argument.trim().to_string(),
+                repos: picked.iter().map(|row| row.repo.clone()).collect(),
+            });
+        }
+        "add" | "remove" => {
+            if picked.is_empty() {
+                ui.note = Some("nothing checked — space toggles a row".into());
+                return true;
+            }
+            for row in &picked {
+                requests.push(if command.name == "add" {
+                    Request::AddMember {
+                        session: session.clone(),
+                        repo: row.repo.clone(),
+                    }
+                } else {
+                    Request::RemoveMember {
+                        session: session.clone(),
+                        repo: row.repo.clone(),
+                    }
+                });
+            }
+        }
+        "session new" => requests.push(Request::SessionNew {
+            name: argument.trim().to_string(),
+        }),
+        "session rename" => requests.push(Request::SessionRename {
+            session: session.clone(),
+            name: argument.trim().to_string(),
+        }),
+        other => {
+            // `open` needs the session picker (#26) and `fetch` its own
+            // argument list. Said rather than silently doing nothing.
+            ui.note = Some(format!("{other} lands with its screen"));
+            return true;
+        }
+    }
+
+    for request in &requests {
+        if let Err(e) = send(state, request) {
+            ui.note = Some(format!("could not reach the daemon: {e}"));
+            return true;
+        }
+    }
+    // The daemon owns what happens next; ask for the rows that will show it.
+    let _ = send(state, &Request::ListRepos);
+    ui.screen = Screen::Dash;
+    ui.note = None;
+    true
 }
 
 /// Carry out what the WORKTREES pane decided `^g a` or `^g r` means.
@@ -538,7 +644,14 @@ fn handle(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
                 // and say why when they cannot — a key that silently does
                 // nothing reads as grove being broken.
                 Routed::Act(Action::Adopt) if ui.screen == Screen::Dash => {
-                    let intent = ui.worktrees.adopt();
+                    // An offered conflict outranks the cursor: the user was
+                    // just told this key takes over the worktree that blocked
+                    // them, and the WORKTREES cursor is wherever it happened
+                    // to be.
+                    let intent = match ui.conflict.take() {
+                        Some((worktree, _)) => Some(worktrees::Intent::Adopt(worktree)),
+                        None => ui.worktrees.adopt(),
+                    };
                     Flow::Continue {
                         redraw: act_on_worktree(intent, state, ui),
                     }
@@ -555,18 +668,39 @@ fn handle(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
                     Flow::Continue { redraw: true }
                 }
                 Routed::Act(Action::MoveDown) if ui.screen == Screen::Palette => Flow::Continue {
-                    redraw: ui.palette.move_down(),
+                    redraw: match ui.palette.select_mut() {
+                        Some(select) => select.move_down(),
+                        None => ui.palette.move_down(),
+                    },
                 },
                 Routed::Act(Action::MoveUp) if ui.screen == Screen::Palette => Flow::Continue {
-                    redraw: ui.palette.move_up(),
+                    redraw: match ui.palette.select_mut() {
+                        Some(select) => select.move_up(),
+                        None => ui.palette.move_up(),
+                    },
+                },
+                Routed::Act(Action::Toggle) if ui.screen == Screen::Palette => Flow::Continue {
+                    redraw: match ui.palette.select_mut() {
+                        Some(select) => select.toggle(),
+                        // No picker open, so space is just a character — a
+                        // session name can contain one.
+                        None => {
+                            ui.palette.push(' ');
+                            true
+                        }
+                    },
                 },
                 Routed::Act(Action::Erase) if ui.screen == Screen::Palette => Flow::Continue {
                     redraw: ui.palette.backspace(),
                 },
                 Routed::Act(Action::Cancel) if ui.screen == Screen::Palette => {
-                    // `esc` closes without side effects: nothing has been run,
-                    // so there is nothing to undo.
-                    ui.screen = Screen::Dash;
+                    // From an argument, `esc` steps back to the command list
+                    // rather than closing: the user is one keystroke from what
+                    // they wanted. From the list it closes, with nothing to
+                    // undo because nothing has run.
+                    if !ui.palette.unargue() {
+                        ui.screen = Screen::Dash;
+                    }
                     Flow::Continue { redraw: true }
                 }
                 Routed::Act(Action::Confirm) if ui.screen == Screen::Palette => {
@@ -676,6 +810,26 @@ fn handle(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
         // The pty `^g enter` asked for. Without this the terminal exists and
         // the pane still says there is none, until something else happens to
         // refresh the worktree rows.
+        // The branch is already checked out somewhere. Refusing and stopping
+        // there would leave the user to go and find it; §7 says offer to take
+        // it over instead, and `^g a` is already the key for adopting.
+        Input::Daemon(DaemonEvent::BranchCheckedOutElsewhere {
+            branch,
+            existing,
+            existing_path,
+            ..
+        }) => {
+            ui.note = Some(format!(
+                "{branch} is already checked out at {} — ^g a adopts it",
+                existing_path.display()
+            ));
+            ui.conflict = Some((existing, existing_path));
+            // The palette has nothing left to do, and leaving it open over the
+            // message would hide the worktree the offer is about.
+            ui.screen = Screen::Dash;
+            Flow::Continue { redraw: true }
+        }
+
         Input::Daemon(DaemonEvent::TerminalSpawned { terminal, .. }) => {
             let (rows, cols) = ui.terminal_pane_size();
             for request in ui.terminals.show(Some(terminal), rows, cols) {
@@ -2060,11 +2214,21 @@ mod tests {
     }
 
     #[test]
-    fn a_command_that_needs_an_argument_says_so_rather_than_swallowing_enter() {
-        // Collecting the argument is #24. Until then `enter` on `add` must
-        // not look like grove ignored it.
+    fn a_command_that_needs_an_argument_opens_its_picker() {
+        // #23 could only say "this needs an argument". Now `enter` steps into
+        // argument mode, and for `add` that is a list of the repos the session
+        // does *not* hold — the ones the REPOS pane never shows.
         let (mut s, mut theirs) = wired();
         let mut ui = Ui::new();
+        let mut outsider = repo_row("api-gateway", 0);
+        outsider.member = false;
+        handle(
+            Input::Daemon(DaemonEvent::Repos(vec![repo_row("billing", 1), outsider])),
+            &mut s,
+            &mut ui,
+        );
+        let _ = sent(&mut theirs);
+
         handle(prefix(), &mut s, &mut ui);
         handle(key(KeyCode::Char('/')), &mut s, &mut ui);
         for c in "add".chars() {
@@ -2072,10 +2236,208 @@ mod tests {
         }
         handle(key(KeyCode::Enter), &mut s, &mut ui);
 
+        assert_eq!(ui.screen, Screen::Palette, "still open, now arguing");
+        assert_eq!(ui.palette.arguing().map(|c| c.name), Some("add"));
+        let rows: Vec<&str> = ui
+            .palette
+            .select()
+            .expect("a picker")
+            .rows()
+            .iter()
+            .map(|row| row.name.as_str())
+            .collect();
+        assert_eq!(rows, ["api-gateway"], "only what is not already a member");
+        assert!(
+            sent(&mut theirs).is_empty(),
+            "opening a picker must not change anything"
+        );
+    }
+
+    #[test]
+    fn new_creates_one_worktree_per_checked_repo_and_adopts_the_newcomers() {
+        // The acceptance, end to end: space toggles, enter creates. A checked
+        // non-member joins the session first, because a worktree belongs to a
+        // member.
+        let (mut s, mut theirs) = wired();
+        let mut ui = Ui::new();
+        let mut outsider = repo_row("api-gateway", 0);
+        outsider.member = false;
+        handle(
+            Input::Daemon(DaemonEvent::Repos(vec![repo_row("billing", 1), outsider])),
+            &mut s,
+            &mut ui,
+        );
+        handle(
+            Input::Daemon(DaemonEvent::Sessions(vec![grove_proto::SessionRow {
+                id: grove_domain::SessionId("open".into()),
+                name: "current".into(),
+                members: vec![],
+                state: grove_domain::SessionState::Attached,
+                terminals: 0,
+                since: 0,
+                size: 0,
+            }])),
+            &mut s,
+            &mut ui,
+        );
+        let _ = sent(&mut theirs);
+
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('/')), &mut s, &mut ui);
+        for c in "new".chars() {
+            handle(key(KeyCode::Char(c)), &mut s, &mut ui);
+        }
+        handle(key(KeyCode::Enter), &mut s, &mut ui);
+        for c in "feat/split".chars() {
+            handle(key(KeyCode::Char(c)), &mut s, &mut ui);
+        }
+        // billing is checked as a member; check the outsider too.
+        handle(key(KeyCode::Down), &mut s, &mut ui);
+        handle(key(KeyCode::Char(' ')), &mut s, &mut ui);
+        assert_eq!(ui.palette.select().expect("a picker").count(), 2);
+
+        handle(key(KeyCode::Enter), &mut s, &mut ui);
+        let asked = sent(&mut theirs);
+        assert!(
+            asked.iter().any(|r| matches!(
+                r,
+                Request::AddMember { repo, .. } if repo.0 == "api-gateway"
+            )),
+            "the newcomer joins the session: {asked:?}"
+        );
+        match asked
+            .iter()
+            .find(|r| matches!(r, Request::NewWorktrees { .. }))
+        {
+            Some(Request::NewWorktrees { branch, repos, .. }) => {
+                assert_eq!(branch, "feat/split");
+                assert_eq!(repos.len(), 2, "one worktree per checked repo");
+            }
+            other => panic!("expected NewWorktrees, got {other:?}"),
+        }
+        assert_eq!(ui.screen, Screen::Dash, "it ran, so the palette closes");
+    }
+
+    #[test]
+    fn enter_with_nothing_checked_says_so_rather_than_creating_nothing() {
+        let (mut s, mut theirs) = wired();
+        let mut ui = Ui::new();
+        handle(
+            Input::Daemon(DaemonEvent::Repos(vec![repo_row("billing", 1)])),
+            &mut s,
+            &mut ui,
+        );
+        handle(
+            Input::Daemon(DaemonEvent::Sessions(vec![grove_proto::SessionRow {
+                id: grove_domain::SessionId("open".into()),
+                name: "current".into(),
+                members: vec![],
+                state: grove_domain::SessionState::Attached,
+                terminals: 0,
+                since: 0,
+                size: 0,
+            }])),
+            &mut s,
+            &mut ui,
+        );
+        let _ = sent(&mut theirs);
+
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('/')), &mut s, &mut ui);
+        for c in "new".chars() {
+            handle(key(KeyCode::Char(c)), &mut s, &mut ui);
+        }
+        handle(key(KeyCode::Enter), &mut s, &mut ui);
+        for c in "feat/x".chars() {
+            handle(key(KeyCode::Char(c)), &mut s, &mut ui);
+        }
+        // Uncheck the only member.
+        handle(key(KeyCode::Char(' ')), &mut s, &mut ui);
+        handle(key(KeyCode::Enter), &mut s, &mut ui);
+
         let note = ui.note.clone().expect("a reason");
-        assert!(note.contains("add"), "{note}");
-        assert!(sent(&mut theirs).is_empty(), "nothing may be sent for it");
-        assert_eq!(ui.screen, Screen::Palette, "the palette stays open");
+        assert!(note.contains("checked"), "{note}");
+        assert!(sent(&mut theirs).is_empty(), "nothing to create");
+        assert_eq!(ui.screen, Screen::Palette);
+    }
+
+    #[test]
+    fn a_branch_already_checked_out_offers_the_worktree_that_has_it() {
+        // Acceptance, and §7's flow: refusing and stopping would leave the
+        // user to go and find the worktree themselves.
+        let (mut s, mut theirs) = wired();
+        let mut ui = Ui::new();
+        handle(
+            Input::Daemon(DaemonEvent::Sessions(vec![grove_proto::SessionRow {
+                id: grove_domain::SessionId("open".into()),
+                name: "current".into(),
+                members: vec![],
+                state: grove_domain::SessionState::Attached,
+                terminals: 0,
+                since: 0,
+                size: 0,
+            }])),
+            &mut s,
+            &mut ui,
+        );
+        let _ = sent(&mut theirs);
+
+        let existing = grove_proto::WorktreeRef {
+            repo: grove_domain::RepoId("billing".into()),
+            branch: "feat/split".into(),
+        };
+        handle(
+            Input::Daemon(DaemonEvent::BranchCheckedOutElsewhere {
+                repo: grove_domain::RepoId("billing".into()),
+                branch: "feat/split".into(),
+                existing: existing.clone(),
+                existing_path: PathBuf::from("/w/other/feat-split"),
+            }),
+            &mut s,
+            &mut ui,
+        );
+        let note = ui.note.clone().expect("the offer");
+        assert!(note.contains("/w/other/feat-split"), "{note}");
+        assert!(note.contains("adopts"), "{note}");
+
+        // And the key it names takes over that worktree, not whatever the
+        // WORKTREES cursor happens to be on.
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('a')), &mut s, &mut ui);
+        let asked = sent(&mut theirs);
+        assert!(
+            asked.iter().any(|r| matches!(
+                r,
+                Request::AdoptWorktree { worktree, .. } if *worktree == existing
+            )),
+            "the offered worktree is the one adopted: {asked:?}"
+        );
+        assert!(ui.conflict.is_none(), "the offer is spent");
+    }
+
+    #[test]
+    fn esc_from_an_argument_goes_back_to_the_command_list() {
+        let (mut s, _theirs) = wired();
+        let mut ui = Ui::new();
+        handle(
+            Input::Daemon(DaemonEvent::Repos(vec![repo_row("billing", 1)])),
+            &mut s,
+            &mut ui,
+        );
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('/')), &mut s, &mut ui);
+        for c in "new".chars() {
+            handle(key(KeyCode::Char(c)), &mut s, &mut ui);
+        }
+        handle(key(KeyCode::Enter), &mut s, &mut ui);
+        assert!(ui.palette.arguing().is_some());
+
+        handle(key(KeyCode::Esc), &mut s, &mut ui);
+        assert!(ui.palette.arguing().is_none(), "back to choosing");
+        assert_eq!(ui.screen, Screen::Palette, "and still open");
+
+        handle(key(KeyCode::Esc), &mut s, &mut ui);
+        assert_eq!(ui.screen, Screen::Dash, "now it closes");
     }
 
     #[test]

@@ -113,11 +113,52 @@ pub const COMMANDS: &[Command] = &[
     },
 ];
 
+/// Which repositories a command's picker shows, if it has one.
+///
+/// A `match` on the command's own name rather than a flag on the row, so a
+/// command that grows a picker declares it in one place — and #33's Lua
+/// commands, which have no name known here, simply have none.
+pub fn picker_for(name: &str) -> Option<crate::select::Wants> {
+    use crate::select::Wants;
+    match name {
+        "new" => Some(Wants::AllReposMembersChecked),
+        "add" => Some(Wants::NonMembers),
+        "remove" => Some(Wants::Members),
+        _ => None,
+    }
+}
+
+/// What the palette is doing right now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Mode {
+    /// Choosing a command.
+    Choosing,
+    /// A command is chosen and its argument is being typed or picked. The
+    /// palette stops filtering commands here: `new feat/x` is a branch name
+    /// with a slash in it, not a fuzzy query.
+    Arguing {
+        command: &'static Command,
+        argument: String,
+        select: crate::select::Select,
+    },
+}
+
 /// The palette's state while it is open.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Palette {
     input: String,
     selected: usize,
+    mode: Mode,
+}
+
+impl Default for Palette {
+    fn default() -> Self {
+        Self {
+            input: String::new(),
+            selected: 0,
+            mode: Mode::Choosing,
+        }
+    }
 }
 
 impl Palette {
@@ -126,6 +167,73 @@ impl Palette {
     pub fn open(&mut self) {
         self.input.clear();
         self.selected = 0;
+        self.mode = Mode::Choosing;
+    }
+
+    /// Move into argument mode for `command`, building its picker from the
+    /// repositories the daemon last sent.
+    ///
+    /// Called when a command is chosen — by `enter` or by typing its name and
+    /// a space, which is how a command line behaves.
+    pub fn argue(&mut self, command: &'static Command, repos: &[grove_proto::RepoRow]) {
+        let select = match picker_for(command.name) {
+            Some(wants) => crate::select::Select::build(repos, wants),
+            None => crate::select::Select::default(),
+        };
+        // The line keeps the command name, because that is what a command line
+        // looks like: `new feat/x`, not a branch name floating on its own.
+        self.input = format!("{} ", command.name);
+        self.mode = Mode::Arguing {
+            command,
+            argument: String::new(),
+            select,
+        };
+    }
+
+    /// Back to choosing a command, keeping the palette open.
+    ///
+    /// `esc` in argument mode steps back rather than closing outright: the
+    /// user is one keystroke from the command they wanted, and closing would
+    /// make them retype it.
+    pub fn unargue(&mut self) -> bool {
+        if matches!(self.mode, Mode::Choosing) {
+            return false;
+        }
+        self.mode = Mode::Choosing;
+        self.input.clear();
+        self.selected = 0;
+        true
+    }
+
+    /// The argument typed so far, if any.
+    pub fn argument(&self) -> Option<&str> {
+        match &self.mode {
+            Mode::Choosing => None,
+            Mode::Arguing { argument, .. } => Some(argument),
+        }
+    }
+
+    /// The picker, while one is open.
+    pub fn select_mut(&mut self) -> Option<&mut crate::select::Select> {
+        match &mut self.mode {
+            Mode::Choosing => None,
+            Mode::Arguing { select, .. } => Some(select),
+        }
+    }
+
+    pub fn select(&self) -> Option<&crate::select::Select> {
+        match &self.mode {
+            Mode::Choosing => None,
+            Mode::Arguing { select, .. } => Some(select),
+        }
+    }
+
+    /// The command being argued, if any.
+    pub fn arguing(&self) -> Option<&'static Command> {
+        match &self.mode {
+            Mode::Choosing => None,
+            Mode::Arguing { command, .. } => Some(command),
+        }
     }
 
     /// What has been typed. The renderer reads the field directly; this is
@@ -136,8 +244,17 @@ impl Palette {
     }
 
     /// Add a typed character.
+    ///
+    /// In argument mode the character goes to the argument rather than to a
+    /// fuzzy query: `new feat/ABC-4471` is a branch name, and filtering the
+    /// command list by it would leave the palette empty and the user unsure
+    /// whether their typing landed.
     pub fn push(&mut self, c: char) {
         self.input.push(c);
+        if let Mode::Arguing { argument, .. } = &mut self.mode {
+            argument.push(c);
+            return;
+        }
         // The list under the cursor just changed, so the cursor means
         // something else now. Back to the top, which is the best match.
         self.selected = 0;
@@ -146,6 +263,17 @@ impl Palette {
     /// Remove the last character. Returns whether anything changed, so an
     /// empty palette does not redraw on every backspace.
     pub fn backspace(&mut self) -> bool {
+        if let Mode::Arguing { argument, .. } = &mut self.mode {
+            // Backspacing past the argument leaves the command name alone;
+            // `esc` is how you go back to choosing, and erasing into the name
+            // would leave the line saying something the mode does not agree
+            // with.
+            if argument.pop().is_some() {
+                self.input.pop();
+                return true;
+            }
+            return false;
+        }
         let changed = self.input.pop().is_some();
         if changed {
             self.selected = 0;
@@ -155,6 +283,10 @@ impl Palette {
 
     /// The commands matching what has been typed, best first.
     pub fn matches(&self) -> Vec<&'static Command> {
+        if matches!(self.mode, Mode::Arguing { .. }) {
+            // Not a command list any more.
+            return Vec::new();
+        }
         if self.input.is_empty() {
             // Nothing typed lists everything, in SPEC §5's order.
             return COMMANDS.iter().collect();
@@ -207,6 +339,60 @@ impl Palette {
             // look like one, and the terminal's own cursor is elsewhere.
             Span::styled("▏", theme.style(Role::Accent)),
         ])];
+
+        // Argument mode draws the picker where the command list was, with the
+        // footer §4.2 shows: what space does, what enter will create, and the
+        // live count that makes "enter create 3" a promise rather than a
+        // guess.
+        if let Mode::Arguing {
+            command, select, ..
+        } = &self.mode
+        {
+            if let Takes::Argument(what) = command.takes
+                && self.argument().is_some_and(str::is_empty)
+            {
+                lines.push(Line::styled(format!("  {what}"), theme.style(Role::Muted)));
+            }
+            if select.is_empty() {
+                lines.push(Line::styled(
+                    "  no repos to choose from",
+                    theme.style(Role::Muted),
+                ));
+            }
+            let room = usize::from(area.height).saturating_sub(2);
+            for (index, row) in select.rows().iter().take(room).enumerate() {
+                let here = index == select.cursor();
+                let mark = if row.checked { "[x]" } else { "[ ]" };
+                let style = if here {
+                    theme.style(Role::Accent).add_modifier(Modifier::BOLD)
+                } else if row.checked {
+                    theme.style(Role::Clean)
+                } else {
+                    theme.style(Role::Muted)
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(if here { "❯ " } else { "  " }, theme.style(Role::Accent)),
+                    Span::styled(mark, style),
+                    Span::raw(" "),
+                    Span::styled(row.name.clone(), style),
+                    Span::raw("  "),
+                    Span::styled(
+                        if row.member { "member" } else { "workspace" },
+                        theme.style(Role::Muted),
+                    ),
+                ]));
+            }
+            lines.push(Line::styled(
+                format!(
+                    "  space toggle · enter {} {} · esc back",
+                    command.name,
+                    select.count()
+                ),
+                theme.style(Role::Muted),
+            ));
+            Paragraph::new(lines).render(area, buf);
+            return;
+        }
 
         let matches = self.matches();
         if matches.is_empty() {
@@ -472,6 +658,108 @@ mod tests {
                 command.name
             );
         }
+    }
+
+    fn repo(name: &str, member: bool) -> grove_proto::RepoRow {
+        grove_proto::RepoRow {
+            repo: grove_domain::RepoId(name.into()),
+            name: name.into(),
+            base_branch: "origin/main".into(),
+            base_from_origin_head: true,
+            worktrees: 0,
+            dirty: false,
+            member,
+        }
+    }
+
+    fn arguing(command: &str, repos: &[grove_proto::RepoRow]) -> Palette {
+        let chosen = COMMANDS
+            .iter()
+            .find(|c| c.name == command)
+            .expect("a command");
+        let mut palette = Palette::default();
+        palette.argue(chosen, repos);
+        palette
+    }
+
+    #[test]
+    fn typing_an_argument_is_not_a_fuzzy_query() {
+        // `new feat/ABC-4471` is a branch name. Filtering the command list by
+        // it would empty the palette and leave the user unsure whether their
+        // typing landed anywhere.
+        let mut palette = arguing("new", &[repo("a", true)]);
+        for c in "feat/ABC-4471".chars() {
+            palette.push(c);
+        }
+        assert_eq!(palette.argument(), Some("feat/ABC-4471"));
+        assert_eq!(palette.input(), "new feat/ABC-4471");
+        assert!(
+            palette.matches().is_empty(),
+            "the command list is not what is being chosen any more"
+        );
+    }
+
+    #[test]
+    fn backspace_erases_the_argument_and_stops_at_the_command() {
+        // Erasing into the command name would leave the line saying something
+        // the mode does not agree with; `esc` is how you go back.
+        let mut palette = arguing("new", &[]);
+        for c in "ab".chars() {
+            palette.push(c);
+        }
+        assert!(palette.backspace());
+        assert_eq!(palette.argument(), Some("a"));
+        assert!(palette.backspace());
+        assert!(!palette.backspace(), "the command name is not erasable");
+        assert_eq!(palette.input(), "new ");
+    }
+
+    #[test]
+    fn esc_in_argument_mode_steps_back_rather_than_closing() {
+        // The user is one keystroke from the command they wanted. Closing
+        // would make them type it again.
+        let mut palette = arguing("new", &[]);
+        assert!(palette.unargue());
+        assert_eq!(palette.input(), "");
+        assert!(!palette.matches().is_empty(), "back to choosing");
+        assert!(!palette.unargue(), "and there is nowhere further back");
+    }
+
+    #[test]
+    fn only_the_commands_that_pick_repos_get_a_picker() {
+        assert!(picker_for("new").is_some());
+        assert!(picker_for("add").is_some());
+        assert!(picker_for("remove").is_some());
+        // `session new` takes a name, not a list of repos.
+        assert!(picker_for("session new").is_none());
+        assert!(picker_for("scan").is_none());
+    }
+
+    #[test]
+    fn the_footer_counts_what_enter_will_do() {
+        // §4.2's "enter create 3". The count is live, so it is a promise
+        // rather than a guess.
+        let palette = arguing("new", &[repo("a", true), repo("b", true), repo("c", false)]);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 70,
+            height: 10,
+        };
+        let mut buf = Buffer::empty(area);
+        palette.render(&mut buf, area, &theme());
+        let painted: String = (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(painted.contains("[x] a"), "{painted}");
+        assert!(painted.contains("[ ] c"), "{painted}");
+        assert!(painted.contains("workspace"), "non-members are reachable");
+        assert!(painted.contains("enter new 2"), "{painted}");
     }
 
     #[test]
