@@ -354,7 +354,15 @@ const PALETTE: &[Binding] = &[
 /// session picker from inside the diff, but a footer that says so is teaching
 /// a key the reader is not there to learn. The mock draws it the same way.
 pub fn bar_bindings(screen: Screen) -> impl Iterator<Item = &'static Binding> {
-    let global: &[Binding] = if screen == Screen::Dash { GLOBAL } else { &[] };
+    // The scratch shell has no bindings of its own — every unprefixed key
+    // belongs to the program inside it — so the globals are the only keys
+    // there are, and leaving them off would leave that screen with no way out
+    // written down anywhere.
+    let global: &[Binding] = if matches!(screen, Screen::Dash | Screen::Shell) {
+        GLOBAL
+    } else {
+        &[]
+    };
     local_bindings(screen)
         .iter()
         .chain(global.iter())

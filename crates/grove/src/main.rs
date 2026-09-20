@@ -61,7 +61,7 @@ use ratatui::widgets::{Block, Borders, Padding, Paragraph, Wrap};
 use repos::Repos;
 use sessions::Sessions;
 use terminals::Terminals;
-use theme::{Depth, Role, Theme};
+use theme::{Depth, Ink, Role, Theme};
 use userkeys::UserKeys;
 use worktrees::{Intent, Worktrees};
 
@@ -1891,23 +1891,71 @@ fn draw(f: &mut ratatui::Frame, state: &State, ui: &Ui) {
     }
 
     if matches!(state, State::Connected { .. }) && ui.screen == Screen::Diff {
-        ui.diff.render(f.buffer_mut(), body_area, &ui.theme);
+        draw_dash(f, body_area, ui);
+        let parts = overlay(
+            f,
+            body_area,
+            ui,
+            ui.theme.style(Role::Accent),
+            tall(body_area),
+            ui.diff.footer(),
+        );
+        ui.diff.render(f.buffer_mut(), parts, &ui.theme);
         status_bar(f, bar_area, ui);
         return;
     }
 
     if matches!(state, State::Connected { .. }) && ui.screen == Screen::Shell {
-        // The whole body: it is a terminal, not a pane, and §4.5 gives it the
-        // screen rather than a corner of one.
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(ui.theme.border())
-            .border_style(ui.theme.style(Role::Muted))
-            .title(Span::styled(" scratch ", ui.theme.style(Role::Accent)));
-        let inner = block.inner(body_area);
-        f.render_widget(block, body_area);
-        ui.terminals
-            .render(f.buffer_mut(), inner, &ui.theme, ui.scratch.is_some());
+        // An overlay like the rest, not a full-screen box: §4.5 gives the
+        // scratch shell the screen rather than a corner of one, and the mock
+        // does that by making it the tallest of the overlays rather than by
+        // taking the frame.
+        draw_dash(f, body_area, ui);
+        let parts = overlay(
+            f,
+            body_area,
+            ui,
+            ui.theme.style(Role::Accent),
+            tall(body_area),
+            statusbar::hints(Screen::Shell),
+        );
+        // The mock heads it with what it is and where it is: a shell, attached
+        // to nothing, in the directory the daemon started it in.
+        f.render_widget(
+            Paragraph::new(overlay::header(
+                "shell",
+                "scratch · not attached to a worktree",
+                "",
+                parts.header.width,
+                &ui.theme,
+            )),
+            parts.header,
+        );
+        // §3.1's rule, said out loud on the one screen where it bites: every
+        // key here goes to the shell, so the way back has to be written down.
+        // The mock says it in the same place the picker says its warning.
+        let note = Rect {
+            y: parts.body.bottom().saturating_sub(1),
+            height: 1,
+            ..parts.body
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("keys go to the shell — ", ui.theme.ink_style(Ink::Faint)),
+                Span::styled("^g", ui.theme.style(Role::Accent)),
+                Span::styled(" returns to grove", ui.theme.ink_style(Ink::Faint)),
+            ])),
+            note,
+        );
+        ui.terminals.render(
+            f.buffer_mut(),
+            Rect {
+                height: parts.body.height.saturating_sub(2),
+                ..parts.body
+            },
+            &ui.theme,
+            ui.scratch.is_some(),
+        );
         status_bar(f, bar_area, ui);
         return;
     }
@@ -2059,6 +2107,16 @@ fn bytes(n: u64) -> String {
 /// drawing them into the WORKTREES pane fitted them into twenty-odd columns
 /// and truncated every summary, which is how the palette shipped until a test
 /// painted it at a real size.
+/// Rows for an overlay that wants to be tall rather than to fit its contents.
+///
+/// The diff and the scratch shell are the two whose contents are unbounded —
+/// a patch and a pty — so the mock gives them a fixed box, three-quarters of
+/// the window, rather than `fit-content`. The rest stays visible around it,
+/// which is the point of their being overlays at all.
+fn tall(body: Rect) -> u16 {
+    (body.height * 3 / 4).saturating_sub(6).max(1)
+}
+
 /// Draw the three panes and their contents.
 ///
 /// Separate from `draw` because the overlays sit *over* it: the mock washes
