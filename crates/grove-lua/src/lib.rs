@@ -311,6 +311,12 @@ pub struct DaemonConfig {
     /// optional `{path}` placeholder; empty when neither the config nor
     /// `$EDITOR` names one, which makes the open request report instead of
     /// spawn.
+    ///
+    /// The string is split on whitespace with no quoting rule, so a program
+    /// path containing spaces cannot be expressed directly — a macOS `.app`
+    /// bundle, say — and needs a wrapper script. The daemon gives the editor
+    /// no terminal; a tty editor exits silently, so this must name a
+    /// graphical editor or a command that does not need one (SPEC §10).
     pub editor: String,
     /// Starting directory for the standalone scratch terminal.
     pub scratch_cwd: String,
