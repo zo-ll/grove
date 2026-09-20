@@ -6,9 +6,11 @@
 //! like a state rather than like an error or an empty row.
 //!
 //! Three columns: a dot for worktree presence and dirtiness, the repo name,
-//! and the number of branched worktrees with the clone excluded. The count is
-//! `·` rather than `0` for the same reason: zero is a number the user did
-//! something to reach, and `·` reads as "nothing here yet".
+//! and the branched-worktree count. The count arrives already correct — the
+//! clone is excluded by [`grove_proto::RepoRow`]'s contract, not by anything
+//! here — so a zero means the member has nothing branched. It renders as `·`
+//! rather than `0` for the reason the state exists: zero is a number someone
+//! did something to reach, and `·` reads as "nothing here yet".
 
 use grove_proto::RepoRow;
 use ratatui::buffer::Buffer;
@@ -16,6 +18,7 @@ use ratatui::layout::Rect;
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
+use unicode_width::UnicodeWidthStr;
 
 use crate::theme::{Role, Theme};
 
@@ -137,10 +140,10 @@ impl Repos {
         // Dot, space, name, space, count — the name is what gives way when the
         // pane is narrow, because the other two are one column each and losing
         // either costs a whole signal.
-        let fixed = 1 + 1 + 1 + count.chars().count();
+        let fixed = 1 + 1 + 1 + count.width();
         let room = (width as usize).saturating_sub(fixed);
         let name = truncate(&row.name, room);
-        let padding = room.saturating_sub(name.chars().count());
+        let padding = room.saturating_sub(name.width());
 
         let name_style = if selected {
             theme.style(Role::Accent).add_modifier(Modifier::BOLD)
@@ -158,23 +161,37 @@ impl Repos {
     }
 }
 
-/// Shorten a name to `room` columns, ending in `…` when it does not fit.
+/// Shorten a name to `room` **display columns**, ending in `…` when it does
+/// not fit.
 ///
-/// Counts characters rather than display columns. Repo names come from
-/// directory names, which are overwhelmingly ASCII; a wide character would
-/// make this one column optimistic, and the alternative is a dependency for
-/// the width table. Worth revisiting if a repo ever renders wrong.
+/// Columns, not characters. A repo name is a directory name and so usually
+/// ASCII, where the two agree — but a CJK name is two columns per character,
+/// and counting characters would let the name overrun the pane and push the
+/// count off the edge. `unicode-width` is already in the graph under ratatui,
+/// so this costs a direct dependency rather than a new one. The same
+/// arithmetic serves branch names in #20.
 fn truncate(name: &str, room: usize) -> String {
     if room == 0 {
         return String::new();
     }
-    if name.chars().count() <= room {
+    if name.width() <= room {
         return name.to_owned();
     }
-    if room == 1 {
+    if room < 2 {
+        // No room for a character and the ellipsis both.
         return ELLIPSIS.to_owned();
     }
-    let kept: String = name.chars().take(room - 1).collect();
+    let budget = room - ELLIPSIS.width();
+    let mut kept = String::new();
+    let mut used = 0usize;
+    for ch in name.chars() {
+        let w = ch.to_string().width();
+        if used + w > budget {
+            break;
+        }
+        kept.push(ch);
+        used += w;
+    }
     format!("{kept}{ELLIPSIS}")
 }
 
@@ -291,6 +308,22 @@ mod tests {
                 "expected an ellipsis: {rendered:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_wide_name_is_measured_in_columns_not_characters() {
+        // Four characters, eight columns. Counting characters would call this
+        // a fit at six and overrun the pane by two.
+        let wide = "課題管理";
+        assert_eq!(wide.width(), 8);
+        assert_eq!(truncate(wide, 8), wide);
+        let clipped = truncate(wide, 6);
+        assert!(
+            clipped.width() <= 6,
+            "{clipped:?} is {} columns",
+            clipped.width()
+        );
+        assert!(clipped.ends_with(ELLIPSIS));
     }
 
     #[test]

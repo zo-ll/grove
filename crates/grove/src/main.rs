@@ -232,12 +232,25 @@ fn handle(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
                 }
                 // The arrows drive whichever list has focus — the point of
                 // focus being functional rather than decorative.
-                Routed::Act(Action::MoveDown) if ui.focus == Focus::Repos => Flow::Continue {
-                    redraw: ui.repos.move_down(),
-                },
-                Routed::Act(Action::MoveUp) if ui.focus == Focus::Repos => Flow::Continue {
-                    redraw: ui.repos.move_up(),
-                },
+                // Which list the arrows drive is a question about the screen
+                // and the layout, not only about focus — see
+                // `dash::list_under_arrows`.
+                Routed::Act(Action::MoveDown)
+                    if dash::list_under_arrows(ui.screen, ui.focus, ui.panes, ui.width)
+                        == Some(Focus::Repos) =>
+                {
+                    Flow::Continue {
+                        redraw: ui.repos.move_down(),
+                    }
+                }
+                Routed::Act(Action::MoveUp)
+                    if dash::list_under_arrows(ui.screen, ui.focus, ui.panes, ui.width)
+                        == Some(Focus::Repos) =>
+                {
+                    Flow::Continue {
+                        redraw: ui.repos.move_up(),
+                    }
+                }
                 Routed::Act(Action::TogglePane(index)) => {
                     let Some(pane) = Panes::addressed(index) else {
                         return Flow::Continue { redraw: false };
@@ -742,6 +755,29 @@ mod tests {
             ui.repos.selected().map(|r| r.name.as_str()),
             Some("b"),
             "an arrow in another pane must not move this list"
+        );
+    }
+
+    #[test]
+    fn an_arrow_in_an_overlay_leaves_the_dash_lists_alone() {
+        // End to end through `handle`, because the gate is only worth having
+        // where the key actually arrives: with the picker open, focus still
+        // says REPOS, and the list must not move behind it.
+        let mut s = connected();
+        let mut ui = Ui::new();
+        handle(
+            Input::Daemon(DaemonEvent::Repos(vec![repo_row("a", 1), repo_row("b", 1)])),
+            &mut s,
+            &mut ui,
+        );
+        ui.focus = Focus::Repos;
+        ui.screen = Screen::Picker;
+
+        handle(key(KeyCode::Down), &mut s, &mut ui);
+        assert_eq!(
+            ui.repos.selected().map(|r| r.name.as_str()),
+            Some("a"),
+            "an overlay owns the keyboard; the list behind it must not scroll"
         );
     }
 

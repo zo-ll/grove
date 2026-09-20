@@ -19,7 +19,7 @@ use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Widget};
 
-use crate::keymap::Focus;
+use crate::keymap::{Focus, Screen};
 use crate::theme::{Role, Theme};
 
 /// A pane is identified by the focus it would hold.
@@ -330,6 +330,30 @@ fn placeholder(pane: Pane) -> &'static str {
         Focus::Repos => "repos land in #19",
         Focus::Worktrees => "worktrees land in #20",
         Focus::Terminal => "the pty lands in #21",
+    }
+}
+
+/// Which dash list the arrows are driving, if any.
+///
+/// Three conditions, and each one has already been a bug once. The screen must
+/// be the dash, because an overlay owns the keyboard while it is open and
+/// focus still holds whichever pane was selected behind it — the same mistake
+/// as the keymap's, one layer up: without this, `↓` in the session picker
+/// scrolls the REPOS list nobody can see. The pane must be one that holds a
+/// list, since the terminal takes keys rather than a cursor. And it must be
+/// drawable at the current width, because a pane the dash dropped is not on
+/// screen however the toggles are set.
+pub fn list_under_arrows(screen: Screen, focus: Pane, panes: Panes, width: u16) -> Option<Pane> {
+    if screen != Screen::Dash {
+        return None;
+    }
+    if !panes.drawable(width).visible(focus) {
+        return None;
+    }
+    match focus {
+        Focus::Repos | Focus::Worktrees => Some(focus),
+        // The terminal is a pty: its keys go to the program, not to a cursor.
+        Focus::Terminal => None,
     }
 }
 
@@ -718,6 +742,57 @@ mod tests {
             "a hidden pane must not be painted: {painted}"
         );
         assert!(painted.contains("WORKTREES"));
+    }
+
+    #[test]
+    fn an_overlay_takes_the_arrows_away_from_the_dash_lists() {
+        // The review's medium, and the same class as the keymap's M4 one layer
+        // up: focus still holds a dash pane while an overlay is open, so
+        // asking focus alone scrolls a list behind the picker.
+        for screen in [
+            Screen::Palette,
+            Screen::Picker,
+            Screen::Diff,
+            Screen::Shell,
+            Screen::EndSession,
+        ] {
+            assert_eq!(
+                list_under_arrows(screen, Focus::Repos, Panes::default(), 200),
+                None,
+                "{screen:?} owns the keyboard while it is open"
+            );
+        }
+        assert_eq!(
+            list_under_arrows(Screen::Dash, Focus::Repos, Panes::default(), 200),
+            Some(Focus::Repos)
+        );
+    }
+
+    #[test]
+    fn the_terminal_pane_has_no_cursor_for_the_arrows_to_move() {
+        // It is a pty: `↓` belongs to the program inside it.
+        assert_eq!(
+            list_under_arrows(Screen::Dash, Focus::Terminal, Panes::default(), 200),
+            None
+        );
+    }
+
+    #[test]
+    fn a_pane_that_is_not_drawn_does_not_take_the_arrows() {
+        // Whether by toggle or by width — both are "not on screen", and the
+        // arrows must not drive either.
+        let mut hidden = Panes::default();
+        assert!(hidden.toggle(Focus::Repos));
+        assert_eq!(
+            list_under_arrows(Screen::Dash, Focus::Repos, hidden, 200),
+            None,
+            "a hidden pane"
+        );
+        assert_eq!(
+            list_under_arrows(Screen::Dash, Focus::Terminal, Panes::default(), 40),
+            None,
+            "a pane too narrow to draw"
+        );
     }
 
     #[test]

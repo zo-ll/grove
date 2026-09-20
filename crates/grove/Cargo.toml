@@ -13,5 +13,9 @@ workspace = true
 grove-domain = { workspace = true }
 grove-proto = { workspace = true }
 ratatui = "0.30"
+# Already in the graph under ratatui; taken directly because a repo or branch
+# name is user data and may be any width, and a truncation that counts
+# characters clips a CJK name a column short.
+unicode-width = "0.2"
 signal-hook = "0.3"
 grove-lua = { workspace = true }
