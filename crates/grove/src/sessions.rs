@@ -63,6 +63,20 @@ impl Sessions {
             .min(self.rows.len().saturating_sub(1));
     }
 
+    /// Take one session's row, replacing what was known about it.
+    ///
+    /// The daemon reports a single session changing far more often than it
+    /// reports the whole list, and until this existed those events were
+    /// dropped: the session the user had just created was not in the list, so
+    /// the status bar named it by its id — `session: 18d72b99d427b674-0` for
+    /// a session called "invoice split".
+    pub fn upsert(&mut self, row: SessionRow) {
+        match self.rows.iter_mut().find(|known| known.id == row.id) {
+            Some(known) => *known = row,
+            None => self.rows.push(row),
+        }
+    }
+
     /// A session by the name a script would know it as.
     pub fn by_name(&self, name: &str) -> Option<&SessionRow> {
         self.rows.iter().find(|row| row.name == name)

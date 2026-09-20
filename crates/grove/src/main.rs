@@ -1395,6 +1395,9 @@ fn handle(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
         // so a stale answer here adopts into the wrong one — which is worse
         // than the status line this event used to produce.
         Input::Daemon(DaemonEvent::SessionChanged(row)) => {
+            // Keep the row, not just the id: the bar names the open session,
+            // the picker lists it, and both need more than an id to do it.
+            ui.sessions.upsert(row.clone());
             match row.state {
                 grove_domain::SessionState::Attached => ui.session = Some(row.id.clone()),
                 // The session we were in stopped being open. Forgetting it is
@@ -3186,6 +3189,30 @@ mod tests {
             screen.contains("point grove at your clones"),
             "the guidance must not be cut off: {screen}"
         );
+    }
+
+    #[test]
+    fn the_bar_names_a_session_the_moment_it_exists() {
+        // It said `session: 18d72b99d427b674-0` for a session called "invoice
+        // split": the id is the fallback for a session the TUI knows nothing
+        // else about, and a freshly created one was exactly that — the event
+        // that announced it carried the name and was thrown away.
+        let mut s = connected();
+        let mut ui = Ui::new();
+        handle(
+            Input::Daemon(DaemonEvent::SessionChanged(grove_proto::SessionRow {
+                id: grove_domain::SessionId("18d72b99d427b674-0".into()),
+                name: "invoice split".into(),
+                members: vec![],
+                state: grove_domain::SessionState::Attached,
+                terminals: 0,
+                since: 0,
+                size: 0,
+            })),
+            &mut s,
+            &mut ui,
+        );
+        assert_eq!(ui.session_name(), "session: invoice split");
     }
 
     #[test]
