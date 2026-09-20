@@ -246,7 +246,20 @@ impl Palette {
     }
 
     /// The picker, while one is open.
+    /// Whether there is a list of repositories to tick.
+    ///
+    /// Not the same as "an argument is being collected": `session new` takes
+    /// a name and `new` takes a branch *and* a set of repos. Everything that
+    /// treats space as a toggle, counts what `enter` will do, or draws a row
+    /// of checkboxes has to ask this rather than assume.
+    pub fn picking(&self) -> bool {
+        matches!(&self.mode, Mode::Arguing { command, .. } if picker_for(&command.name).is_some())
+    }
+
     pub fn select_mut(&mut self) -> Option<&mut crate::select::Select> {
+        if !self.picking() {
+            return None;
+        }
         match &mut self.mode {
             Mode::Choosing => None,
             Mode::Arguing { select, .. } => Some(select),
@@ -254,6 +267,9 @@ impl Palette {
     }
 
     pub fn select(&self) -> Option<&crate::select::Select> {
+        if !self.picking() {
+            return None;
+        }
         match &self.mode {
             Mode::Choosing => None,
             Mode::Arguing { select, .. } => Some(select),
@@ -388,11 +404,7 @@ impl Palette {
         // `space` is only ever a toggle while there is something to tick:
         // nothing on the command list, where it types a space, and nothing on
         // a command that takes a name.
-        let picking = matches!(
-            &self.mode,
-            Mode::Arguing { command, .. } if picker_for(&command.name).is_some()
-        );
-        hints.retain(|hint| picking || hint.label != "toggle");
+        hints.retain(|hint| self.picking() || hint.label != "toggle");
         if let Mode::Arguing {
             command, select, ..
         } = &self.mode
