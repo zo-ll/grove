@@ -13,10 +13,11 @@
 //!   a hidden pane leaves the arrow keys driving a list that is not on screen,
 //!   and hiding the focused pane has to move focus rather than orphan it.
 
+use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Widget};
+use ratatui::widgets::{Block, Borders, Widget};
 
 use crate::keymap::Focus;
 use crate::theme::{Role, Theme};
@@ -332,20 +333,23 @@ fn placeholder(pane: Pane) -> &'static str {
     }
 }
 
-/// Draw the frame.
+/// Draw the frame and return the area inside each pane's border.
+///
+/// The frame is this module's; what goes in the areas it returns belongs to
+/// the panes themselves — #19, #20 and #21. Returning the inner rects rather
+/// than taking the contents as an argument keeps that split honest: this
+/// module never learns what a repo is.
 ///
 /// The focused pane is drawn in the accent colour and bold, everything else
-/// muted. That is the whole focus indicator, and it has to survive the theme
-/// degrading to sixteen colours — which is why it is a colour *and* a weight
-/// rather than a colour alone.
-pub fn render(
-    buf: &mut ratatui::buffer::Buffer,
-    area: Rect,
-    panes: Panes,
-    focus: Pane,
-    theme: &Theme,
-) {
+/// muted. That is the whole focus indicator, and it is a colour *and* a weight
+/// because colour alone disappears on a terminal that has themed its palette.
+pub fn render(buf: &mut Buffer, area: Rect, panes: Panes, focus: Pane, theme: &Theme) -> Areas {
     let areas = split(area, panes);
+    let mut inner = Areas {
+        repos: None,
+        worktrees: None,
+        terminal: None,
+    };
     for pane in [Focus::Repos, Focus::Worktrees, Focus::Terminal] {
         let Some(rect) = areas.of(pane) else {
             continue;
@@ -361,11 +365,23 @@ pub fn render(
             .border_type(theme.border())
             .border_style(style)
             .title(Span::styled(title(pane), style));
-        let inner = block.inner(rect);
+        let within = block.inner(rect);
         block.render(rect, buf);
-        Paragraph::new(Line::styled(placeholder(pane), theme.style(Role::Muted)))
-            .render(inner, buf);
+        match pane {
+            Focus::Repos => inner.repos = Some(within),
+            Focus::Worktrees => inner.worktrees = Some(within),
+            Focus::Terminal => inner.terminal = Some(within),
+        }
     }
+    inner
+}
+
+/// What a pane says while the issue that fills it is still open.
+///
+/// Drawn by the caller into the area `render` hands back, so it disappears
+/// one pane at a time as #19 through #21 land rather than all at once.
+pub fn placeholder_line(pane: Pane, theme: &Theme) -> Line<'static> {
+    Line::styled(placeholder(pane), theme.style(Role::Muted))
 }
 
 #[cfg(test)]
@@ -630,7 +646,7 @@ mod tests {
     }
 
     /// The style of the cell at a pane's top-left corner — its border.
-    fn corner(buf: &ratatui::buffer::Buffer, rect: Rect) -> ratatui::style::Style {
+    fn corner(buf: &Buffer, rect: Rect) -> ratatui::style::Style {
         buf[(rect.x, rect.y)].style()
     }
 
@@ -640,8 +656,8 @@ mod tests {
         // signals are checked because colour alone disappears on a terminal
         // that themes its palette, and weight alone is subtle at a glance.
         let theme = theme();
-        let mut buf = ratatui::buffer::Buffer::empty(NARROW);
-        render(&mut buf, NARROW, Panes::default(), Focus::Worktrees, &theme);
+        let mut buf = Buffer::empty(NARROW);
+        let _ = render(&mut buf, NARROW, Panes::default(), Focus::Worktrees, &theme);
 
         let areas = split(NARROW, Panes::default());
         let focused = corner(&buf, areas.worktrees.expect("visible"));
@@ -663,8 +679,8 @@ mod tests {
         let theme = theme();
         let areas = split(NARROW, Panes::default());
         for focus in [Focus::Repos, Focus::Worktrees, Focus::Terminal] {
-            let mut buf = ratatui::buffer::Buffer::empty(NARROW);
-            render(&mut buf, NARROW, Panes::default(), focus, &theme);
+            let mut buf = Buffer::empty(NARROW);
+            let _ = render(&mut buf, NARROW, Panes::default(), focus, &theme);
             for pane in [Focus::Repos, Focus::Worktrees, Focus::Terminal] {
                 let style = corner(&buf, areas.of(pane).expect("visible"));
                 let expected = if pane == focus {
@@ -689,8 +705,8 @@ mod tests {
         let theme = theme();
         let mut panes = Panes::default();
         assert!(panes.toggle(Focus::Repos));
-        let mut buf = ratatui::buffer::Buffer::empty(NARROW);
-        render(&mut buf, NARROW, panes, Focus::Worktrees, &theme);
+        let mut buf = Buffer::empty(NARROW);
+        let _ = render(&mut buf, NARROW, panes, Focus::Worktrees, &theme);
 
         let worktrees = split(NARROW, panes).worktrees.expect("visible");
         assert_eq!(worktrees.x, 0, "WORKTREES takes the left edge");

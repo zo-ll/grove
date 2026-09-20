@@ -12,6 +12,7 @@
 mod dash;
 mod events;
 mod keymap;
+mod repos;
 mod statusbar;
 mod terminal;
 mod theme;
@@ -35,6 +36,7 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Padding, Paragraph, Wrap};
+use repos::Repos;
 use theme::{Depth, Role, Theme};
 
 /// What the shell is currently able to show. Screens replace this in #18-#30;
@@ -48,6 +50,9 @@ struct Ui {
     /// Which dash panes are on screen. Focus is kept consistent with this:
     /// see `Panes::refocus`.
     panes: Panes,
+    /// The session's member repos and the cursor in them, which is what the
+    /// WORKTREES pane will follow in #20.
+    repos: Repos,
     /// The terminal's current width, because whether a pane is on screen
     /// depends on it: below a certain width the dash drops panes it cannot
     /// draw, and focus must not cycle onto one of those.
@@ -82,6 +87,7 @@ impl Ui {
             focus: Focus::Worktrees,
             router: Router::new(),
             panes: Panes::default(),
+            repos: Repos::default(),
             width: 80,
             theme,
             config_note: (!notes.is_empty()).then(|| notes.join("; ")),
@@ -224,6 +230,14 @@ fn handle(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
                     ui.focus = ui.panes.drawable(ui.width).previous_visible(ui.focus);
                     Flow::Continue { redraw: true }
                 }
+                // The arrows drive whichever list has focus — the point of
+                // focus being functional rather than decorative.
+                Routed::Act(Action::MoveDown) if ui.focus == Focus::Repos => Flow::Continue {
+                    redraw: ui.repos.move_down(),
+                },
+                Routed::Act(Action::MoveUp) if ui.focus == Focus::Repos => Flow::Continue {
+                    redraw: ui.repos.move_up(),
+                },
                 Routed::Act(Action::TogglePane(index)) => {
                     let Some(pane) = Panes::addressed(index) else {
                         return Flow::Continue { redraw: false };
@@ -265,6 +279,14 @@ fn handle(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
             Flow::Continue { redraw: false }
         }
         Input::Terminal(_) => Flow::Continue { redraw: false },
+
+        // The REPOS pane's data. Kept ahead of the catch-all below because
+        // that one only narrates the event on the status line, which for a
+        // list of repos would say a lot and show nothing.
+        Input::Daemon(DaemonEvent::Repos(rows)) => {
+            ui.repos.set(rows);
+            Flow::Continue { redraw: true }
+        }
 
         Input::Daemon(ev) => {
             if let State::Connected { note, .. } = state {
@@ -388,7 +410,24 @@ fn draw(f: &mut ratatui::Frame, state: &State, ui: &Ui) {
     // are not screens and #22's empty state is about a workspace with nothing
     // in it, not about a daemon grove cannot reach.
     if matches!(state, State::Connected { .. }) && ui.screen == Screen::Dash {
-        dash::render(f.buffer_mut(), body_area, ui.panes, ui.focus, &ui.theme);
+        let inner = dash::render(f.buffer_mut(), body_area, ui.panes, ui.focus, &ui.theme);
+        if let Some(area) = inner.repos {
+            ui.repos
+                .render(f.buffer_mut(), area, &ui.theme, ui.focus == Focus::Repos);
+        }
+        // #20 and #21 fill these; until then each says so in its own pane
+        // rather than the dash claiming to be finished.
+        for (pane, area) in [
+            (Focus::Worktrees, inner.worktrees),
+            (Focus::Terminal, inner.terminal),
+        ] {
+            if let Some(area) = area {
+                f.render_widget(
+                    Paragraph::new(dash::placeholder_line(pane, &ui.theme)),
+                    area,
+                );
+            }
+        }
         status_bar(f, bar_area, ui);
         return;
     }
@@ -649,6 +688,79 @@ mod tests {
             ui.panes.drawable(ui.width).visible(ui.focus),
             "focus must land somewhere that fits"
         );
+    }
+
+    fn repo_row(name: &str, worktrees: u32) -> grove_proto::RepoRow {
+        grove_proto::RepoRow {
+            repo: grove_domain::RepoId(name.into()),
+            name: name.into(),
+            base_branch: "origin/main".into(),
+            base_from_origin_head: true,
+            worktrees,
+            dirty: false,
+            member: true,
+        }
+    }
+
+    #[test]
+    fn the_repos_event_fills_the_pane() {
+        // The pane's data arrives over the protocol like everything else, and
+        // before this arm existed it was narrated onto the status line — a
+        // sentence about repos instead of a list of them.
+        let mut s = connected();
+        let mut ui = Ui::new();
+        handle(
+            Input::Daemon(DaemonEvent::Repos(vec![repo_row("a", 1), repo_row("b", 0)])),
+            &mut s,
+            &mut ui,
+        );
+        assert_eq!(ui.repos.rows().len(), 2);
+        assert_eq!(ui.repos.selected().map(|r| r.name.as_str()), Some("a"));
+    }
+
+    #[test]
+    fn arrows_drive_the_focused_list_and_nothing_else() {
+        // Focus is functional: the same key has to move the list that has it
+        // and leave the others alone. The source mock drew a focus ring and
+        // always moved the worktree list, which is the bug `Focus` exists to
+        // prevent.
+        let mut s = connected();
+        let mut ui = Ui::new();
+        handle(
+            Input::Daemon(DaemonEvent::Repos(vec![repo_row("a", 1), repo_row("b", 1)])),
+            &mut s,
+            &mut ui,
+        );
+
+        ui.focus = Focus::Repos;
+        handle(key(KeyCode::Down), &mut s, &mut ui);
+        assert_eq!(ui.repos.selected().map(|r| r.name.as_str()), Some("b"));
+
+        ui.focus = Focus::Worktrees;
+        handle(key(KeyCode::Up), &mut s, &mut ui);
+        assert_eq!(
+            ui.repos.selected().map(|r| r.name.as_str()),
+            Some("b"),
+            "an arrow in another pane must not move this list"
+        );
+    }
+
+    #[test]
+    fn an_arrow_at_the_end_of_the_list_costs_no_frame() {
+        let mut s = connected();
+        let mut ui = Ui::new();
+        handle(
+            Input::Daemon(DaemonEvent::Repos(vec![repo_row("only", 1)])),
+            &mut s,
+            &mut ui,
+        );
+        ui.focus = Focus::Repos;
+        match handle(key(KeyCode::Down), &mut s, &mut ui) {
+            Flow::Continue { redraw } => {
+                assert!(!redraw, "a cursor that cannot move must not redraw")
+            }
+            Flow::Quit => panic!("an arrow must not quit"),
+        }
     }
 
     #[test]
