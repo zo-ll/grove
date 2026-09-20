@@ -17,7 +17,7 @@
 use ratatui::text::{Line, Span};
 
 use crate::keymap::{Action, key_label};
-use crate::theme::{Role, Theme};
+use crate::theme::{Ink, Role, Theme};
 
 /// Why the dash has nothing to show.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,21 +79,26 @@ impl Empty {
 
     /// The guidance, ready to draw.
     pub fn lines(self, theme: &Theme) -> Vec<Line<'static>> {
+        // The mock's weights: the situation is stated quietly, the steps read
+        // as ordinary text, and the only thing in the accent colour is the key
+        // you are being asked to press. Guidance that shouts competes with the
+        // one part of itself that is actionable — and the step text was green,
+        // which in this palette means "clean" and meant nothing here.
         let mut lines = vec![
-            Line::styled(self.headline(), theme.style(Role::Accent)),
+            Line::styled(self.headline(), theme.ink_style(Ink::Subtext)),
             Line::from(""),
         ];
         for (index, (what, action, command)) in self.steps().iter().enumerate() {
             lines.push(Line::from(vec![
-                Span::styled(format!("{}  ", index + 1), theme.style(Role::Muted)),
-                Span::styled(*what, theme.style(Role::Clean)),
+                Span::styled(format!("{}  ", index + 1), theme.ink_style(Ink::Faint)),
+                Span::styled(*what, theme.ink_style(Ink::Subtext)),
             ]));
             lines.push(Line::from(vec![
                 Span::raw("   "),
                 // The key as the keymap spells it today. If the binding moves,
                 // this moves with it.
                 Span::styled(key_label(*action), theme.style(Role::Accent)),
-                Span::styled(format!("  {command}"), theme.style(Role::Muted)),
+                Span::styled(format!("  {command}"), theme.ink_style(Ink::Faint)),
             ]));
             lines.push(Line::from(""));
         }
