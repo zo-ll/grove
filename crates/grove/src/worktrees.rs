@@ -40,6 +40,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 use unicode_width::UnicodeWidthStr;
 
+use crate::text::truncate;
 use crate::theme::{Role, Theme};
 
 /// Ours, with a pty attached.
@@ -54,8 +55,6 @@ const GLYPH_CLONE: &str = "─";
 const STALE: &str = "~";
 /// A detached HEAD has no branch name to show.
 const DETACHED: &str = "(detached)";
-
-const ELLIPSIS: &str = "…";
 
 /// What the pane does with the row under the cursor when `^g a` or `^g r` is
 /// pressed. The refusals are as much a part of the feature as the actions:
@@ -266,32 +265,6 @@ fn age_label(seconds: u64) -> String {
         s if s < DAY => format!("{}h", s / HOUR),
         s => format!("{}d", s / DAY),
     }
-}
-
-/// Shorten to `room` display columns. Same arithmetic as the REPOS pane's, for
-/// the same reason: branch names are user data and may be any width.
-fn truncate(name: &str, room: usize) -> String {
-    if room == 0 {
-        return String::new();
-    }
-    if name.width() <= room {
-        return name.to_owned();
-    }
-    if room < 2 {
-        return ELLIPSIS.to_owned();
-    }
-    let budget = room - ELLIPSIS.width();
-    let mut kept = String::new();
-    let mut used = 0usize;
-    for ch in name.chars() {
-        let w = ch.to_string().width();
-        if used + w > budget {
-            break;
-        }
-        kept.push(ch);
-        used += w;
-    }
-    format!("{kept}{ELLIPSIS}")
 }
 
 #[cfg(test)]

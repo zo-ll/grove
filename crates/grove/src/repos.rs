@@ -20,6 +20,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 use unicode_width::UnicodeWidthStr;
 
+use crate::text::truncate;
 use crate::theme::{Role, Theme};
 
 /// A repo that holds at least one branched worktree.
@@ -28,9 +29,6 @@ const DOT_PRESENT: &str = "●";
 const DOT_EMPTY: &str = "○";
 /// The count column when there is nothing to count.
 const COUNT_NONE: &str = "·";
-/// What a truncated name ends with. One column, so the budget arithmetic
-/// stays honest.
-const ELLIPSIS: &str = "…";
 
 /// The pane's own state: which repos it shows and where the cursor is.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -161,43 +159,12 @@ impl Repos {
     }
 }
 
-/// Shorten a name to `room` **display columns**, ending in `…` when it does
-/// not fit.
-///
-/// Columns, not characters. A repo name is a directory name and so usually
-/// ASCII, where the two agree — but a CJK name is two columns per character,
-/// and counting characters would let the name overrun the pane and push the
-/// count off the edge. `unicode-width` is already in the graph under ratatui,
-/// so this costs a direct dependency rather than a new one. The same
-/// arithmetic serves branch names in #20.
-fn truncate(name: &str, room: usize) -> String {
-    if room == 0 {
-        return String::new();
-    }
-    if name.width() <= room {
-        return name.to_owned();
-    }
-    if room < 2 {
-        // No room for a character and the ellipsis both.
-        return ELLIPSIS.to_owned();
-    }
-    let budget = room - ELLIPSIS.width();
-    let mut kept = String::new();
-    let mut used = 0usize;
-    for ch in name.chars() {
-        let w = ch.to_string().width();
-        if used + w > budget {
-            break;
-        }
-        kept.push(ch);
-        used += w;
-    }
-    format!("{kept}{ELLIPSIS}")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The pane's own assertions about fitting; `truncate` itself is tested
+    // where it lives.
+    use crate::text::ELLIPSIS;
     use grove_domain::RepoId;
 
     fn row(name: &str, worktrees: u32, dirty: bool) -> RepoRow {
@@ -308,31 +275,6 @@ mod tests {
                 "expected an ellipsis: {rendered:?}"
             );
         }
-    }
-
-    #[test]
-    fn a_wide_name_is_measured_in_columns_not_characters() {
-        // Four characters, eight columns. Counting characters would call this
-        // a fit at six and overrun the pane by two.
-        let wide = "課題管理";
-        assert_eq!(wide.width(), 8);
-        assert_eq!(truncate(wide, 8), wide);
-        let clipped = truncate(wide, 6);
-        assert!(
-            clipped.width() <= 6,
-            "{clipped:?} is {} columns",
-            clipped.width()
-        );
-        assert!(clipped.ends_with(ELLIPSIS));
-    }
-
-    #[test]
-    fn a_name_that_fits_is_not_ellipsised() {
-        assert_eq!(truncate("web-app", 10), "web-app");
-        assert_eq!(truncate("web-app", 7), "web-app");
-        assert_eq!(truncate("web-app", 6), "web-a…");
-        assert_eq!(truncate("web-app", 1), ELLIPSIS);
-        assert_eq!(truncate("web-app", 0), "");
     }
 
     #[test]

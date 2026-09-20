@@ -15,6 +15,7 @@ mod keymap;
 mod repos;
 mod statusbar;
 mod terminal;
+mod text;
 mod theme;
 mod worktrees;
 
@@ -251,15 +252,45 @@ fn act_on_worktree(intent: Option<Intent>, state: &mut State, ui: &mut Ui) -> bo
     };
     match send(state, &request) {
         Ok(()) => {
-            // The pane does not change here: ownership is the daemon's to
-            // write, and the row updates when it says so.
+            // Ownership is the daemon's to write, so the row does not change
+            // here. Asking again is what makes the answer arrive: the daemon
+            // replies to `ListWorktrees`, it does not push a repo's rows
+            // unprompted.
             ui.note = None;
+            request_worktrees(state, ui);
             false
         }
         Err(e) => {
             ui.note = Some(format!("could not reach the daemon: {e}"));
             true
         }
+    }
+}
+
+/// The questions the dash cannot draw without.
+///
+/// Sent the moment the handshake succeeds. The daemon answers what it is
+/// asked; it does not volunteer a workspace, so without this the panes stay
+/// empty for as long as grove is open — which is how the dash shipped until
+/// review caught it. Worktrees are not here: they are asked for per repo, once
+/// there is a selection to ask about.
+fn ask_for_the_dash<W: std::io::Write>(daemon: &mut W) -> Result<(), grove_proto::FrameError> {
+    grove_proto::write_frame(daemon, &Request::ListSessions)?;
+    grove_proto::write_frame(daemon, &Request::ListRepos)
+}
+
+/// Ask for the selected repo's worktrees.
+///
+/// Called whenever the selection changes, because the daemon sends worktrees
+/// for a named repo rather than pushing every repo's at once. A failure is
+/// left to the status bar: the pane keeps the rows it has, which are stale but
+/// labelled with the repo they came from.
+fn request_worktrees(state: &mut State, ui: &mut Ui) {
+    let Some(repo) = ui.repos.selected().map(|row| row.repo.clone()) else {
+        return;
+    };
+    if let Err(e) = send(state, &Request::ListWorktrees(repo)) {
+        ui.note = Some(format!("could not reach the daemon: {e}"));
     }
 }
 
@@ -314,17 +345,21 @@ fn handle(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
                     if dash::list_under_arrows(ui.screen, ui.focus, ui.panes, ui.width)
                         == Some(Focus::Repos) =>
                 {
-                    Flow::Continue {
-                        redraw: ui.repos.move_down(),
+                    let moved = ui.repos.move_down();
+                    if moved {
+                        request_worktrees(state, ui);
                     }
+                    Flow::Continue { redraw: moved }
                 }
                 Routed::Act(Action::MoveUp)
                     if dash::list_under_arrows(ui.screen, ui.focus, ui.panes, ui.width)
                         == Some(Focus::Repos) =>
                 {
-                    Flow::Continue {
-                        redraw: ui.repos.move_up(),
+                    let moved = ui.repos.move_up();
+                    if moved {
+                        request_worktrees(state, ui);
                     }
+                    Flow::Continue { redraw: moved }
                 }
                 Routed::Act(Action::MoveDown)
                     if dash::list_under_arrows(ui.screen, ui.focus, ui.panes, ui.width)
@@ -402,6 +437,21 @@ fn handle(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
         // The REPOS pane's data. Kept ahead of the catch-all below because
         // that one only narrates the event on the status line, which for a
         // list of repos would say a lot and show nothing.
+        // One session's state moved. Ownership requests name the open session,
+        // so a stale answer here adopts into the wrong one — which is worse
+        // than the status line this event used to produce.
+        Input::Daemon(DaemonEvent::SessionChanged(row)) => {
+            match row.state {
+                grove_domain::SessionState::Attached => ui.session = Some(row.id.clone()),
+                // The session we were in stopped being open. Forgetting it is
+                // the point: adopt has nothing to adopt into until the daemon
+                // names another.
+                _ if ui.session.as_ref() == Some(&row.id) => ui.session = None,
+                _ => {}
+            }
+            Flow::Continue { redraw: true }
+        }
+
         // Which session is open decides what adopt and release name. The
         // daemon is the authority on it; the TUI only remembers the answer.
         Input::Daemon(DaemonEvent::Sessions(rows)) => {
@@ -414,12 +464,20 @@ fn handle(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
 
         Input::Daemon(DaemonEvent::Repos(rows)) => {
             ui.repos.set(rows);
+            // The WORKTREES pane follows this selection, and the daemon sends
+            // worktrees only when asked for a repo by name.
+            request_worktrees(state, ui);
             Flow::Continue { redraw: true }
         }
 
-        // Rows for whichever repo the daemon was asked about. The pane takes
-        // them whole: which repo they belong to is the REPOS cursor's business.
-        Input::Daemon(DaemonEvent::Worktrees { rows, .. }) => {
+        // Rows for one repo. The cursor may have moved since the request went
+        // out, so rows for a repo we are no longer showing are dropped rather
+        // than painted under the wrong heading.
+        Input::Daemon(DaemonEvent::Worktrees { repo, rows }) => {
+            let showing = ui.repos.selected().map(|row| row.repo.clone());
+            if showing.as_ref() != Some(&repo) {
+                return Flow::Continue { redraw: false };
+            }
             ui.worktrees.set(rows);
             Flow::Continue { redraw: true }
         }
@@ -509,13 +567,23 @@ fn connect(workspace: &Path, inputs: &Inputs) -> State {
         Ok(ev) => match accept_welcome(&ev) {
             Handshake::Agreed => {
                 events::spawn_daemon_reader(reader, inputs.sender());
-                State::Connected {
-                    workspace: workspace.to_path_buf(),
-                    note: "connected".into(),
-                    // Kept so the TUI can ask for things rather than only
-                    // listen. Everything grove does to a repo is a request on
-                    // this half.
-                    daemon: Some(write_half),
+                // The daemon answers questions; it does not volunteer the
+                // dash. Without these two the panes stay empty forever, which
+                // is exactly how this shipped until review caught it.
+                let mut daemon = write_half;
+                match ask_for_the_dash(&mut daemon) {
+                    Ok(()) => State::Connected {
+                        workspace: workspace.to_path_buf(),
+                        note: "connected".into(),
+                        // Kept so the TUI can ask for things rather than only
+                        // listen. Everything grove does to a repo is a request
+                        // on this half.
+                        daemon: Some(daemon),
+                    },
+                    Err(e) => State::Disconnected {
+                        workspace: workspace.to_path_buf(),
+                        reason: format!("could not ask the daemon for the dash: {e}"),
+                    },
                 }
             }
             Handshake::Mismatch { daemon, client } => State::Disconnected {
@@ -961,6 +1029,13 @@ mod tests {
         // key rather than from the spec.
         let mut s = connected();
         let mut ui = Ui::new();
+        // The pane only takes rows for the repo it is showing, so the
+        // selection has to exist before they arrive.
+        handle(
+            Input::Daemon(DaemonEvent::Repos(vec![repo_row("repo", 1)])),
+            &mut s,
+            &mut ui,
+        );
         handle(
             Input::Daemon(DaemonEvent::Worktrees {
                 repo: grove_domain::RepoId("repo".into()),
@@ -983,6 +1058,13 @@ mod tests {
         // to adopt *into*.
         let mut s = connected();
         let mut ui = Ui::new();
+        // The pane only takes rows for the repo it is showing, so the
+        // selection has to exist before they arrive.
+        handle(
+            Input::Daemon(DaemonEvent::Repos(vec![repo_row("repo", 1)])),
+            &mut s,
+            &mut ui,
+        );
         handle(
             Input::Daemon(DaemonEvent::Worktrees {
                 repo: grove_domain::RepoId("repo".into()),
@@ -1039,6 +1121,13 @@ mod tests {
     fn arrows_drive_the_worktrees_list_when_it_has_focus() {
         let mut s = connected();
         let mut ui = Ui::new();
+        // The pane only takes rows for the repo it is showing, so the
+        // selection has to exist before they arrive.
+        handle(
+            Input::Daemon(DaemonEvent::Repos(vec![repo_row("repo", 1)])),
+            &mut s,
+            &mut ui,
+        );
         handle(
             Input::Daemon(DaemonEvent::Worktrees {
                 repo: grove_domain::RepoId("repo".into()),
@@ -1063,6 +1152,187 @@ mod tests {
             ui.worktrees.selected().map(|r| r.worktree.branch.as_str()),
             Some("b"),
             "an arrow in another pane must not move this list"
+        );
+    }
+
+    /// A connected state whose daemon half is a socket the test can read.
+    fn wired() -> (State, UnixStream) {
+        let (ours, theirs) = UnixStream::pair().expect("a socket pair");
+        (
+            State::Connected {
+                workspace: PathBuf::from("/w"),
+                note: "connected".into(),
+                daemon: Some(ours),
+            },
+            theirs,
+        )
+    }
+
+    /// Everything the TUI has sent so far.
+    fn sent(socket: &mut UnixStream) -> Vec<Request> {
+        socket
+            .set_nonblocking(true)
+            .expect("a socket that can be drained");
+        let mut out = Vec::new();
+        while let Ok(request) = grove_proto::read_frame::<_, Request>(socket) {
+            out.push(request);
+        }
+        out
+    }
+
+    #[test]
+    fn the_dash_asks_for_its_own_data() {
+        // The review's high: the panes filled only from injected events, so a
+        // real grove drew an empty dash forever. The daemon answers questions
+        // and volunteers nothing.
+        let (_ours, mut theirs) = UnixStream::pair().expect("a socket pair");
+        let mut writer = _ours;
+        ask_for_the_dash(&mut writer).expect("the requests go out");
+        let asked = sent(&mut theirs);
+        assert!(
+            asked.contains(&Request::ListSessions),
+            "the open session decides what adopt names: {asked:?}"
+        );
+        assert!(
+            asked.contains(&Request::ListRepos),
+            "the REPOS pane has nothing without this: {asked:?}"
+        );
+    }
+
+    #[test]
+    fn moving_the_repo_cursor_asks_for_that_repos_worktrees() {
+        // The WORKTREES pane follows the REPOS selection, and the daemon sends
+        // worktrees for a named repo rather than all of them at once.
+        let (mut s, mut theirs) = wired();
+        let mut ui = Ui::new();
+        handle(
+            Input::Daemon(DaemonEvent::Repos(vec![repo_row("a", 1), repo_row("b", 1)])),
+            &mut s,
+            &mut ui,
+        );
+        let first = sent(&mut theirs);
+        assert!(
+            first.contains(&Request::ListWorktrees(grove_domain::RepoId("a".into()))),
+            "the first repo's worktrees are asked for as soon as there is a selection: {first:?}"
+        );
+
+        ui.focus = Focus::Repos;
+        handle(key(KeyCode::Down), &mut s, &mut ui);
+        let second = sent(&mut theirs);
+        assert!(
+            second.contains(&Request::ListWorktrees(grove_domain::RepoId("b".into()))),
+            "moving the cursor must ask about the repo now under it: {second:?}"
+        );
+    }
+
+    #[test]
+    fn worktrees_for_a_repo_we_are_no_longer_showing_are_dropped() {
+        // The cursor can move between the request going out and the rows
+        // coming back. Painting them would label one repo's worktrees with
+        // another's name.
+        let (mut s, _theirs) = wired();
+        let mut ui = Ui::new();
+        handle(
+            Input::Daemon(DaemonEvent::Repos(vec![repo_row("a", 1)])),
+            &mut s,
+            &mut ui,
+        );
+        handle(
+            Input::Daemon(DaemonEvent::Worktrees {
+                repo: grove_domain::RepoId("somewhere-else".into()),
+                rows: vec![worktree_row("stale", grove_domain::Ownership::Ours)],
+            }),
+            &mut s,
+            &mut ui,
+        );
+        assert!(
+            ui.worktrees.selected().is_none(),
+            "rows for another repo must not be painted under this one"
+        );
+    }
+
+    #[test]
+    fn a_session_that_stops_being_open_is_forgotten() {
+        // Ownership requests name the open session, so a stale answer adopts
+        // into the wrong one.
+        let mut s = connected();
+        let mut ui = Ui::new();
+        let mut row = grove_proto::SessionRow {
+            id: grove_domain::SessionId("s1".into()),
+            name: "one".into(),
+            members: vec![],
+            state: grove_domain::SessionState::Attached,
+            terminals: 0,
+            since: 0,
+            size: 0,
+        };
+        handle(
+            Input::Daemon(DaemonEvent::SessionChanged(row.clone())),
+            &mut s,
+            &mut ui,
+        );
+        assert_eq!(ui.session.as_ref().map(|s| s.0.as_str()), Some("s1"));
+
+        row.state = grove_domain::SessionState::Detached;
+        handle(
+            Input::Daemon(DaemonEvent::SessionChanged(row)),
+            &mut s,
+            &mut ui,
+        );
+        assert!(
+            ui.session.is_none(),
+            "adopt has nothing to adopt into once the session is not open"
+        );
+    }
+
+    #[test]
+    fn adopting_sends_the_request_and_asks_again_for_the_rows() {
+        // Ownership is the daemon's to write, so the pane does not change
+        // here; asking again is what makes the answer arrive.
+        let (mut s, mut theirs) = wired();
+        let mut ui = Ui::new();
+        handle(
+            Input::Daemon(DaemonEvent::Repos(vec![repo_row("repo", 1)])),
+            &mut s,
+            &mut ui,
+        );
+        handle(
+            Input::Daemon(DaemonEvent::Worktrees {
+                repo: grove_domain::RepoId("repo".into()),
+                rows: vec![worktree_row("free", grove_domain::Ownership::Unowned)],
+            }),
+            &mut s,
+            &mut ui,
+        );
+        handle(
+            Input::Daemon(DaemonEvent::Sessions(vec![grove_proto::SessionRow {
+                id: grove_domain::SessionId("open".into()),
+                name: "current".into(),
+                members: vec![],
+                state: grove_domain::SessionState::Attached,
+                terminals: 0,
+                since: 0,
+                size: 0,
+            }])),
+            &mut s,
+            &mut ui,
+        );
+        let _ = sent(&mut theirs);
+
+        ui.focus = Focus::Worktrees;
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('a')), &mut s, &mut ui);
+
+        let asked = sent(&mut theirs);
+        assert!(
+            asked
+                .iter()
+                .any(|r| matches!(r, Request::AdoptWorktree { .. })),
+            "adopt must reach the daemon: {asked:?}"
+        );
+        assert!(
+            asked.contains(&Request::ListWorktrees(grove_domain::RepoId("repo".into()))),
+            "and the rows must be asked for again: {asked:?}"
         );
     }
 
