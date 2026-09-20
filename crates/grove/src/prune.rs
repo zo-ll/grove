@@ -24,13 +24,11 @@
 
 use grove_proto::{PruneBlocker, PruneCandidate, PruneState};
 use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
-use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 
 use crate::text::truncate;
-use crate::theme::{Role, Theme};
+use crate::theme::{Ink, Role, Theme};
 
 /// One row of the picker.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,45 +157,77 @@ impl Prune {
     }
 
     /// Draw the picker into `area`.
-    pub fn render(&self, buf: &mut Buffer, area: Rect, theme: &Theme) {
-        if area.width == 0 || area.height == 0 {
+    /// The keys this screen offers, with the live count on the verb.
+    ///
+    /// §5: `enter prune 3` is a promise about what the key will do, and it
+    /// changes as rows are ticked. The verb is the keymap's; only the number
+    /// is this screen's.
+    pub fn footer(&self) -> Vec<crate::statusbar::Hint> {
+        let mut hints = crate::statusbar::hints(crate::keymap::Screen::Prune);
+        for hint in &mut hints {
+            if hint.label == "prune" {
+                hint.label = format!("prune {}", self.count());
+            }
+        }
+        hints
+    }
+
+    /// Rows of content, so the overlay can be that tall.
+    pub fn height(&self) -> u16 {
+        u16::try_from(self.rows.len().max(1)).unwrap_or(u16::MAX)
+    }
+
+    /// Draw the prune list into the overlay's parts.
+    pub fn render(&self, buf: &mut Buffer, parts: crate::overlay::Parts, theme: &Theme) {
+        let (header, body) = (parts.header, parts.body);
+        if body.width == 0 || body.height == 0 {
             return;
         }
-        let mut lines = vec![Line::from(vec![
-            Span::styled("❯ prune", theme.style(Role::Accent)),
-            Span::raw("   "),
-            Span::styled(
-                format!("{} selected · {}", self.count(), bytes(self.reclaimable())),
-                theme.style(Role::Muted),
-            ),
-        ])];
+        crate::overlay::header(
+            "❯",
+            "prune",
+            &format!("{} selected · {}", self.count(), bytes(self.reclaimable())),
+            header.width,
+            theme,
+        )
+        .render(header, buf);
 
+        let mut lines = Vec::new();
         if self.rows.is_empty() {
-            lines.push(Line::styled("  nothing to prune", theme.style(Role::Muted)));
+            lines.push(Line::styled(
+                "nothing to prune",
+                theme.ink_style(Ink::Subtext),
+            ));
         }
 
-        let room = usize::from(area.height).saturating_sub(2);
-        for (index, row) in self.rows.iter().take(room).enumerate() {
+        for (index, row) in self.rows.iter().take(usize::from(body.height)).enumerate() {
             let here = index == self.cursor;
-            let mark = if row.checked { "[x]" } else { "[ ]" };
-            let style = if here {
-                theme.style(Role::Accent).add_modifier(Modifier::BOLD)
-            } else if row.checked {
-                theme.style(Role::Clean)
-            } else {
-                theme.style(Role::Muted)
-            };
-            let branch = truncate(&row.candidate.worktree.branch, 22);
-            let repo = truncate(&row.candidate.worktree.repo.0, 16);
-            lines.push(Line::from(vec![
-                Span::styled(if here { "❯" } else { " " }, theme.style(Role::Accent)),
-                Span::styled(mark, style),
-                Span::raw(" "),
-                Span::styled(format!("{repo:<16} "), style),
-                Span::styled(format!("{branch:<22} "), style),
-                // The reason, in its own colour: safe rows read as safe and
-                // blocked ones read as the thing that blocks them.
-                Span::styled(
+            // The mock's columns: box, 16 for the repo, 22 for the branch, the
+            // reason in what is left, and the size right-aligned in 7.
+            let mut spans = crate::overlay::row(
+                here,
+                vec![
+                    (
+                        if row.checked { "[x]" } else { "[ ]" }.to_string(),
+                        Ink::Text,
+                    ),
+                    (
+                        format!("{:<16}", truncate(&row.candidate.worktree.repo.0, 16)),
+                        Ink::Text,
+                    ),
+                    (
+                        format!("{:<22}", truncate(&row.candidate.worktree.branch, 22)),
+                        Ink::Subtext,
+                    ),
+                    (format!("{:<22}", reason(row)), Ink::Subtext),
+                    (format!("{:>7}", bytes(row.candidate.size)), Ink::Faint),
+                ],
+                theme,
+            );
+            // The reason keeps its own colour on an unselected row: safe rows
+            // read as safe, and blocked ones read as the thing blocking them.
+            if !here {
+                spans[7] = Span::styled(
                     format!("{:<22}", reason(row)),
                     if row.safe() {
                         theme.style(Role::Clean)
@@ -206,16 +236,11 @@ impl Prune {
                     } else {
                         theme.style(Role::Dirty)
                     },
-                ),
-                Span::styled(bytes(row.candidate.size), theme.style(Role::Muted)),
-            ]));
+                );
+            }
+            lines.push(Line::from(spans));
         }
-
-        lines.push(Line::styled(
-            format!("  space toggle · a all safe · enter prune {}", self.count()),
-            theme.style(Role::Muted),
-        ));
-        Paragraph::new(lines).render(area, buf);
+        Paragraph::new(lines).render(body, buf);
     }
 }
 
@@ -260,6 +285,7 @@ mod tests {
     use super::*;
     use grove_domain::{RepoId, SessionId};
     use grove_proto::WorktreeRef;
+    use ratatui::layout::Rect;
 
     fn candidate(repo: &str, branch: &str, blockers: Vec<PruneBlocker>) -> PruneCandidate {
         PruneCandidate {
@@ -454,7 +480,7 @@ mod tests {
             height: 10,
         };
         let mut buf = Buffer::empty(area);
-        prune.render(&mut buf, area, &theme());
+        prune.render(&mut buf, crate::overlay::Parts::of(area), &theme());
         let painted: String = (0..area.height)
             .map(|y| {
                 (0..area.width)
@@ -480,7 +506,7 @@ mod tests {
             height: 10,
         };
         let mut buf = Buffer::empty(area);
-        prune.render(&mut buf, area, &theme());
+        prune.render(&mut buf, crate::overlay::Parts::of(area), &theme());
         let painted: String = (0..area.height)
             .map(|y| {
                 (0..area.width)
@@ -489,9 +515,19 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(painted.contains("enter prune 1"), "{painted}");
-        assert!(painted.contains("a all safe"), "{painted}");
         assert!(painted.contains("1 selected"), "{painted}");
+        // §5's promise is on the verb, and the overlay draws the footer, so
+        // this asserts what prune hands it rather than what it paints.
+        let verb = prune
+            .footer()
+            .into_iter()
+            .find(|hint| hint.keys == "enter")
+            .expect("enter is bound here");
+        assert_eq!(verb.label, "prune 1", "the count must be live");
+        assert!(
+            prune.footer().iter().any(|hint| hint.label == "all safe"),
+            "and `a` must still be offered"
+        );
     }
 
     #[test]

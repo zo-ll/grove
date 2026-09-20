@@ -15,13 +15,11 @@
 //! A test asserts the registry has not grown any.
 
 use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
-use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 
 use crate::text::truncate;
-use crate::theme::{Role, Theme};
+use crate::theme::{Ink, Theme};
 
 /// What a command needs after its name.
 ///
@@ -377,104 +375,140 @@ impl Palette {
         true
     }
 
-    /// Draw the palette into `area`.
-    pub fn render(&self, buf: &mut Buffer, area: Rect, theme: &Theme) {
-        if area.width == 0 || area.height == 0 {
-            return;
-        }
-        let mut lines = vec![Line::from(vec![
-            Span::styled("❯ ", theme.style(Role::Accent)),
-            Span::styled(self.input.clone(), theme.style(Role::Clean)),
-            // A block for the caret: the palette is a command line and has to
-            // look like one, and the terminal's own cursor is elsewhere.
-            Span::styled("▏", theme.style(Role::Accent)),
-        ])];
-
-        // Argument mode draws the picker where the command list was, with the
-        // footer §4.2 shows: what space does, what enter will create, and the
-        // live count that makes "enter create 3" a promise rather than a
-        // guess.
+    /// The keys this screen offers, for the overlay's footer.
+    ///
+    /// Mode-aware, because the keymap is not: `space` toggles a repository
+    /// while an argument is being collected and types a space when a command
+    /// is being chosen, and a footer that advertised `space toggle` on the
+    /// command list would be teaching a key that does something else. The
+    /// verb carries the live count for the same reason §5's does: `enter
+    /// create 3` is a promise, not a guess.
+    pub fn footer(&self) -> Vec<crate::statusbar::Hint> {
+        let arguing = matches!(self.mode, Mode::Arguing { .. });
+        let mut hints = crate::statusbar::hints(crate::keymap::Screen::Palette);
+        hints.retain(|hint| arguing || hint.label != "toggle");
         if let Mode::Arguing {
             command, select, ..
         } = &self.mode
         {
-            if let Takes::Argument(what) = command.takes
-                && self.argument().is_some_and(str::is_empty)
-            {
-                lines.push(Line::styled(format!("  {what}"), theme.style(Role::Muted)));
+            for hint in &mut hints {
+                if hint.label == "run" {
+                    hint.label = format!("{} {}", command.name, select.count());
+                }
             }
+        }
+        hints
+    }
+
+    /// Rows of content this palette has, so the box can be that tall.
+    pub fn height(&self) -> u16 {
+        let rows = match &self.mode {
+            // The argument view spends two lines on the base branch and the
+            // rule under it before the repositories start.
+            Mode::Arguing { select, .. } => select.rows().len() + 3,
+            _ => self.matches().len().max(1),
+        };
+        u16::try_from(rows).unwrap_or(u16::MAX)
+    }
+
+    /// Draw the palette into the overlay's parts.
+    pub fn render(&self, buf: &mut Buffer, parts: crate::overlay::Parts, theme: &Theme) {
+        let (header, body) = (parts.header, parts.body);
+        if body.width == 0 || body.height == 0 {
+            return;
+        }
+
+        // Argument mode draws the picker where the command list was, with the
+        // base branch above it — §4.2's sketch, and the mock's `palArg`.
+        if let Mode::Arguing {
+            command, select, ..
+        } = &self.mode
+        {
+            let typed = match self.argument() {
+                Some(argument) => format!("{} {argument}", command.name),
+                None => command.name.to_string(),
+            };
+            crate::overlay::header("❯", &typed, "", header.width, theme).render(header, buf);
+
+            let mut lines = vec![
+                Line::from(vec![
+                    Span::styled(
+                        format!("{:<24}", "base: origin/main"),
+                        theme.ink_style(Ink::Subtext),
+                    ),
+                    Span::styled("from origin/HEAD", theme.ink_style(Ink::Faint)),
+                ]),
+                Line::styled("─".repeat(body.width as usize), theme.ink_style(Ink::Frame)),
+            ];
             if select.is_empty() {
                 lines.push(Line::styled(
-                    "  no repos to choose from",
-                    theme.style(Role::Muted),
+                    "no repos to choose from",
+                    theme.ink_style(Ink::Subtext),
                 ));
             }
-            let room = usize::from(area.height).saturating_sub(2);
+            let room = usize::from(body.height).saturating_sub(lines.len());
             for (index, row) in select.rows().iter().take(room).enumerate() {
                 let here = index == select.cursor();
-                let mark = if row.checked { "[x]" } else { "[ ]" };
-                let style = if here {
-                    theme.style(Role::Accent).add_modifier(Modifier::BOLD)
-                } else if row.checked {
-                    theme.style(Role::Clean)
-                } else {
-                    theme.style(Role::Muted)
-                };
-                lines.push(Line::from(vec![
-                    Span::styled(if here { "❯ " } else { "  " }, theme.style(Role::Accent)),
-                    Span::styled(mark, style),
-                    Span::raw(" "),
-                    Span::styled(row.name.clone(), style),
-                    Span::raw("  "),
-                    Span::styled(
-                        if row.member { "member" } else { "workspace" },
-                        theme.style(Role::Muted),
-                    ),
-                ]));
+                lines.push(Line::from(crate::overlay::row(
+                    here,
+                    vec![
+                        (
+                            if row.checked { "[x]" } else { "[ ]" }.to_string(),
+                            Ink::Text,
+                        ),
+                        (format!("{:<22}", truncate(&row.name, 22)), Ink::Text),
+                        (
+                            if row.member { "member" } else { "workspace" }.to_string(),
+                            Ink::Subtext,
+                        ),
+                    ],
+                    theme,
+                )));
             }
-            lines.push(Line::styled(
-                format!(
-                    "  space toggle · enter {} {} · esc back",
-                    command.name,
-                    select.count()
-                ),
-                theme.style(Role::Muted),
-            ));
-            Paragraph::new(lines).render(area, buf);
+            Paragraph::new(lines).render(body, buf);
             return;
         }
 
         let matches = self.matches();
+        crate::overlay::header(
+            "❯",
+            &self.input,
+            &match matches.len() {
+                1 => "1 command".to_string(),
+                n => format!("{n} commands"),
+            },
+            header.width,
+            theme,
+        )
+        .render(header, buf);
+
+        let mut lines = Vec::new();
         if matches.is_empty() {
             lines.push(Line::styled(
                 format!("no command matches {:?}", self.input),
-                theme.style(Role::Muted),
+                theme.ink_style(Ink::Subtext),
             ));
         }
-        // One row per command, minus the input line.
-        let room = usize::from(area.height).saturating_sub(1);
-        for (index, command) in matches.iter().take(room).enumerate() {
+        for (index, command) in matches.iter().take(usize::from(body.height)).enumerate() {
             let chosen = index == self.selected;
-            let name_style = if chosen {
-                theme.style(Role::Accent).add_modifier(Modifier::BOLD)
-            } else {
-                theme.style(Role::Clean)
-            };
             let argument = match command.takes {
                 Takes::Nothing => String::new(),
                 Takes::Argument(what) => format!(" {what}"),
             };
-            let name = format!("{}{argument}", command.name);
-            // The summary gives way first: the name is what is being chosen.
-            let room = usize::from(area.width).saturating_sub(name.len() + 4);
-            lines.push(Line::from(vec![
-                Span::styled(if chosen { "❯ " } else { "  " }, theme.style(Role::Accent)),
-                Span::styled(name, name_style),
-                Span::raw("  "),
-                Span::styled(truncate(&command.summary, room), theme.style(Role::Muted)),
-            ]));
+            // The mock's columns: a 24-column name, then the summary in what
+            // is left, then the key that runs it without opening this at all.
+            let name = truncate(&format!("{}{argument}", command.name), 24);
+            let room = usize::from(body.width).saturating_sub(24 + 2 + 4);
+            lines.push(Line::from(crate::overlay::row(
+                chosen,
+                vec![
+                    (format!("{name:<24}"), Ink::Text),
+                    (truncate(&command.summary, room), Ink::Subtext),
+                ],
+                theme,
+            )));
         }
-        Paragraph::new(lines).render(area, buf);
+        Paragraph::new(lines).render(body, buf);
     }
 }
 
@@ -528,6 +562,7 @@ fn score(query: &str, name: &str) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::layout::Rect;
 
     fn theme() -> Theme {
         Theme::resolve(&grove_lua::TuiConfig::default(), crate::theme::Depth::True).0
@@ -692,7 +727,7 @@ mod tests {
             height: 14,
         };
         let mut buf = Buffer::empty(area);
-        Palette::default().render(&mut buf, area, &theme());
+        Palette::default().render(&mut buf, crate::overlay::Parts::of(area), &theme());
         let painted: String = (0..area.height)
             .map(|y| {
                 (0..area.width)
@@ -798,7 +833,7 @@ mod tests {
             height: 10,
         };
         let mut buf = Buffer::empty(area);
-        palette.render(&mut buf, area, &theme());
+        palette.render(&mut buf, crate::overlay::Parts::of(area), &theme());
         let painted: String = (0..area.height)
             .map(|y| {
                 (0..area.width)
@@ -810,7 +845,18 @@ mod tests {
         assert!(painted.contains("[x] a"), "{painted}");
         assert!(painted.contains("[ ] c"), "{painted}");
         assert!(painted.contains("workspace"), "non-members are reachable");
-        assert!(painted.contains("enter new 2"), "{painted}");
+        // The count lives on the verb in the footer, which the overlay draws:
+        // two members are ticked, so enter promises two.
+        let verb = palette
+            .footer()
+            .into_iter()
+            .find(|hint| hint.keys == "enter")
+            .expect("enter is bound here");
+        assert_eq!(verb.label, "new 2", "the promise has to be live");
+        assert!(
+            palette.footer().iter().any(|hint| hint.label == "toggle"),
+            "space toggles while an argument is being collected"
+        );
     }
 
     #[test]
@@ -823,7 +869,7 @@ mod tests {
             height: 6,
         };
         let mut buf = Buffer::empty(area);
-        typed("sess").render(&mut buf, area, &theme());
+        typed("sess").render(&mut buf, crate::overlay::Parts::of(area), &theme());
         let first: String = (0..area.width)
             .map(|x| buf[(x, 0)].symbol().to_string())
             .collect();

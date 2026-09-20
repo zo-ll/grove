@@ -36,12 +36,15 @@ fn key_of(b: &Binding) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hint {
     pub keys: String,
-    pub label: &'static str,
+    /// Owned rather than borrowed from the binding, because an overlay's
+    /// footer says `enter prune 3` — the verb is the keymap's and the count
+    /// is the screen's, and the two have to end up in one string.
+    pub label: String,
 }
 
 impl Hint {
     /// The width it takes, keys and label and the space between.
-    fn width(&self) -> usize {
+    pub fn width(&self) -> usize {
         self.keys.chars().count() + 1 + self.label.chars().count()
     }
 }
@@ -80,7 +83,7 @@ pub fn hints(screen: Screen) -> Vec<Hint> {
             } else {
                 spelled
             },
-            label: first.label,
+            label: first.label.to_string(),
         });
         run.clear();
     };

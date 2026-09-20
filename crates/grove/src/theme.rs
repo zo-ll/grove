@@ -292,6 +292,8 @@ impl Theme {
               four times"
 )]
 pub enum Ink {
+    /// `crust`. What an overlay washes the screen behind it with.
+    Backdrop,
     /// `surface0`. An unfocused pane's border, and the status bar's ground.
     Frame,
     /// `surface1`. A rule between two things on one line.
@@ -310,6 +312,7 @@ pub enum Ink {
 impl Ink {
     const fn rgb(self) -> (u8, u8, u8) {
         match self {
+            Self::Backdrop => (0x11, 0x11, 0x1b),
             Self::Frame => (0x31, 0x32, 0x44),
             Self::Divider => (0x45, 0x47, 0x5a),
             Self::Text => (0xcd, 0xd6, 0xf4),
@@ -798,6 +801,7 @@ mod tests {
         ("help.rs", include_str!("help.rs")),
         ("keymap.rs", include_str!("keymap.rs")),
         ("main.rs", include_str!("main.rs")),
+        ("overlay.rs", include_str!("overlay.rs")),
         ("palette.rs", include_str!("palette.rs")),
         ("prune.rs", include_str!("prune.rs")),
         ("repos.rs", include_str!("repos.rs")),
