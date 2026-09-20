@@ -115,6 +115,13 @@ pub enum Action {
     TogglePane(u8),
     MoveUp,
     MoveDown,
+    /// Scroll the terminal pane's history. Prefixed, because the pty has the
+    /// unprefixed arrows.
+    ScrollUp,
+    ScrollDown,
+    /// Open a terminal for the selected worktree, for the worktrees that have
+    /// none — an adopted one, or any of them after the daemon restarted.
+    SpawnTerminal,
     Adopt,
     Release,
     OpenEditor,
@@ -173,6 +180,11 @@ const DASH: &[Binding] = &[
     b(true, KeyCode::Char('o'), Action::OpenEditor, "editor"),
     b(false, KeyCode::Up, Action::MoveUp, "move"),
     b(false, KeyCode::Down, Action::MoveDown, "move"),
+    // The terminal pane's own keys. Prefixed because the pty takes the
+    // unprefixed ones — that is the whole point of §3.1's rule.
+    b(true, KeyCode::Up, Action::ScrollUp, "scroll"),
+    b(true, KeyCode::Down, Action::ScrollDown, "scroll"),
+    b(true, KeyCode::Enter, Action::SpawnTerminal, "terminal"),
 ];
 
 /// Overlay bindings, per SPEC §3.4. Unprefixed throughout — the picker, diff

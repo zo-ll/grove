@@ -15,6 +15,7 @@ mod keymap;
 mod repos;
 mod statusbar;
 mod terminal;
+mod terminals;
 mod text;
 mod theme;
 mod worktrees;
@@ -39,6 +40,7 @@ use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Padding, Paragraph, Wrap};
 use repos::Repos;
+use terminals::Terminals;
 use theme::{Depth, Role, Theme};
 use worktrees::{Intent, Worktrees};
 
@@ -58,6 +60,13 @@ struct Ui {
     repos: Repos,
     /// Every worktree of the selected repo, whoever owns it.
     worktrees: Worktrees,
+    /// The grids of every pty this pane has shown, and which one is on screen.
+    terminals: Terminals,
+    /// The terminal's current height, for sizing the pty. Width is `width`.
+    height: u16,
+    /// The last size the terminal pane actually had, kept so hiding the pane
+    /// does not reflow the program inside its pty.
+    last_pane_size: (u16, u16),
     /// Something to say about the last thing the user pressed — a refusal, or
     /// a failure to reach the daemon. Cleared by the next successful action.
     note: Option<String>,
@@ -76,6 +85,49 @@ struct Ui {
 }
 
 impl Ui {
+    /// The pty's size: the terminal pane's inner area, or the whole terminal
+    /// minus the chrome when the pane is not on screen — a pty still needs a
+    /// size, and one that swings with visibility would reflow the program
+    /// inside it every time the pane is toggled.
+    fn terminal_pane_size(&self) -> (u16, u16) {
+        let body = Rect {
+            x: 0,
+            y: 0,
+            width: self.width,
+            height: self.height.saturating_sub(1),
+        };
+        match dash::split(body, self.panes).terminal {
+            // Two columns and two rows of border.
+            Some(rect) => (
+                rect.height.saturating_sub(2).max(1),
+                rect.width.saturating_sub(2).max(1),
+            ),
+            // Hidden. The pty keeps the size it had rather than taking the
+            // whole body: a program inside it would otherwise reflow twice
+            // around a `^g 3` to glance at something else, and vim redrawing
+            // itself at two different widths is a worse cost than a grid that
+            // is briefly the wrong size for a pane nobody is looking at.
+            None => self.last_pane_size,
+        }
+    }
+
+    /// Record the terminal pane's size while it is on screen, for the times
+    /// it is not.
+    fn remember_pane_size(&mut self) {
+        let body = Rect {
+            x: 0,
+            y: 0,
+            width: self.width,
+            height: self.height.saturating_sub(1),
+        };
+        if let Some(rect) = dash::split(body, self.panes).terminal {
+            self.last_pane_size = (
+                rect.height.saturating_sub(2).max(1),
+                rect.width.saturating_sub(2).max(1),
+            );
+        }
+    }
+
     #[cfg(test)]
     fn new() -> Self {
         Self::with_config(&TuiConfig::default(), None, Depth::detect())
@@ -101,9 +153,12 @@ impl Ui {
             panes: Panes::default(),
             repos: Repos::default(),
             worktrees: Worktrees::default(),
+            terminals: Terminals::default(),
             session: None,
             note: None,
             width: 80,
+            height: 24,
+            last_pane_size: (22, 34),
             theme,
             config_note: (!notes.is_empty()).then(|| notes.join("; ")),
         }
@@ -279,6 +334,23 @@ fn ask_for_the_dash<W: std::io::Write>(daemon: &mut W) -> Result<(), grove_proto
     grove_proto::write_frame(daemon, &Request::ListRepos)
 }
 
+/// Follow the WORKTREES cursor with the terminal pane.
+///
+/// Called wherever the selection can change — an arrow, a refreshed list, a
+/// terminal exiting. Attaching is not free, so `Terminals::show` returns
+/// nothing when the selection did not actually move.
+fn follow_selection(state: &mut State, ui: &mut Ui) {
+    let terminal = ui.worktrees.selected().and_then(|row| row.terminal);
+    ui.remember_pane_size();
+    let (rows, cols) = ui.terminal_pane_size();
+    for request in ui.terminals.show(terminal, rows, cols) {
+        if let Err(e) = send(state, &request) {
+            ui.note = Some(format!("could not reach the daemon: {e}"));
+            return;
+        }
+    }
+}
+
 /// Ask for the selected repo's worktrees.
 ///
 /// Called whenever the selection changes, because the daemon sends worktrees
@@ -365,16 +437,47 @@ fn handle(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
                     if dash::list_under_arrows(ui.screen, ui.focus, ui.panes, ui.width)
                         == Some(Focus::Worktrees) =>
                 {
-                    Flow::Continue {
-                        redraw: ui.worktrees.move_down(),
+                    let moved = ui.worktrees.move_down();
+                    if moved {
+                        follow_selection(state, ui);
                     }
+                    Flow::Continue { redraw: moved }
                 }
                 Routed::Act(Action::MoveUp)
                     if dash::list_under_arrows(ui.screen, ui.focus, ui.panes, ui.width)
                         == Some(Focus::Worktrees) =>
                 {
-                    Flow::Continue {
-                        redraw: ui.worktrees.move_up(),
+                    let moved = ui.worktrees.move_up();
+                    if moved {
+                        follow_selection(state, ui);
+                    }
+                    Flow::Continue { redraw: moved }
+                }
+                // grove's own scrolling, prefixed because the pty has the
+                // unprefixed arrows.
+                Routed::Act(Action::ScrollUp) if ui.screen == Screen::Dash => Flow::Continue {
+                    redraw: ui.terminals.scroll(terminals::SCROLL_STEP),
+                },
+                Routed::Act(Action::ScrollDown) if ui.screen == Screen::Dash => Flow::Continue {
+                    redraw: ui.terminals.scroll(-terminals::SCROLL_STEP),
+                },
+                Routed::Act(Action::SpawnTerminal) if ui.screen == Screen::Dash => {
+                    let target = ui
+                        .worktrees
+                        .selected()
+                        .filter(|row| row.terminal.is_none())
+                        .map(|row| grove_proto::TerminalTarget::Worktree(row.worktree.clone()));
+                    match target {
+                        Some(target) => {
+                            let request = Request::SpawnTerminal(target);
+                            if let Err(e) = send(state, &request) {
+                                ui.note = Some(format!("could not reach the daemon: {e}"));
+                            }
+                            Flow::Continue { redraw: true }
+                        }
+                        // Already has one, or there is no row: nothing to do,
+                        // and nothing worth saying either.
+                        None => Flow::Continue { redraw: false },
                     }
                 }
                 // Adopt and release act on the row under the WORKTREES cursor,
@@ -408,8 +511,24 @@ fn handle(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
                 // acknowledged with a redraw rather than silently dropped, so
                 // the routing is visibly working.
                 Routed::Act(_) => Flow::Continue { redraw: true },
-                // Forwarding to the daemon is #21; the route is correct now.
-                Routed::ToPty(_) => Flow::Continue { redraw: false },
+                // The pane is a real terminal: keys go to the program, not to
+                // grove. `^g` is how grove is addressed instead, which the
+                // router has already applied by the time this arrives.
+                Routed::ToPty(key) => {
+                    let Some(bytes) = terminals::encode_key(key) else {
+                        return Flow::Continue { redraw: false };
+                    };
+                    let Some(request) = ui.terminals.input(bytes) else {
+                        return Flow::Continue { redraw: false };
+                    };
+                    if let Err(e) = send(state, &request) {
+                        ui.note = Some(format!("could not reach the daemon: {e}"));
+                        return Flow::Continue { redraw: true };
+                    }
+                    // The grid changes when the program answers, not when the
+                    // key is sent.
+                    Flow::Continue { redraw: false }
+                }
                 // Half a chord: the status bar shows it, so redraw.
                 Routed::PrefixPending => Flow::Continue { redraw: true },
                 Routed::Unbound => Flow::Continue { redraw: true },
@@ -419,8 +538,16 @@ fn handle(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
             }
         }
 
-        Input::Terminal(TermEvent::Resize(width, _)) => {
+        Input::Terminal(TermEvent::Resize(width, height)) => {
             ui.width = width;
+            ui.height = height;
+            ui.remember_pane_size();
+            let (rows, cols) = ui.terminal_pane_size();
+            if let Some(request) = ui.terminals.resize(rows, cols)
+                && let Err(e) = send(state, &request)
+            {
+                ui.note = Some(format!("could not reach the daemon: {e}"));
+            }
             // A resize can take a pane off screen, so focus is rechecked here
             // rather than only when the user presses something.
             ui.focus = ui.panes.drawable(width).refocus(ui.focus);
@@ -462,6 +589,54 @@ fn handle(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
             Flow::Continue { redraw: true }
         }
 
+        // The pty `^g enter` asked for. Without this the terminal exists and
+        // the pane still says there is none, until something else happens to
+        // refresh the worktree rows.
+        Input::Daemon(DaemonEvent::TerminalSpawned { terminal, .. }) => {
+            let (rows, cols) = ui.terminal_pane_size();
+            for request in ui.terminals.show(Some(terminal), rows, cols) {
+                if let Err(e) = send(state, &request) {
+                    ui.note = Some(format!("could not reach the daemon: {e}"));
+                    break;
+                }
+            }
+            // The row still says it has no terminal, and that is the daemon's
+            // to correct — ask rather than edit the row here.
+            request_worktrees(state, ui);
+            Flow::Continue { redraw: true }
+        }
+
+        Input::Daemon(DaemonEvent::TerminalScreen { terminal, screen }) => {
+            ui.terminals.screen(terminal, &screen);
+            Flow::Continue { redraw: true }
+        }
+
+        Input::Daemon(DaemonEvent::TerminalScrollback {
+            terminal,
+            seq,
+            lines,
+            done,
+        }) => {
+            ui.terminals.scrollback(terminal, seq, &lines, done);
+            // History lands behind the grid, so nothing on screen moves until
+            // the user scrolls into it.
+            Flow::Continue { redraw: false }
+        }
+
+        Input::Daemon(DaemonEvent::TerminalOutput { terminal, bytes }) => {
+            ui.terminals.output(terminal, &bytes);
+            // Only the pane on screen is worth a frame; the others are kept
+            // current in their own grids for when they are shown again.
+            Flow::Continue {
+                redraw: ui.terminals.showing() == Some(terminal),
+            }
+        }
+
+        Input::Daemon(DaemonEvent::TerminalExited { terminal, .. }) => {
+            ui.terminals.exited(terminal);
+            Flow::Continue { redraw: true }
+        }
+
         Input::Daemon(DaemonEvent::Repos(rows)) => {
             ui.repos.set(rows);
             // The WORKTREES pane follows this selection, and the daemon sends
@@ -479,6 +654,7 @@ fn handle(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
                 return Flow::Continue { redraw: false };
             }
             ui.worktrees.set(rows);
+            follow_selection(state, ui);
             Flow::Continue { redraw: true }
         }
 
@@ -640,13 +816,13 @@ fn draw(f: &mut ratatui::Frame, state: &State, ui: &Ui) {
                 ui.focus == Focus::Worktrees,
             );
         }
-        // #21 fills this one; until then it says so rather than the dash
-        // claiming to be finished.
         if let Some(area) = inner.terminal {
-            f.render_widget(
-                Paragraph::new(dash::placeholder_line(Focus::Terminal, &ui.theme)),
-                area,
-            );
+            let has_terminal = ui
+                .worktrees
+                .selected()
+                .is_some_and(|row| row.terminal.is_some());
+            ui.terminals
+                .render(f.buffer_mut(), area, &ui.theme, has_terminal);
         }
         status_bar(f, bar_area, ui);
         return;
@@ -1342,6 +1518,264 @@ mod tests {
         assert!(
             asked.contains(&Request::ListWorktrees(grove_domain::RepoId("repo".into()))),
             "and the rows must be asked for again: {asked:?}"
+        );
+    }
+
+    fn with_terminal(branch: &str, terminal: Option<u64>) -> grove_proto::WorktreeRow {
+        let mut row = worktree_row(branch, grove_domain::Ownership::Ours);
+        row.terminal = terminal.map(grove_proto::TerminalId);
+        row
+    }
+
+    /// A dash showing one repo and two worktrees, one with a pty.
+    fn dashed(s: &mut State, ui: &mut Ui) {
+        handle(
+            Input::Daemon(DaemonEvent::Repos(vec![repo_row("repo", 2)])),
+            s,
+            ui,
+        );
+        handle(
+            Input::Daemon(DaemonEvent::Worktrees {
+                repo: grove_domain::RepoId("repo".into()),
+                rows: vec![with_terminal("a", Some(1)), with_terminal("b", Some(2))],
+            }),
+            s,
+            ui,
+        );
+    }
+
+    #[test]
+    fn the_terminal_pane_follows_the_worktree_cursor() {
+        // Acceptance: switching selection switches which pty is displayed,
+        // without disturbing either — so a detach precedes the attach and the
+        // processes are never touched.
+        let (mut s, mut theirs) = wired();
+        let mut ui = Ui::new();
+        dashed(&mut s, &mut ui);
+        let first = sent(&mut theirs);
+        assert!(
+            first
+                .iter()
+                .any(|r| matches!(r, Request::AttachTerminal(a) if a.terminal == grove_proto::TerminalId(1))),
+            "the first worktree's terminal is attached: {first:?}"
+        );
+
+        ui.focus = Focus::Worktrees;
+        handle(key(KeyCode::Down), &mut s, &mut ui);
+        let second = sent(&mut theirs);
+        assert!(
+            second.iter().any(
+                |r| matches!(r, Request::DetachTerminal(t) if *t == grove_proto::TerminalId(1))
+            ),
+            "the one we left is detached: {second:?}"
+        );
+        assert!(
+            second
+                .iter()
+                .any(|r| matches!(r, Request::AttachTerminal(a) if a.terminal == grove_proto::TerminalId(2))),
+            "and the one we arrived at is attached: {second:?}"
+        );
+    }
+
+    #[test]
+    fn keys_reach_the_pty_when_the_pane_has_focus() {
+        // The pane is a real terminal, not a preview: with focus on it the
+        // keystroke belongs to the program inside.
+        let (mut s, mut theirs) = wired();
+        let mut ui = Ui::new();
+        dashed(&mut s, &mut ui);
+        let _ = sent(&mut theirs);
+
+        ui.focus = Focus::Terminal;
+        handle(key(KeyCode::Char('l')), &mut s, &mut ui);
+        let asked = sent(&mut theirs);
+        match asked.as_slice() {
+            [Request::Input { terminal, bytes }] => {
+                assert_eq!(*terminal, grove_proto::TerminalId(1));
+                assert_eq!(bytes, b"l");
+            }
+            other => panic!("expected the keystroke to reach the pty, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_prefix_still_addresses_grove_from_inside_the_terminal() {
+        // §3.1's whole rule: a focused pty takes every key except `^g`. If
+        // this broke, there would be no way out of the pane.
+        let (mut s, mut theirs) = wired();
+        let mut ui = Ui::new();
+        dashed(&mut s, &mut ui);
+        let _ = sent(&mut theirs);
+
+        ui.focus = Focus::Terminal;
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('1')), &mut s, &mut ui);
+        assert!(
+            !ui.panes.visible(Focus::Repos),
+            "^g 1 must still hide a pane"
+        );
+        assert!(
+            sent(&mut theirs).is_empty(),
+            "a chord addressed to grove must not reach the program"
+        );
+    }
+
+    #[test]
+    fn resizing_tells_the_daemon_the_ptys_new_size() {
+        // Acceptance: resize propagates. The daemon owns the process, so it
+        // is the one that must call TIOCSWINSZ.
+        let (mut s, mut theirs) = wired();
+        let mut ui = Ui::new();
+        dashed(&mut s, &mut ui);
+        let _ = sent(&mut theirs);
+
+        handle(Input::Terminal(TermEvent::Resize(200, 50)), &mut s, &mut ui);
+        let asked = sent(&mut theirs);
+        assert!(
+            asked
+                .iter()
+                .any(|r| matches!(r, Request::ResizeTerminal { .. })),
+            "a resize must reach the daemon: {asked:?}"
+        );
+    }
+
+    #[test]
+    fn output_for_a_terminal_off_screen_costs_no_frame() {
+        // Every attached pty streams; only the one being looked at is worth a
+        // redraw. Without this the dash repaints at the rate of the busiest
+        // terminal in the session.
+        let (mut s, mut theirs) = wired();
+        let mut ui = Ui::new();
+        dashed(&mut s, &mut ui);
+        let _ = sent(&mut theirs);
+
+        match handle(
+            Input::Daemon(DaemonEvent::TerminalOutput {
+                terminal: grove_proto::TerminalId(2),
+                bytes: b"busy".to_vec(),
+            }),
+            &mut s,
+            &mut ui,
+        ) {
+            Flow::Continue { redraw } => assert!(!redraw, "that pane is not on screen"),
+            Flow::Quit => panic!("output must not quit"),
+        }
+
+        match handle(
+            Input::Daemon(DaemonEvent::TerminalOutput {
+                terminal: grove_proto::TerminalId(1),
+                bytes: b"visible".to_vec(),
+            }),
+            &mut s,
+            &mut ui,
+        ) {
+            Flow::Continue { redraw } => assert!(redraw, "this one is"),
+            Flow::Quit => panic!("output must not quit"),
+        }
+    }
+
+    #[test]
+    fn a_worktree_without_a_terminal_can_be_given_one() {
+        // Acceptance: an affordance to spawn. A worktree can legitimately
+        // have no pty — adopted, or after the daemon restarted.
+        let (mut s, mut theirs) = wired();
+        let mut ui = Ui::new();
+        handle(
+            Input::Daemon(DaemonEvent::Repos(vec![repo_row("repo", 1)])),
+            &mut s,
+            &mut ui,
+        );
+        handle(
+            Input::Daemon(DaemonEvent::Worktrees {
+                repo: grove_domain::RepoId("repo".into()),
+                rows: vec![with_terminal("bare", None)],
+            }),
+            &mut s,
+            &mut ui,
+        );
+        let _ = sent(&mut theirs);
+
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Enter), &mut s, &mut ui);
+        let asked = sent(&mut theirs);
+        assert!(
+            asked.iter().any(|r| matches!(
+                r,
+                Request::SpawnTerminal(grove_proto::TerminalTarget::Worktree(_))
+            )),
+            "^g enter must ask for a terminal here: {asked:?}"
+        );
+    }
+
+    #[test]
+    fn hiding_the_terminal_pane_does_not_reflow_the_program_inside_it() {
+        // The review's medium: sizing the pty from "whatever is on screen"
+        // means `^g 3` to glance at something else reflows vim twice, once on
+        // the way out and once on the way back.
+        let (mut s, mut theirs) = wired();
+        let mut ui = Ui::new();
+        handle(Input::Terminal(TermEvent::Resize(200, 50)), &mut s, &mut ui);
+        dashed(&mut s, &mut ui);
+        let _ = sent(&mut theirs);
+        let attached = ui.terminal_pane_size();
+
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('3')), &mut s, &mut ui);
+        assert!(!ui.panes.visible(Focus::Terminal), "^g 3 hides the pane");
+        assert_eq!(
+            ui.terminal_pane_size(),
+            attached,
+            "a hidden pane must not resize the pty behind it"
+        );
+    }
+
+    #[test]
+    fn a_spawned_terminal_is_shown_without_waiting_to_be_told_twice() {
+        // The review's other medium: `^g enter` created the pty and the pane
+        // went on saying there was none, because nothing acted on the reply.
+        let (mut s, mut theirs) = wired();
+        let mut ui = Ui::new();
+        handle(
+            Input::Daemon(DaemonEvent::Repos(vec![repo_row("repo", 1)])),
+            &mut s,
+            &mut ui,
+        );
+        handle(
+            Input::Daemon(DaemonEvent::Worktrees {
+                repo: grove_domain::RepoId("repo".into()),
+                rows: vec![with_terminal("bare", None)],
+            }),
+            &mut s,
+            &mut ui,
+        );
+        let _ = sent(&mut theirs);
+
+        handle(
+            Input::Daemon(DaemonEvent::TerminalSpawned {
+                target: grove_proto::TerminalTarget::Worktree(grove_proto::WorktreeRef {
+                    repo: grove_domain::RepoId("repo".into()),
+                    branch: "bare".into(),
+                }),
+                terminal: grove_proto::TerminalId(9),
+            }),
+            &mut s,
+            &mut ui,
+        );
+        assert_eq!(
+            ui.terminals.showing(),
+            Some(grove_proto::TerminalId(9)),
+            "the pane must show the terminal it just asked for"
+        );
+        let asked = sent(&mut theirs);
+        assert!(
+            asked
+                .iter()
+                .any(|r| matches!(r, Request::AttachTerminal(a) if a.terminal == grove_proto::TerminalId(9))),
+            "and attach to it: {asked:?}"
+        );
+        assert!(
+            asked.contains(&Request::ListWorktrees(grove_domain::RepoId("repo".into()))),
+            "the row still says it has no terminal, which is the daemon's to correct: {asked:?}"
         );
     }
 
