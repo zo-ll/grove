@@ -14,6 +14,7 @@ mod empty;
 mod events;
 mod keymap;
 mod palette;
+mod prune;
 mod repos;
 mod select;
 mod statusbar;
@@ -36,6 +37,7 @@ use grove_proto::{
 };
 use keymap::{Action, Focus, Routed, Router, Screen};
 use palette::{Palette, Takes};
+use prune::Prune;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::Event as TermEvent;
@@ -68,6 +70,8 @@ struct Ui {
     terminals: Terminals,
     /// grove's command line, while it is open.
     palette: Palette,
+    /// The prune picker's rows, while it is open.
+    prune: Prune,
     /// A `new` that hit a branch already checked out somewhere else, and the
     /// worktree it collided with. §7 says the flow offers to adopt that
     /// worktree rather than refusing and leaving the user to find it.
@@ -165,6 +169,7 @@ impl Ui {
             worktrees: Worktrees::default(),
             terminals: Terminals::default(),
             palette: Palette::default(),
+            prune: Prune::default(),
             conflict: None,
             session: None,
             note: None,
@@ -313,9 +318,14 @@ fn run_command(chosen: Option<&'static palette::Command>, state: &mut State, ui:
 
     let request = match command.name {
         "scan" => Some(Request::Scan),
+        // The picker opens on the daemon's answer, not on the keystroke: its
+        // whole point is that the safe rows are the daemon's judgement, and an
+        // empty screen that fills in later would invite `a` before they
+        // arrive.
+        "prune" => Some(Request::ListPruneCandidates),
         "snapshot" => ui.session.clone().map(Request::SaveSnapshot),
-        // `prune` opens a picker (#25), `defaults` an editor, `keys` the help
-        // overlay (#30). Each is a screen rather than a request.
+        // `defaults` is an editor and `keys` the help overlay (#30). Each is
+        // a screen rather than a request.
         _ => {
             ui.note = Some(format!("{} lands with its screen", command.name));
             return true;
@@ -679,6 +689,42 @@ fn handle(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
                         None => ui.palette.move_up(),
                     },
                 },
+                Routed::Act(Action::Toggle) if ui.screen == Screen::Prune => Flow::Continue {
+                    redraw: ui.prune.toggle(),
+                },
+                Routed::Act(Action::SelectSafe) if ui.screen == Screen::Prune => Flow::Continue {
+                    redraw: ui.prune.select_safe(),
+                },
+                Routed::Act(Action::MoveDown) if ui.screen == Screen::Prune => Flow::Continue {
+                    redraw: ui.prune.move_down(),
+                },
+                Routed::Act(Action::MoveUp) if ui.screen == Screen::Prune => Flow::Continue {
+                    redraw: ui.prune.move_up(),
+                },
+                Routed::Act(Action::Cancel) if ui.screen == Screen::Prune => {
+                    // Nothing has been removed, so there is nothing to undo.
+                    ui.screen = Screen::Dash;
+                    Flow::Continue { redraw: true }
+                }
+                Routed::Act(Action::Confirm) if ui.screen == Screen::Prune => {
+                    let worktrees: Vec<grove_proto::WorktreeRef> = ui
+                        .prune
+                        .checked()
+                        .iter()
+                        .map(|row| row.candidate.worktree.clone())
+                        .collect();
+                    if worktrees.is_empty() {
+                        ui.note = Some("nothing checked — space toggles a row".into());
+                        return Flow::Continue { redraw: true };
+                    }
+                    if let Err(e) = send(state, &Request::Prune(worktrees)) {
+                        ui.note = Some(format!("could not reach the daemon: {e}"));
+                    }
+                    // The screen stays until the daemon says what happened:
+                    // this is the destructive one, and closing on send would
+                    // show success before there is any.
+                    Flow::Continue { redraw: true }
+                }
                 Routed::Act(Action::Toggle) if ui.screen == Screen::Palette => Flow::Continue {
                     redraw: match ui.palette.select_mut() {
                         Some(select) => select.toggle(),
@@ -827,6 +873,37 @@ fn handle(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
             // The palette has nothing left to do, and leaving it open over the
             // message would hide the worktree the offer is about.
             ui.screen = Screen::Dash;
+            Flow::Continue { redraw: true }
+        }
+
+        // The answer to `prune`. Opening on this rather than on the keystroke
+        // means the screen is never a blank list that fills in underneath a
+        // user already pressing `a`.
+        Input::Daemon(DaemonEvent::PruneCandidates(candidates)) => {
+            ui.prune.set(candidates);
+            ui.screen = Screen::Prune;
+            Flow::Continue { redraw: true }
+        }
+
+        // What prune actually did. `failed` is per row, because a prune that
+        // removed four of five and said "ok" would be a lie about the fifth.
+        Input::Daemon(DaemonEvent::Pruned {
+            removed,
+            failed,
+            reclaimed,
+        }) => {
+            ui.screen = Screen::Dash;
+            ui.note = Some(if failed.is_empty() {
+                format!("pruned {} · {} reclaimed", removed.len(), bytes(reclaimed))
+            } else {
+                let (worktree, why) = &failed[0];
+                format!(
+                    "pruned {} of {}; {} failed: {why}",
+                    removed.len(),
+                    removed.len() + failed.len(),
+                    worktree.branch
+                )
+            });
             Flow::Continue { redraw: true }
         }
 
@@ -1085,6 +1162,15 @@ fn draw(f: &mut ratatui::Frame, state: &State, ui: &Ui) {
         return;
     }
 
+    if matches!(state, State::Connected { .. }) && ui.screen == Screen::Prune {
+        let inner = dash::render(f.buffer_mut(), body_area, ui.panes, ui.focus, &ui.theme);
+        if let Some(area) = inner.worktrees.or(inner.repos).or(inner.terminal) {
+            ui.prune.render(f.buffer_mut(), area, &ui.theme);
+        }
+        status_bar(f, bar_area, ui);
+        return;
+    }
+
     if matches!(state, State::Connected { .. }) && ui.screen == Screen::Palette {
         // Over the dash rather than beside it: §4.2 calls it grove's command
         // line, and a command line that moves the screen under it makes the
@@ -1160,6 +1246,17 @@ fn draw(f: &mut ratatui::Frame, state: &State, ui: &Ui) {
     );
 
     status_bar(f, bar_area, ui);
+}
+
+/// Bytes, for the line that says how much prune reclaimed.
+fn bytes(n: u64) -> String {
+    const MB: u64 = 1024 * 1024;
+    const GB: u64 = 1024 * MB;
+    match n {
+        n if n >= GB => format!("{:.1} GB", n as f64 / GB as f64),
+        n if n >= MB => format!("{} MB", n / MB),
+        n => format!("{} KB", (n / 1024).max(1)),
+    }
 }
 
 /// The one row along the bottom, drawn the same way whatever is above it.
@@ -1430,7 +1527,7 @@ mod tests {
             &mut ui,
         );
         ui.focus = Focus::Repos;
-        ui.screen = Screen::Picker;
+        ui.screen = Screen::Prune;
 
         handle(key(KeyCode::Down), &mut s, &mut ui);
         assert_eq!(
@@ -2413,6 +2510,159 @@ mod tests {
             "the offered worktree is the one adopted: {asked:?}"
         );
         assert!(ui.conflict.is_none(), "the offer is spent");
+    }
+
+    fn prune_candidate(
+        repo: &str,
+        branch: &str,
+        blockers: Vec<grove_proto::PruneBlocker>,
+    ) -> grove_proto::PruneCandidate {
+        grove_proto::PruneCandidate {
+            worktree: grove_proto::WorktreeRef {
+                repo: grove_domain::RepoId(repo.into()),
+                branch: branch.into(),
+            },
+            state: if blockers.is_empty() {
+                grove_proto::PruneState::Merged
+            } else {
+                grove_proto::PruneState::Neither
+            },
+            size: 100 * 1024 * 1024,
+            blockers,
+        }
+    }
+
+    #[test]
+    fn prune_asks_the_daemon_and_opens_on_its_answer() {
+        // The picker's whole point is that the safe rows are the daemon's
+        // judgement. Opening on the keystroke would show an empty list that
+        // fills in under a user already pressing `a`.
+        let (mut s, mut theirs) = wired();
+        let mut ui = Ui::new();
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('/')), &mut s, &mut ui);
+        for c in "prune".chars() {
+            handle(key(KeyCode::Char(c)), &mut s, &mut ui);
+        }
+        handle(key(KeyCode::Enter), &mut s, &mut ui);
+
+        assert!(
+            sent(&mut theirs).contains(&Request::ListPruneCandidates),
+            "it asks first"
+        );
+        assert_ne!(ui.screen, Screen::Prune, "and waits for the answer");
+
+        handle(
+            Input::Daemon(DaemonEvent::PruneCandidates(vec![
+                prune_candidate("web-app", "feat/done", vec![]),
+                prune_candidate(
+                    "sdk-js",
+                    "wip/x",
+                    vec![grove_proto::PruneBlocker::Dirty { files: 2 }],
+                ),
+            ])),
+            &mut s,
+            &mut ui,
+        );
+        assert_eq!(ui.screen, Screen::Prune);
+        assert_eq!(ui.prune.count(), 1, "only the daemon's safe row");
+    }
+
+    #[test]
+    fn enter_removes_exactly_what_is_checked_and_waits_to_say_so() {
+        let (mut s, mut theirs) = wired();
+        let mut ui = Ui::new();
+        handle(
+            Input::Daemon(DaemonEvent::PruneCandidates(vec![
+                prune_candidate("web-app", "feat/done", vec![]),
+                prune_candidate(
+                    "sdk-js",
+                    "wip/x",
+                    vec![grove_proto::PruneBlocker::Dirty { files: 2 }],
+                ),
+            ])),
+            &mut s,
+            &mut ui,
+        );
+        let _ = sent(&mut theirs);
+
+        handle(key(KeyCode::Enter), &mut s, &mut ui);
+        match sent(&mut theirs).as_slice() {
+            [Request::Prune(worktrees)] => {
+                assert_eq!(worktrees.len(), 1, "the blocked row is not included");
+                assert_eq!(worktrees[0].branch, "feat/done");
+            }
+            other => panic!("expected one prune, got {other:?}"),
+        }
+        assert_eq!(
+            ui.screen,
+            Screen::Prune,
+            "this is the destructive one: the screen stays until the daemon says what happened"
+        );
+
+        handle(
+            Input::Daemon(DaemonEvent::Pruned {
+                removed: vec![grove_proto::WorktreeRef {
+                    repo: grove_domain::RepoId("web-app".into()),
+                    branch: "feat/done".into(),
+                }],
+                failed: vec![],
+                reclaimed: 412 * 1024 * 1024,
+            }),
+            &mut s,
+            &mut ui,
+        );
+        assert_eq!(ui.screen, Screen::Dash);
+        let note = ui.note.clone().expect("what happened");
+        assert!(note.contains("412 MB"), "{note}");
+    }
+
+    #[test]
+    fn a_prune_that_partly_failed_says_which_row_and_why() {
+        // "Pruned 4" after removing four of five is a lie about the fifth.
+        let mut s = connected();
+        let mut ui = Ui::new();
+        handle(
+            Input::Daemon(DaemonEvent::Pruned {
+                removed: vec![grove_proto::WorktreeRef {
+                    repo: grove_domain::RepoId("a".into()),
+                    branch: "gone".into(),
+                }],
+                failed: vec![(
+                    grove_proto::WorktreeRef {
+                        repo: grove_domain::RepoId("b".into()),
+                        branch: "busy".into(),
+                    },
+                    "a terminal is running in it".into(),
+                )],
+                reclaimed: 0,
+            }),
+            &mut s,
+            &mut ui,
+        );
+        let note = ui.note.clone().expect("a report");
+        assert!(note.contains("busy"), "{note}");
+        assert!(note.contains("terminal is running"), "{note}");
+        assert!(note.contains("1 of 2"), "{note}");
+    }
+
+    #[test]
+    fn a_selects_safe_rows_only_from_the_keyboard() {
+        let mut s = connected();
+        let mut ui = Ui::new();
+        handle(
+            Input::Daemon(DaemonEvent::PruneCandidates(vec![
+                prune_candidate("a", "safe", vec![]),
+                prune_candidate("b", "dirty", vec![grove_proto::PruneBlocker::Unmerged]),
+            ])),
+            &mut s,
+            &mut ui,
+        );
+        // Uncheck the safe row, then ask for all safe back.
+        handle(key(KeyCode::Char(' ')), &mut s, &mut ui);
+        assert_eq!(ui.prune.count(), 0);
+        handle(key(KeyCode::Char('a')), &mut s, &mut ui);
+        assert_eq!(ui.prune.count(), 1, "a must never check the blocked row");
     }
 
     #[test]

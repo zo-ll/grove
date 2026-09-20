@@ -35,6 +35,10 @@ pub enum Screen {
     Dash,
     Palette,
     Picker,
+    /// The prune picker. Its own screen rather than the session picker's,
+    /// because its keys differ where it matters: `a` here means "every safe
+    /// row", and on a screen that deletes work that distinction is the point.
+    Prune,
     Diff,
     Shell,
     EndSession,
@@ -124,6 +128,9 @@ pub enum Action {
     Erase,
     /// Check or uncheck the row under the cursor, in a multi-select.
     Toggle,
+    /// Check every row the daemon judged safe — and only those. Prune's own
+    /// key, because "all" on that screen must never mean every row.
+    SelectSafe,
     /// Open a terminal for the selected worktree, for the worktrees that have
     /// none — an adopted one, or any of them after the daemon restarted.
     SpawnTerminal,
@@ -224,6 +231,20 @@ const DASH: &[Binding] = &[
     b(true, KeyCode::Enter, Action::SpawnTerminal, "terminal"),
 ];
 
+/// The prune picker's keys (SPEC §5's footer).
+///
+/// `a` is deliberately *not* "select all": on the one screen that destroys
+/// work, a key one keystroke from `enter` must never reach a row the daemon
+/// judged unsafe.
+const PRUNE: &[Binding] = &[
+    b(false, KeyCode::Char(' '), Action::Toggle, "toggle"),
+    b(false, KeyCode::Char('a'), Action::SelectSafe, "all safe"),
+    b(false, KeyCode::Up, Action::MoveUp, "move"),
+    b(false, KeyCode::Down, Action::MoveDown, "move"),
+    b(false, KeyCode::Enter, Action::Confirm, "prune"),
+    b(false, KeyCode::Esc, Action::Cancel, "close"),
+];
+
 /// Overlay bindings, per SPEC §3.4. Unprefixed throughout — the picker, diff
 /// and end-session screens are not ptys, so they take keys directly.
 const PICKER: &[Binding] = &[
@@ -266,6 +287,7 @@ pub fn bindings(screen: Screen) -> impl Iterator<Item = &'static Binding> {
         Screen::Dash => DASH,
         Screen::Palette => PALETTE,
         Screen::Picker => PICKER,
+        Screen::Prune => PRUNE,
         Screen::Diff => DIFF,
         Screen::Shell => SHELL,
         Screen::EndSession => END,
