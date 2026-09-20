@@ -20,12 +20,20 @@ use crate::keymap::{Action, key_label};
 use crate::theme::{Ink, Role, Theme};
 
 /// Why the dash has nothing to show.
+///
+/// Each variant names the thing that is missing, so `Empty::Session` reads as
+/// "empty for want of a session". They were `Repos`, `Session` and
+/// `Members` until there were three of them and the common prefix became
+/// noise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Empty {
     /// No repositories under the workspace at all.
-    NoRepos,
-    /// Repositories exist, but this session has none of them.
-    NoMembers,
+    Repos,
+    /// Repositories exist and nothing is open to put them in. §2.3: a session
+    /// is explicit, and a fresh workspace has none.
+    Session,
+    /// A session is open, but holds none of the workspace's repositories.
+    Members,
 }
 
 impl Empty {
@@ -35,10 +43,16 @@ impl Empty {
     /// the ones this session holds. A session with members is not empty even
     /// when the selected repo has nothing branched — that is the REPOS pane's
     /// `·`, a state rather than an absence.
-    pub fn of(workspace: usize, members: usize) -> Option<Self> {
-        match (workspace, members) {
-            (0, _) => Some(Self::NoRepos),
-            (_, 0) => Some(Self::NoMembers),
+    pub fn of(workspace: usize, members: usize, session: bool) -> Option<Self> {
+        match (workspace, session, members) {
+            (0, _, _) => Some(Self::Repos),
+            // Before membership, because `add` refuses without somewhere to
+            // add to. Telling a user to add repos to a session that does not
+            // exist is a step that cannot be taken, and the first run was
+            // doing exactly that: `^g / add` answered "no open session to add
+            // in" to someone following the screen's own instructions.
+            (_, false, _) => Some(Self::Session),
+            (_, true, 0) => Some(Self::Members),
             _ => None,
         }
     }
@@ -46,8 +60,9 @@ impl Empty {
     /// The headline, which names the situation rather than the remedy.
     pub fn headline(self) -> &'static str {
         match self {
-            Self::NoRepos => "grove is empty",
-            Self::NoMembers => "this session has no repos",
+            Self::Repos => "grove is empty",
+            Self::Session => "no session open",
+            Self::Members => "this session has no repos",
         }
     }
 
@@ -57,8 +72,9 @@ impl Empty {
     /// user is not told to do it again.
     fn steps(self) -> &'static [(&'static str, Action, &'static str)] {
         match self {
-            Self::NoRepos => &[
+            Self::Repos => &[
                 ("point grove at your clones", Action::OpenPalette, "scan"),
+                ("start a session", Action::OpenPalette, "session new <name>"),
                 (
                     "add repos to this session",
                     Action::OpenPalette,
@@ -66,7 +82,16 @@ impl Empty {
                 ),
                 ("name a branch", Action::PrefillNew, "new <branch>"),
             ],
-            Self::NoMembers => &[
+            Self::Session => &[
+                ("start a session", Action::OpenPalette, "session new <name>"),
+                (
+                    "add repos to this session",
+                    Action::OpenPalette,
+                    "add <repo>",
+                ),
+                ("name a branch", Action::PrefillNew, "new <branch>"),
+            ],
+            Self::Members => &[
                 (
                     "add repos to this session",
                     Action::OpenPalette,
@@ -112,8 +137,9 @@ impl Empty {
     /// has is copy that will be read with its end cut off.
     pub fn repos_note(self) -> &'static str {
         match self {
-            Self::NoRepos => "no repos found",
-            Self::NoMembers => "none in session",
+            Self::Session => "no session",
+            Self::Repos => "no repos found",
+            Self::Members => "none in session",
         }
     }
 }
@@ -141,8 +167,8 @@ mod tests {
 
     #[test]
     fn an_empty_workspace_is_told_to_scan() {
-        assert_eq!(Empty::of(0, 0), Some(Empty::NoRepos));
-        let rendered = text(&Empty::NoRepos.lines(&theme()));
+        assert_eq!(Empty::of(0, 0, false), Some(Empty::Repos));
+        let rendered = text(&Empty::Repos.lines(&theme()));
         assert!(rendered.contains("grove is empty"), "{rendered}");
         assert!(rendered.contains("scan"), "{rendered}");
     }
@@ -151,8 +177,8 @@ mod tests {
     fn a_session_with_no_members_is_not_told_to_scan() {
         // The repos are already there. Telling this user to scan sends them
         // looking for a fault that is not there.
-        assert_eq!(Empty::of(4, 0), Some(Empty::NoMembers));
-        let rendered = text(&Empty::NoMembers.lines(&theme()));
+        assert_eq!(Empty::of(4, 0, true), Some(Empty::Members));
+        let rendered = text(&Empty::Members.lines(&theme()));
         assert!(rendered.contains("no repos"), "{rendered}");
         assert!(
             !rendered.contains("scan"),
@@ -162,11 +188,36 @@ mod tests {
     }
 
     #[test]
+    fn a_workspace_with_no_session_is_told_to_start_one_first() {
+        // The first-run dead end: the screen said "add repos to this session"
+        // when there was no session, `^g /  add` answered "no open session to
+        // add in", and the user had followed the instructions exactly. §2.3
+        // makes a session explicit, so the guidance has to.
+        assert_eq!(Empty::of(4, 0, false), Some(Empty::Session));
+        let rendered = text(&Empty::Session.lines(&theme()));
+        let start = rendered.find("session new").expect("step one is a session");
+        let add = rendered.find("add <repo>").expect("then repos");
+        assert!(start < add, "in that order: {rendered}");
+        assert!(
+            !rendered.contains("scan"),
+            "the repos are already found: {rendered}"
+        );
+    }
+
+    #[test]
+    fn an_empty_workspace_is_told_to_scan_before_anything_else() {
+        let rendered = text(&Empty::Repos.lines(&theme()));
+        let scan = rendered.find("scan").expect("scan");
+        let start = rendered.find("session new").expect("then a session");
+        assert!(scan < start, "{rendered}");
+    }
+
+    #[test]
     fn a_session_with_members_is_not_empty() {
         // Even when the selected repo has nothing branched — that is the
         // REPOS pane's `·`, a state rather than an absence.
-        assert_eq!(Empty::of(4, 1), None);
-        assert_eq!(Empty::of(1, 1), None);
+        assert_eq!(Empty::of(4, 1, true), None);
+        assert_eq!(Empty::of(1, 1, true), None);
     }
 
     #[test]
@@ -174,7 +225,7 @@ mod tests {
         // Guidance naming a key that does nothing is worse than no guidance:
         // the user presses it, nothing happens, and the rest of the screen is
         // now suspect. Asserted against the keymap rather than a literal.
-        let rendered = text(&Empty::NoRepos.lines(&theme()));
+        let rendered = text(&Empty::Repos.lines(&theme()));
         assert!(
             rendered.contains(&key_label(Action::OpenPalette)),
             "the palette's real key must appear: {rendered}"
@@ -187,7 +238,7 @@ mod tests {
 
     #[test]
     fn the_steps_are_numbered_in_order() {
-        let rendered = text(&Empty::NoRepos.lines(&theme()));
+        let rendered = text(&Empty::Repos.lines(&theme()));
         let one = rendered.find('1').expect("a first step");
         let two = rendered.find('2').expect("a second");
         let three = rendered.find('3').expect("a third");
@@ -219,6 +270,6 @@ mod tests {
 
     #[test]
     fn each_state_says_something_different_in_the_repos_pane() {
-        assert_ne!(Empty::NoRepos.repos_note(), Empty::NoMembers.repos_note());
+        assert_ne!(Empty::Repos.repos_note(), Empty::Members.repos_note());
     }
 }

@@ -125,7 +125,14 @@ impl Repos {
     /// An empty member list draws nothing here: SPEC §4.1's empty state is a
     /// whole-dash affair with numbered guidance, and half of it rendered in one
     /// pane would be worse than the space it fills. That is #22.
-    pub fn render(&self, buf: &mut Buffer, area: Rect, theme: &Theme, focused: bool) {
+    pub fn render(
+        &self,
+        buf: &mut Buffer,
+        area: Rect,
+        theme: &Theme,
+        focused: bool,
+        session: bool,
+    ) {
         if area.width == 0 || area.height == 0 {
             return;
         }
@@ -133,7 +140,7 @@ impl Repos {
             // The guidance itself lives in the WORKTREES pane (§4.1); this
             // pane says only why it is empty, so the two do not repeat each
             // other in the narrowest column on screen.
-            if let Some(empty) = Empty::of(self.all.len(), 0) {
+            if let Some(empty) = Empty::of(self.all.len(), 0, session) {
                 Paragraph::new(Line::styled(empty.repos_note(), theme.style(Role::Muted)))
                     .render(area, buf);
             }
@@ -226,7 +233,7 @@ mod tests {
             height: 10,
         };
         let mut buf = Buffer::empty(area);
-        repos.render(&mut buf, area, &theme(), focused);
+        repos.render(&mut buf, area, &theme(), focused, true);
         (0..area.height)
             .map(|y| {
                 (0..width)

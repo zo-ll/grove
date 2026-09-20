@@ -2123,7 +2123,11 @@ fn tall(body: Rect) -> u16 {
 /// the dash out behind a palette rather than replacing it, so the dash has to
 /// be painted first and then dimmed.
 fn draw_dash(f: &mut ratatui::Frame, body_area: Rect, ui: &Ui) {
-    let empty = empty::Empty::of(ui.repos.workspace_count(), ui.repos.member_count());
+    let empty = empty::Empty::of(
+        ui.repos.workspace_count(),
+        ui.repos.member_count(),
+        ui.session.is_some(),
+    );
     // §4.1's empty state draws two panes, not three: nothing is selected,
     // so there is no terminal to show, and the guidance needs the width
     // more than an empty box does. The user's own toggles are untouched —
@@ -2142,8 +2146,13 @@ fn draw_dash(f: &mut ratatui::Frame, body_area: Rect, ui: &Ui) {
         &selection,
     );
     if let Some(area) = inner.repos {
-        ui.repos
-            .render(f.buffer_mut(), area, &ui.theme, ui.focus == Focus::Repos);
+        ui.repos.render(
+            f.buffer_mut(),
+            area,
+            &ui.theme,
+            ui.focus == Focus::Repos,
+            ui.session.is_some(),
+        );
     }
     if let Some(area) = inner.worktrees {
         // A dash with nothing in it re-homes §4.1's numbered guidance
@@ -2228,7 +2237,11 @@ fn status_bar(f: &mut ratatui::Frame, area: Rect, ui: &Ui) {
     };
     // A refusal outranks the config note: it is about the key just pressed,
     // and the config note has been true since startup.
-    let note = ui.note.as_deref().or(ui.config_note.as_deref());
+    let note = ui
+        .note
+        .as_deref()
+        .map(statusbar::Note::Refused)
+        .or_else(|| ui.config_note.as_deref().map(statusbar::Note::Config));
     f.render_widget(
         Paragraph::new(statusbar::render(
             ui.screen,
@@ -3150,11 +3163,49 @@ mod tests {
     }
 
     #[test]
+    fn a_first_run_is_told_to_start_a_session_before_adding_repos() {
+        // Found by running it: the dash said "add repos to this session" with
+        // no session open, and `^g /  add` answered "no open session to add
+        // in" to a user following the screen's own instructions.
+        let mut s = connected();
+        let mut ui = Ui::new();
+        let mut outsider = repo_row("elsewhere", 3);
+        outsider.member = false;
+        handle(
+            Input::Daemon(DaemonEvent::Repos(vec![outsider])),
+            &mut s,
+            &mut ui,
+        );
+
+        let screen = painted_dash(&s, &ui, 100, 26).join("\n");
+        let start = screen
+            .find("session new")
+            .expect("step one starts a session");
+        let add = screen.find("add <repo>").expect("then repos are added");
+        assert!(start < add, "in that order: {screen}");
+    }
+
+    #[test]
     fn a_workspace_with_repos_but_no_members_gets_different_copy() {
         // Telling this user to scan sends them looking for a fault that is
         // not there — the repos are already found.
         let mut s = connected();
         let mut ui = Ui::new();
+        // With a session open — without one the dash has an earlier thing to
+        // say, which is the case below.
+        handle(
+            Input::Daemon(DaemonEvent::SessionChanged(grove_proto::SessionRow {
+                id: grove_domain::SessionId("s1".into()),
+                name: "one".into(),
+                members: vec![],
+                state: grove_domain::SessionState::Attached,
+                terminals: 0,
+                since: 0,
+                size: 0,
+            })),
+            &mut s,
+            &mut ui,
+        );
         let mut outsider = repo_row("elsewhere", 3);
         outsider.member = false;
         handle(
