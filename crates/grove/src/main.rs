@@ -26,6 +26,7 @@ mod terminal;
 mod terminals;
 mod text;
 mod theme;
+mod userkeys;
 mod worktrees;
 
 use std::io::Stdout;
@@ -56,6 +57,7 @@ use repos::Repos;
 use sessions::Sessions;
 use terminals::Terminals;
 use theme::{Depth, Role, Theme};
+use userkeys::UserKeys;
 use worktrees::{Intent, Worktrees};
 
 /// What the shell is currently able to show. Screens replace this in #18-#30;
@@ -82,6 +84,9 @@ struct Ui {
     prune: Prune,
     /// Stored sessions, for the picker.
     sessions: Sessions,
+    /// The user's own keymaps from `config.lua`, and the runtime they live in.
+    keys: UserKeys,
+    lua: Option<grove_lua::TuiRuntime>,
     /// The diff screen, while it is open.
     diff: Diff,
     /// The help overlay's scroll, while it is open, and the screen it is
@@ -150,7 +155,7 @@ impl Ui {
     fn help_extent(&self) -> (usize, usize) {
         let screen = self.helping.unwrap_or(self.screen);
         (
-            help::Help::lines(screen, &self.theme).len(),
+            help::Help::lines_with(screen, &self.keys.spellings(), &self.theme).len(),
             usize::from(self.height.saturating_sub(1)).max(1),
         )
     }
@@ -177,6 +182,31 @@ impl Ui {
         Self::with_config(&TuiConfig::default(), None, Depth::detect())
     }
 
+    /// Take the user's keymaps, reporting anything that could not be bound or
+    /// that took a key grove uses.
+    fn with_lua(&mut self, runtime: grove_lua::TuiRuntime) {
+        let spellings: Vec<String> = runtime
+            .registrations()
+            .keymaps
+            .iter()
+            .map(|registration| registration.key.clone())
+            .collect();
+        let (keys, notes) = UserKeys::load(&spellings, |chord| {
+            keymap::what_uses(chord.prefixed, chord.key)
+        });
+        self.keys = keys;
+        if !notes.is_empty() {
+            // Reported at load, which is the moment the user can still connect
+            // it to what they just wrote.
+            let said: Vec<String> = notes.iter().map(ToString::to_string).collect();
+            self.config_note = Some(match &self.config_note {
+                Some(existing) => format!("{existing}; {}", said.join("; ")),
+                None => said.join("; "),
+            });
+        }
+        self.lua = Some(runtime);
+    }
+
     fn with_config(
         config: &TuiConfig,
         error: Option<grove_lua::ConfigError>,
@@ -201,6 +231,8 @@ impl Ui {
             palette: Palette::default(),
             prune: Prune::default(),
             sessions: Sessions::default(),
+            keys: UserKeys::default(),
+            lua: None,
             diff: Diff::default(),
             help: Help::default(),
             helping: None,
@@ -281,7 +313,11 @@ fn run(workspace: PathBuf) -> std::io::Result<()> {
     // anything below fails outright.
     let loaded = config_path().map(TuiRuntime::load);
     let mut ui = match loaded {
-        Some(loaded) => Ui::with_config(loaded.runtime.config(), loaded.error, Depth::detect()),
+        Some(loaded) => {
+            let mut ui = Ui::with_config(loaded.runtime.config(), loaded.error, Depth::detect());
+            ui.with_lua(loaded.runtime);
+            ui
+        }
         // Nowhere to look, so defaults — see `config_path_from`.
         None => Ui::with_config(&TuiConfig::default(), None, Depth::detect()),
     };
@@ -637,6 +673,37 @@ fn follow_selection(state: &mut State, ui: &mut Ui) {
     }
 }
 
+/// How long a user callback may run before grove takes the screen back.
+///
+/// Short enough that a mistake does not read as a freeze, long enough that a
+/// callback shelling out to `gh` has a chance — §10.5 asks for a bound, not a
+/// particular one.
+const USER_CALLBACK_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Run a user keymap's callback, containing whatever it does.
+fn run_user_key(index: usize, ui: &mut Ui) -> Flow {
+    let Some(runtime) = ui.lua.as_ref() else {
+        return Flow::Continue { redraw: false };
+    };
+    match runtime.call_keymap(index, USER_CALLBACK_BUDGET) {
+        Ok(()) => Flow::Continue { redraw: true },
+        Err(grove_lua::CallError::Timeout) => {
+            // Reported, but not disabled: a timeout may be a slow command
+            // rather than a broken one, and taking the key away for the rest
+            // of the session would be grove deciding that.
+            ui.note = Some("that keymap ran too long and was stopped".into());
+            Flow::Continue { redraw: true }
+        }
+        Err(grove_lua::CallError::Failed(why)) => {
+            // §10.5: a throwing callback disables that registration rather
+            // than failing again on every keystroke.
+            ui.keys.disable(index);
+            ui.note = Some(format!("keymap disabled after it failed: {why}"));
+            Flow::Continue { redraw: true }
+        }
+    }
+}
+
 /// Ask the daemon for one file's patch, after the diff cursor moved.
 ///
 /// `None` means the cursor did not move, so there is nothing to fetch and no
@@ -702,7 +769,18 @@ enum Flow {
 fn handle(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
     match input {
         Input::Terminal(TermEvent::Key(key)) => {
-            match ui.router.route(ui.screen, ui.focus, key) {
+            let routed = ui.router.route(ui.screen, ui.focus, key);
+            // A user binding is consulted before grove's own handling, which
+            // is what "merges over" means — and only for keys the router has
+            // not already claimed as text or pty input.
+            if let Routed::Act(_) | Routed::Unbound = routed
+                && let Some(index) =
+                    ui.keys
+                        .bound(matches!(routed, Routed::Unbound), key.code, key.modifiers)
+            {
+                return run_user_key(index, ui);
+            }
+            match routed {
                 Routed::Act(Action::Quit) => Flow::Quit,
                 // Cycling consults visibility rather than the enum's own
                 // order: focus on a hidden pane means the arrows drive a list
@@ -1487,8 +1565,9 @@ fn draw(f: &mut ratatui::Frame, state: &State, ui: &Ui) {
     if let Some(explaining) = ui.helping
         && matches!(state, State::Connected { .. })
     {
+        let user = ui.keys.spellings();
         ui.help
-            .render(f.buffer_mut(), body_area, explaining, &ui.theme);
+            .render(f.buffer_mut(), body_area, explaining, &user, &ui.theme);
         status_bar(f, bar_area, ui);
         return;
     }
@@ -3346,6 +3425,89 @@ mod tests {
             }
             other => panic!("moving the cursor must ask for that file, got {other:?}"),
         }
+    }
+
+    /// A UI whose Lua came from `source`.
+    fn with_lua(source: &str) -> Ui {
+        let loaded = grove_lua::TuiRuntime::load_source(source, "test");
+        let mut ui = Ui::with_config(loaded.runtime.config(), loaded.error, Depth::True);
+        ui.with_lua(loaded.runtime);
+        ui
+    }
+
+    #[test]
+    fn a_user_keymap_runs_from_the_key_it_was_given() {
+        // End to end: the binding is parsed, merged, and reached by the
+        // router — which is what "merges over the built-ins" has to mean.
+        let mut s = connected();
+        let mut ui = with_lua(
+            "local grove = require('grove')\n             grove.keymap('^g w', function() end)\n",
+        );
+        assert!(ui.config_note.is_none(), "nothing to report for a free key");
+
+        handle(prefix(), &mut s, &mut ui);
+        match handle(key(KeyCode::Char('w')), &mut s, &mut ui) {
+            Flow::Continue { redraw } => assert!(redraw, "it ran"),
+            Flow::Quit => panic!("a keymap must not quit"),
+        }
+        assert!(ui.note.is_none(), "and said nothing, because it worked");
+    }
+
+    #[test]
+    fn a_keymap_taking_a_grove_key_is_reported_at_load() {
+        // Acceptance. It still wins — it is their config — but a key that
+        // used to open the session picker and now does something else needs
+        // to be said out loud.
+        let ui = with_lua(
+            "local grove = require('grove')\n             grove.keymap('^g s', function() end)\n",
+        );
+        let note = ui.config_note.clone().expect("a report");
+        assert!(note.contains("^g s"), "{note}");
+        assert!(note.contains("sessions"), "{note}");
+    }
+
+    #[test]
+    fn a_keymap_that_throws_is_disabled_and_said_once() {
+        // §10.5: disabled rather than failing again on every keystroke.
+        let mut s = connected();
+        let mut ui = with_lua(
+            "local grove = require('grove')\n             grove.keymap('^g w', function() error('boom') end)\n",
+        );
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('w')), &mut s, &mut ui);
+        let note = ui.note.clone().expect("a report");
+        assert!(note.contains("boom"), "{note}");
+        assert!(note.contains("disabled"), "{note}");
+
+        ui.note = None;
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('w')), &mut s, &mut ui);
+        assert!(ui.note.is_none(), "it is not offered a second time");
+    }
+
+    #[test]
+    fn a_keymap_that_hangs_leaves_the_tui_responsive() {
+        // The one that matters: user code runs inside this loop, so a
+        // `while true do end` must not take the screen with it.
+        let mut s = connected();
+        let mut ui = with_lua(
+            "local grove = require('grove')\n             grove.keymap('^g w', function() while true do end end)\n",
+        );
+        let started = std::time::Instant::now();
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('w')), &mut s, &mut ui);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "the loop was held for {:?}",
+            started.elapsed()
+        );
+        let note = ui.note.clone().expect("a report");
+        assert!(note.contains("ran too long"), "{note}");
+
+        // And grove still works afterwards.
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('1')), &mut s, &mut ui);
+        assert!(!ui.panes.visible(Focus::Repos), "^g 1 still hides a pane");
     }
 
     #[test]

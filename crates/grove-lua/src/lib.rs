@@ -25,6 +25,28 @@ const DEFAULT_WORKTREE_PATH: &str = "~/grove/{repo}/{branch_slug}";
 const MAX_BRANCH_SLUG_BYTES: usize = 120;
 const BRANCH_SLUG_HASH_BYTES: usize = 16;
 
+/// Why a user callback did not finish.
+///
+/// Separate variants because they want different handling: a timeout is a
+/// script that needs fixing and may work next time, while a throw has already
+/// failed deterministically and §10.5 says to stop offering it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallError {
+    /// It ran past its budget and was stopped.
+    Timeout,
+    /// It raised an error.
+    Failed(String),
+}
+
+impl std::fmt::Display for CallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Timeout => write!(f, "timed out"),
+            Self::Failed(why) => write!(f, "{why}"),
+        }
+    }
+}
+
 /// The result of loading a config, including a recoverable evaluation error.
 pub struct LoadOutcome<T> {
     /// A fully usable runtime, containing defaults when evaluation failed.
@@ -243,6 +265,52 @@ impl TuiRuntime {
     /// Returns the extension registrations owned by the TUI.
     pub fn registrations(&self) -> &TuiRegistrations {
         &self.registrations
+    }
+
+    /// Run a keymap's callback, bounded in time.
+    ///
+    /// User code runs inside the TUI's own loop, so an accidental
+    /// `while true do end` would freeze the screen with no way back. Lua's
+    /// instruction hook checks a deadline and stops the VM when it passes,
+    /// which is the only way to interrupt a running script without killing
+    /// the process around it.
+    ///
+    /// SPEC §10.5: on expiry the caller reports once and the registration is
+    /// the caller's to disable — this only says what happened.
+    pub fn call_keymap(&self, index: usize, budget: Duration) -> Result<(), CallError> {
+        let callback = self
+            .keymap_callback(index)
+            .map_err(|error| CallError::Failed(error.to_string()))?;
+
+        let deadline = Instant::now() + budget;
+        let triggers = mlua::HookTriggers::new().every_nth_instruction(10_000);
+        self.lua
+            .set_hook(triggers, move |_, _| {
+                if Instant::now() >= deadline {
+                    // The error propagates out of `call` as an ordinary Lua
+                    // error, which is how the VM unwinds a hook.
+                    return Err(mlua::Error::runtime("grove: callback timed out"));
+                }
+                Ok(mlua::VmState::Continue)
+            })
+            .map_err(|error| CallError::Failed(error.to_string()))?;
+
+        let outcome = callback.call::<()>(());
+        // Always removed: a hook left installed would bound every later call
+        // against a deadline that has already passed.
+        self.lua.remove_hook();
+
+        match outcome {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let text = error.to_string();
+                if text.contains("timed out") {
+                    Err(CallError::Timeout)
+                } else {
+                    Err(CallError::Failed(text))
+                }
+            }
+        }
     }
 
     /// Retrieves a keymap callback from this runtime's VM.
@@ -1404,6 +1472,43 @@ fn parse_event(value: &str) -> mlua::Result<LifecycleEvent> {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn a_runaway_callback_is_stopped_rather_than_freezing_the_caller() {
+        // §10.5: user code runs inside the TUI's loop, so a `while true do
+        // end` would freeze the screen with no way back. The instruction hook
+        // is the only thing that can interrupt a running script without
+        // killing the process around it.
+        let source = "local grove = require('grove')\n\
+                      grove.keymap('^g w', function() while true do end end)\n";
+        let runtime = TuiRuntime::load_source(source, "runaway").runtime;
+        let started = Instant::now();
+        let outcome = runtime.call_keymap(0, Duration::from_millis(150));
+        assert_eq!(outcome, Err(CallError::Timeout));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "it took {:?}",
+            started.elapsed()
+        );
+
+        // And the VM is usable afterwards: the hook is removed, so a later
+        // callback is not bounded against a deadline that has already passed.
+        let source = "local grove = require('grove')\n\
+                      grove.keymap('^g w', function() end)\n";
+        let runtime = TuiRuntime::load_source(source, "fine").runtime;
+        assert_eq!(runtime.call_keymap(0, Duration::from_millis(500)), Ok(()));
+    }
+
+    #[test]
+    fn a_throwing_callback_reports_what_it_said() {
+        let source = "local grove = require('grove')\n\
+                      grove.keymap('^g w', function() error('no such repo') end)\n";
+        let runtime = TuiRuntime::load_source(source, "throws").runtime;
+        match runtime.call_keymap(0, Duration::from_secs(1)) {
+            Err(CallError::Failed(why)) => assert!(why.contains("no such repo"), "{why}"),
+            other => panic!("expected a failure, got {other:?}"),
+        }
+    }
 
     fn temp_path(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(

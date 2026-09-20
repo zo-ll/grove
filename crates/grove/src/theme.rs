@@ -731,6 +731,7 @@ mod tests {
         ("terminal.rs", include_str!("terminal.rs")),
         ("terminals.rs", include_str!("terminals.rs")),
         ("text.rs", include_str!("text.rs")),
+        ("userkeys.rs", include_str!("userkeys.rs")),
         ("worktrees.rs", include_str!("worktrees.rs")),
     ];
 

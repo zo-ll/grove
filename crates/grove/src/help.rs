@@ -49,7 +49,18 @@ impl Help {
     ///
     /// Built here rather than inside `render` so the tests can read it and the
     /// scroll can measure it.
+    /// The built-in bindings alone, for tests about what grove itself binds.
+    #[cfg(test)]
     pub fn lines(screen: Screen, theme: &Theme) -> Vec<Line<'static>> {
+        Self::lines_with(screen, &[], theme)
+    }
+
+    /// The same, including the user's own bindings.
+    ///
+    /// They belong here for the reason the rest does: help is generated, so a
+    /// binding that exists is a binding that shows. A user who added `^g w`
+    /// and cannot find it in `^g ?` would reasonably conclude it did not load.
+    pub fn lines_with(screen: Screen, user: &[&str], theme: &Theme) -> Vec<Line<'static>> {
         let mut lines = vec![
             Line::styled(
                 format!(" keys · {}", name(screen)),
@@ -79,15 +90,35 @@ impl Help {
                 Span::styled(binding.label, theme.style(Role::Clean)),
             ]));
         }
+        if !user.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::styled(
+                " from your config",
+                theme.style(Role::Muted).add_modifier(Modifier::BOLD),
+            ));
+            for spelling in user {
+                lines.push(Line::from(vec![
+                    Span::styled(format!(" {spelling:<12}"), theme.style(Role::Accent)),
+                    Span::styled("yours", theme.style(Role::Clean)),
+                ]));
+            }
+        }
         lines
     }
 
     /// Draw, from wherever the scroll has reached.
-    pub fn render(&self, buf: &mut Buffer, area: Rect, screen: Screen, theme: &Theme) {
+    pub fn render(
+        &self,
+        buf: &mut Buffer,
+        area: Rect,
+        screen: Screen,
+        user: &[&str],
+        theme: &Theme,
+    ) {
         if area.width == 0 || area.height == 0 {
             return;
         }
-        let all = Self::lines(screen, theme);
+        let all = Self::lines_with(screen, user, theme);
         let room = usize::from(area.height);
         let shown: Vec<Line<'static>> = all.into_iter().skip(self.offset).take(room).collect();
         Paragraph::new(shown).render(area, buf);
@@ -212,6 +243,25 @@ mod tests {
         assert!(!help.scroll(100, total, room), "already at the bottom");
         assert!(help.scroll(-100, total, room));
         assert_eq!(help.offset, 0);
+    }
+
+    #[test]
+    fn a_users_own_bindings_are_listed_too() {
+        // Help is generated, so a binding that exists is a binding that shows.
+        // Someone who added `^g w` and cannot find it in `^g ?` would
+        // reasonably conclude it did not load.
+        let shown = Help::lines_with(Screen::Dash, &["^g w"], &theme())
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(shown.contains("from your config"), "{shown}");
+        assert!(shown.contains("^g w"), "{shown}");
     }
 
     #[test]
