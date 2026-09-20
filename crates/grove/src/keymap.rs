@@ -165,6 +165,30 @@ const fn b(prefixed: bool, key: KeyCode, action: Action, label: &'static str) ->
     }
 }
 
+/// How the keymap spells one binding's key, prefix included.
+///
+/// Shared with the status bar and the help overlay so all three agree: the bar
+/// says `^g a adopt`, help says `^g a`, and both come from here.
+pub fn label_of(binding: &Binding) -> String {
+    let key = match binding.key {
+        KeyCode::Char(' ') => "space".into(),
+        KeyCode::Char(c) => c.to_string(),
+        KeyCode::Enter => "enter".into(),
+        KeyCode::Tab => "tab".into(),
+        KeyCode::BackTab => "shift-tab".into(),
+        KeyCode::Esc => "esc".into(),
+        KeyCode::Backspace => "backspace".into(),
+        KeyCode::Up => "↑".into(),
+        KeyCode::Down => "↓".into(),
+        other => format!("{other:?}").to_lowercase(),
+    };
+    if binding.prefixed {
+        format!("^g {key}")
+    } else {
+        key
+    }
+}
+
 /// How the keymap spells the key that performs `action`, as the status bar
 /// and the empty state both show it.
 ///
