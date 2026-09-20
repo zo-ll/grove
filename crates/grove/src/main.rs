@@ -17,6 +17,7 @@ mod palette;
 mod prune;
 mod repos;
 mod select;
+mod sessions;
 mod statusbar;
 mod terminal;
 mod terminals;
@@ -46,6 +47,7 @@ use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Padding, Paragraph, Wrap};
 use repos::Repos;
+use sessions::Sessions;
 use terminals::Terminals;
 use theme::{Depth, Role, Theme};
 use worktrees::{Intent, Worktrees};
@@ -72,6 +74,10 @@ struct Ui {
     palette: Palette,
     /// The prune picker's rows, while it is open.
     prune: Prune,
+    /// Stored sessions, for the picker.
+    sessions: Sessions,
+    /// The session `X` asked about, waiting on #29's confirm.
+    ending: Option<grove_domain::SessionId>,
     /// A `new` that hit a branch already checked out somewhere else, and the
     /// worktree it collided with. §7 says the flow offers to adopt that
     /// worktree rather than refusing and leaving the user to find it.
@@ -170,6 +176,8 @@ impl Ui {
             terminals: Terminals::default(),
             palette: Palette::default(),
             prune: Prune::default(),
+            sessions: Sessions::default(),
+            ending: None,
             conflict: None,
             session: None,
             note: None,
@@ -348,6 +356,47 @@ fn run_command(chosen: Option<&'static palette::Command>, state: &mut State, ui:
             true
         }
     }
+}
+
+/// Carry out what the session picker decided a key means.
+///
+/// `X` is the exception that shapes the rest: it never sends anything, it
+/// moves to the confirm, because ending a session removes worktrees and §2
+/// makes that the one act grove asks about.
+fn act_on_session(intent: Option<sessions::Intent>, state: &mut State, ui: &mut Ui) -> bool {
+    let Some(intent) = intent else {
+        // Nothing under the cursor — an empty list, not a refusal.
+        return false;
+    };
+    let request = match intent {
+        sessions::Intent::Refused(why) => {
+            ui.note = Some(why);
+            return true;
+        }
+        sessions::Intent::ConfirmEnd(session) => {
+            ui.ending = Some(session);
+            ui.screen = Screen::EndSession;
+            return true;
+        }
+        sessions::Intent::Resume(session) => Request::OpenSession(session),
+        sessions::Intent::Detach(session) => Request::DetachSession(session),
+        sessions::Intent::Close(session) => Request::CloseSession(session),
+    };
+    if let Err(e) = send(state, &request) {
+        ui.note = Some(format!("could not reach the daemon: {e}"));
+        return true;
+    }
+    // The daemon decides what the list looks like afterwards — resuming
+    // replaces the open session and detaches the outgoing one, which is its
+    // bookkeeping rather than something to mirror here.
+    let _ = send(state, &Request::ListSessions);
+    ui.note = None;
+    if matches!(request, Request::OpenSession(_)) {
+        // The dash is about to be a different session's.
+        ui.screen = Screen::Dash;
+        let _ = send(state, &Request::ListRepos);
+    }
+    true
 }
 
 /// Carry out a command that has its argument.
@@ -672,6 +721,50 @@ fn handle(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
                         redraw: act_on_worktree(intent, state, ui),
                     }
                 }
+                Routed::Act(Action::OpenPicker) => {
+                    // Ask before showing: a list of sessions that fills in
+                    // underneath someone already pressing `X` is the worst
+                    // possible version of this screen.
+                    if let Err(e) = send(state, &Request::ListSessions) {
+                        ui.note = Some(format!("could not reach the daemon: {e}"));
+                    }
+                    ui.screen = Screen::Picker;
+                    Flow::Continue { redraw: true }
+                }
+                Routed::Act(Action::MoveDown) if ui.screen == Screen::Picker => Flow::Continue {
+                    redraw: ui.sessions.move_down(),
+                },
+                Routed::Act(Action::MoveUp) if ui.screen == Screen::Picker => Flow::Continue {
+                    redraw: ui.sessions.move_up(),
+                },
+                Routed::Act(Action::Cancel) if ui.screen == Screen::Picker => {
+                    ui.screen = Screen::Dash;
+                    Flow::Continue { redraw: true }
+                }
+                Routed::Act(Action::Confirm) if ui.screen == Screen::Picker => {
+                    let intent = ui.sessions.resume();
+                    Flow::Continue {
+                        redraw: act_on_session(intent, state, ui),
+                    }
+                }
+                Routed::Act(Action::Detach) if ui.screen == Screen::Picker => {
+                    let intent = ui.sessions.detach();
+                    Flow::Continue {
+                        redraw: act_on_session(intent, state, ui),
+                    }
+                }
+                Routed::Act(Action::Close) if ui.screen == Screen::Picker => {
+                    let intent = ui.sessions.close();
+                    Flow::Continue {
+                        redraw: act_on_session(intent, state, ui),
+                    }
+                }
+                Routed::Act(Action::EndSession) if ui.screen == Screen::Picker => {
+                    let intent = ui.sessions.end();
+                    Flow::Continue {
+                        redraw: act_on_session(intent, state, ui),
+                    }
+                }
                 Routed::Act(Action::OpenPalette) => {
                     ui.screen = Screen::Palette;
                     ui.palette.open();
@@ -850,6 +943,7 @@ fn handle(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
                 .iter()
                 .find(|row| row.state == grove_domain::SessionState::Attached)
                 .map(|row| row.id.clone());
+            ui.sessions.set(rows);
             Flow::Continue { redraw: true }
         }
 
@@ -1157,6 +1251,15 @@ fn draw(f: &mut ratatui::Frame, state: &State, ui: &Ui) {
                 .is_some_and(|row| row.terminal.is_some());
             ui.terminals
                 .render(f.buffer_mut(), area, &ui.theme, has_terminal);
+        }
+        status_bar(f, bar_area, ui);
+        return;
+    }
+
+    if matches!(state, State::Connected { .. }) && ui.screen == Screen::Picker {
+        let inner = dash::render(f.buffer_mut(), body_area, ui.panes, ui.focus, &ui.theme);
+        if let Some(area) = inner.worktrees.or(inner.repos).or(inner.terminal) {
+            ui.sessions.render(f.buffer_mut(), area, &ui.theme);
         }
         status_bar(f, bar_area, ui);
         return;
@@ -2530,6 +2633,121 @@ mod tests {
             size: 100 * 1024 * 1024,
             blockers,
         }
+    }
+
+    fn session_row(name: &str, state: grove_domain::SessionState) -> grove_proto::SessionRow {
+        grove_proto::SessionRow {
+            id: grove_domain::SessionId(name.into()),
+            name: name.into(),
+            members: vec!["billing".into()],
+            state,
+            terminals: 2,
+            since: 0,
+            size: 0,
+        }
+    }
+
+    /// The picker, open, with one attached and one detached session.
+    fn picking(s: &mut State, ui: &mut Ui, theirs: &mut UnixStream) {
+        handle(prefix(), s, ui);
+        handle(key(KeyCode::Char('s')), s, ui);
+        handle(
+            Input::Daemon(DaemonEvent::Sessions(vec![
+                session_row("open one", grove_domain::SessionState::Attached),
+                session_row("away one", grove_domain::SessionState::Detached),
+            ])),
+            s,
+            ui,
+        );
+        let _ = sent(theirs);
+    }
+
+    #[test]
+    fn the_picker_asks_for_the_list_before_showing_it() {
+        // A list that fills in underneath someone already pressing `X` is the
+        // worst possible version of this screen.
+        let (mut s, mut theirs) = wired();
+        let mut ui = Ui::new();
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('s')), &mut s, &mut ui);
+        assert_eq!(ui.screen, Screen::Picker);
+        assert!(sent(&mut theirs).contains(&Request::ListSessions));
+    }
+
+    #[test]
+    fn x_routes_to_the_confirm_and_sends_nothing() {
+        // Acceptance: `X` never acts directly. Ending removes worktrees, and
+        // §2 makes that the one thing grove asks about.
+        let (mut s, mut theirs) = wired();
+        let mut ui = Ui::new();
+        picking(&mut s, &mut ui, &mut theirs);
+
+        handle(key(KeyCode::Char('X')), &mut s, &mut ui);
+        assert_eq!(ui.screen, Screen::EndSession, "the confirm, not the act");
+        assert_eq!(ui.ending.as_ref().map(|id| id.0.as_str()), Some("open one"));
+        assert!(
+            sent(&mut theirs).is_empty(),
+            "nothing may be sent before the confirm"
+        );
+    }
+
+    #[test]
+    fn resume_replaces_the_open_session() {
+        let (mut s, mut theirs) = wired();
+        let mut ui = Ui::new();
+        picking(&mut s, &mut ui, &mut theirs);
+
+        handle(key(KeyCode::Down), &mut s, &mut ui);
+        handle(key(KeyCode::Enter), &mut s, &mut ui);
+        let asked = sent(&mut theirs);
+        assert!(
+            asked.iter().any(|r| matches!(
+                r,
+                Request::OpenSession(id) if id.0 == "away one"
+            )),
+            "{asked:?}"
+        );
+        assert_eq!(ui.screen, Screen::Dash, "the dash is that session's now");
+        assert!(
+            asked.contains(&Request::ListRepos),
+            "and its repos are asked for: {asked:?}"
+        );
+    }
+
+    #[test]
+    fn resuming_what_is_already_open_is_refused() {
+        let (mut s, mut theirs) = wired();
+        let mut ui = Ui::new();
+        picking(&mut s, &mut ui, &mut theirs);
+
+        handle(key(KeyCode::Enter), &mut s, &mut ui);
+        let note = ui.note.clone().expect("a reason");
+        assert!(note.contains("already open"), "{note}");
+        assert!(sent(&mut theirs).is_empty());
+        assert_eq!(ui.screen, Screen::Picker, "still choosing");
+    }
+
+    #[test]
+    fn detach_and_close_send_their_own_requests() {
+        // Three verbs for three states, and each has to reach the daemon as
+        // itself: detach keeps terminals, close kills them.
+        let (mut s, mut theirs) = wired();
+        let mut ui = Ui::new();
+        picking(&mut s, &mut ui, &mut theirs);
+
+        handle(key(KeyCode::Char('d')), &mut s, &mut ui);
+        assert!(
+            sent(&mut theirs)
+                .iter()
+                .any(|r| matches!(r, Request::DetachSession(_)))
+        );
+
+        handle(key(KeyCode::Char('c')), &mut s, &mut ui);
+        assert!(
+            sent(&mut theirs)
+                .iter()
+                .any(|r| matches!(r, Request::CloseSession(_)))
+        );
     }
 
     #[test]
