@@ -294,6 +294,39 @@ impl SessionOrchestrator {
                 repo: repo.clone(),
                 rows: self.worktree_rows(&repo)?,
             }]),
+            Request::DiffWorktree { worktree, file } => {
+                let repository = self.repository(&worktree.repo)?.clone();
+                let checkout = self
+                    .find_checkout(&repository, &worktree.branch)?
+                    .ok_or_else(|| {
+                        OrchestrationError::WorktreeMissing(OwnedWorktree {
+                            repo: worktree.repo.clone(),
+                            branch: worktree.branch.clone(),
+                        })
+                    })?;
+                // Read-only by construction: every git call on this path is a
+                // §7 read. The base is the repo's own — an override decides
+                // for its repo, like the prune verdict does.
+                let outcome = crate::diff::diff_screen(
+                    &checkout.path,
+                    self.effective_base(&repository).as_deref(),
+                    file.as_deref(),
+                )
+                .map_err(|error| match error {
+                    crate::diff::DiffScreenError::Git(source) => {
+                        OrchestrationError::GitRead(source)
+                    }
+                })?;
+                Ok(vec![Event::Diff {
+                    worktree,
+                    base: outcome.base,
+                    files: outcome.files,
+                    selected: outcome.selected,
+                    hunks: outcome.hunks,
+                    added: outcome.added,
+                    removed: outcome.removed,
+                }])
+            }
             Request::ListPruneCandidates => Ok(vec![Event::PruneCandidates(self.prune_rows()?)]),
             Request::Prune(selection) => Ok(vec![self.prune(&selection)?]),
             Request::SpawnTerminal(target) => {
