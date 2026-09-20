@@ -26,7 +26,7 @@ use ratatui::crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
 };
 use ratatui::crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::crossterm::{cursor, execute};
 
@@ -83,6 +83,17 @@ impl Guard {
         execute!(
             out,
             EnterAlternateScreen,
+            // The dash leaves the columns between its panes unpainted — that
+            // gap is the mock's, and there is nothing to paint there. So
+            // whatever the alternate screen already held would stay in those
+            // columns, and a stray character standing between two panes reads
+            // as a rendering fault. Not every terminal hands over a blank one.
+            //
+            // Written straight out rather than through `Terminal::clear`,
+            // which asks the terminal where the cursor is and waits for an
+            // answer — a question a pty with nothing attached never answers,
+            // and grove is run inside one by its own tests.
+            Clear(ClearType::All),
             EnableMouseCapture,
             EnableBracketedPaste
         )?;
