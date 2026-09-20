@@ -211,10 +211,15 @@ pub fn connect_or_spawn(
 ) -> Result<UnixStream, LifecycleError> {
     match connect(workspace) {
         Ok(stream) => return Ok(stream),
+        // A busy daemon's backlog answers EAGAIN (WouldBlock) rather than
+        // refused: the daemon is present, so the wait loop below — which
+        // owns the deadline — should see it again, not this arm.
         Err(LifecycleError::Socket { source, .. })
             if matches!(
                 source.kind(),
-                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                io::ErrorKind::NotFound
+                    | io::ErrorKind::ConnectionRefused
+                    | io::ErrorKind::WouldBlock
             ) => {}
         Err(error) => return Err(error),
     }
@@ -239,9 +244,14 @@ pub fn connect_or_spawn(
             Err(LifecycleError::Socket { source, .. })
                 if matches!(
                     source.kind(),
-                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                    io::ErrorKind::NotFound
+                        | io::ErrorKind::ConnectionRefused
+                        | io::ErrorKind::WouldBlock
                 ) && Instant::now() < deadline =>
             {
+                // WouldBlock here is a saturated accept backlog: the daemon
+                // is alive, and attaching is worth waiting its window out —
+                // not a reason to report a startup failure.
                 thread::sleep(Duration::from_millis(20));
             }
             Err(LifecycleError::Socket { .. }) => {
