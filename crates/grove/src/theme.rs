@@ -720,6 +720,7 @@ mod tests {
         ("keymap.rs", include_str!("keymap.rs")),
         ("main.rs", include_str!("main.rs")),
         ("palette.rs", include_str!("palette.rs")),
+        ("prune.rs", include_str!("prune.rs")),
         ("repos.rs", include_str!("repos.rs")),
         ("select.rs", include_str!("select.rs")),
         ("statusbar.rs", include_str!("statusbar.rs")),
