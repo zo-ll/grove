@@ -751,11 +751,23 @@ mod tests {
         let Ok(root) = std::fs::read_dir(&src) else {
             // The only way this happens is the tree the test was compiled in
             // having been removed since — a reviewer's exported worktree, or a
-            // `cargo clean` of a checkout that no longer exists. There is
-            // nothing to compare against, and the guard itself is unaffected
-            // because its sources are baked in.
+            // checkout that no longer exists. There is nothing to compare
+            // against, and the guard itself is unaffected because its sources
+            // are baked in.
+            //
+            // Which is fine locally and not fine in CI: there the tree is the
+            // runner's own checkout, so a missing one means the runner is
+            // broken, and passing quietly would be the one path where this
+            // check approves without checking. Panicking here everywhere would
+            // just resurrect the flake for stale local binaries, so the
+            // environment decides.
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "{} is gone, so the coverage check cannot run — in CI that means a broken checkout",
+                src.display()
+            );
             eprintln!(
-                "skipping coverage check: {} is gone, so the tree cannot be compared",
+                "skipping coverage check: {} is gone (stale test binary)",
                 src.display()
             );
             return;
