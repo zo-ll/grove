@@ -450,11 +450,25 @@ fn status_pairs(bytes: &[u8]) -> Result<impl Fn(&Path) -> char + '_, Error> {
 
 /// Untracked files, the `?` rows of the diff screen (§4.4). `git diff` never
 /// lists them, but the screen shows them, so the dirty-state op answers.
+///
+/// The listing is `-z` and split on NUL, like every other machine-read
+/// porcelain here: git's default `core.quotePath` prints a non-ASCII name as
+/// `?? "caf\303\251.txt"` in text mode — quotes and octal escapes that
+/// would reach the wire as the row's path — while `-z` prints the name
+/// itself, and NUL records are the only way a newline in a filename survives.
 pub fn untracked_files(worktree: &Path) -> Result<Vec<PathBuf>, Error> {
-    let status = git_success(worktree, "status porcelain", &["status", "--porcelain"])?;
+    let status = git_success(
+        worktree,
+        "status porcelain",
+        &["status", "--porcelain", "-z"],
+    )?;
     let mut files = Vec::new();
-    for line in String::from_utf8_lossy(&status).lines() {
-        if let Some(path) = line.strip_prefix("?? ") {
+    for record in status
+        .split(|byte| *byte == 0)
+        .filter(|row| !row.is_empty())
+    {
+        let text = String::from_utf8_lossy(record);
+        if let Some(path) = text.strip_prefix("?? ") {
             files.push(PathBuf::from(path));
         }
     }
@@ -1139,6 +1153,42 @@ mod tests {
             untracked_files(&temp.0).unwrap(),
             [PathBuf::from("scratch")]
         );
+    }
+
+    #[test]
+    fn untracked_names_survive_git_quotes_default() {
+        // git's default core.quotePath escapes a non-ASCII name in text mode
+        // (?? "caf\303\251.txt"); the -z listing prints the name itself, which
+        // is why this listing is -z and the wire never carries the escapes.
+        let temp = TempDir::new("quoted");
+        repo(&temp.0);
+        fs::write(temp.0.join("café.txt"), "non-ascii\n").unwrap();
+        assert_eq!(
+            untracked_files(&temp.0).unwrap(),
+            [PathBuf::from("café.txt")]
+        );
+    }
+
+    #[test]
+    fn a_typechange_is_reported_as_git_says() {
+        // file → symlink: git's name-status says T. The crate reports what
+        // git says; the wire maps T to M (a typechange modifies an existing
+        // path), keeping the wire's status set closed.
+        let temp = TempDir::new("typechange");
+        repo(&temp.0);
+        fs::write(temp.0.join("shape"), "file\n").unwrap();
+        git(&temp.0, &["add", "shape"]);
+        git(&temp.0, &["commit", "-qm", "file"]);
+        // The branch point has the file; HEAD has the symlink.
+        git(&temp.0, &["branch", "base"]);
+        fs::remove_file(temp.0.join("shape")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("target", temp.0.join("shape")).unwrap();
+        git(&temp.0, &["add", "shape"]);
+        git(&temp.0, &["commit", "-qm", "symlink"]);
+        let files = diff(&temp.0, "base").unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].status, 'T');
     }
 
     #[test]
