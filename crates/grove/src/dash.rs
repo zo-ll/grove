@@ -16,7 +16,7 @@
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Modifier;
-use ratatui::text::{Line, Span};
+use ratatui::text::Span;
 use ratatui::widgets::{Block, Borders, Widget};
 
 use crate::keymap::{Focus, Screen};
@@ -324,15 +324,6 @@ fn title(pane: Pane) -> &'static str {
     }
 }
 
-/// What the pane says until the issue that fills it lands.
-fn placeholder(pane: Pane) -> &'static str {
-    match pane {
-        Focus::Repos => "repos land in #19",
-        Focus::Worktrees => "worktrees land in #20",
-        Focus::Terminal => "the pty lands in #21",
-    }
-}
-
 /// Which dash list the arrows are driving, if any.
 ///
 /// Three conditions, and each one has already been a bug once. The screen must
@@ -398,14 +389,6 @@ pub fn render(buf: &mut Buffer, area: Rect, panes: Panes, focus: Pane, theme: &T
         }
     }
     inner
-}
-
-/// What a pane says while the issue that fills it is still open.
-///
-/// Drawn by the caller into the area `render` hands back, so it disappears
-/// one pane at a time as #19 through #21 land rather than all at once.
-pub fn placeholder_line(pane: Pane, theme: &Theme) -> Line<'static> {
-    Line::styled(placeholder(pane), theme.style(Role::Muted))
 }
 
 #[cfg(test)]

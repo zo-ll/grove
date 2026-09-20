@@ -175,8 +175,15 @@ This keeps the prefix where it earns its keep and out of the way everywhere else
 | `^g a` | adopt the selected unowned worktree |
 | `^g r` | release the selected owned worktree |
 | `^g o` | open the selected worktree in `config.editor` |
+| `^g ↑` / `^g ↓` | scroll the terminal pane's history |
+| `^g enter` | open a terminal for the selected worktree |
 
 Focus is functional, not decorative: `↑`/`↓` drive whichever list currently has focus.
+
+The last two are prefixed because the terminal pane is a pty and takes the unprefixed
+arrows itself — §3.1's rule, applied to grove's own scrolling. `^g enter` exists because
+a worktree can legitimately have no terminal: one that was adopted, or any of them after
+the daemon has been restarted.
 
 ### 3.4 Picker bindings
 

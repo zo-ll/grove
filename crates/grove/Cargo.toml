@@ -13,6 +13,11 @@ workspace = true
 grove-domain = { workspace = true }
 grove-proto = { workspace = true }
 ratatui = "0.30"
+# SPEC §8 puts the terminal parser on the TUI side: the daemon streams pty
+# bytes and the client keeps its own grid, so the pane stays current between
+# refreshes. tui-term renders that grid as a ratatui widget.
+tui-term = "0.3"
+vt100 = "0.16"
 # Already in the graph under ratatui; taken directly because a repo or branch
 # name is user data and may be any width, and a truncation that counts
 # characters clips a CJK name a column short.
