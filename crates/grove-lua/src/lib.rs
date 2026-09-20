@@ -368,6 +368,49 @@ impl TuiRuntime {
         }
     }
 
+    /// Run a palette command's callback with its argument, bounded in time.
+    ///
+    /// §10.3's example takes one — `grove.command("review", function(pr) …)` —
+    /// so the argument the user typed is passed straight through. An empty
+    /// argument is still passed, as an empty string, because a command that
+    /// takes none should see one rather than a nil it has to guard.
+    pub fn call_command(
+        &self,
+        index: usize,
+        argument: &str,
+        budget: Duration,
+    ) -> Result<(), CallError> {
+        let callback = self
+            .command_callback(index)
+            .map_err(|error| CallError::Failed(error.to_string()))?;
+
+        let deadline = Instant::now() + budget;
+        let triggers = mlua::HookTriggers::new().every_nth_instruction(10_000);
+        self.lua
+            .set_hook(triggers, move |_, _| {
+                if Instant::now() >= deadline {
+                    return Err(mlua::Error::runtime("grove: callback timed out"));
+                }
+                Ok(mlua::VmState::Continue)
+            })
+            .map_err(|error| CallError::Failed(error.to_string()))?;
+
+        let outcome = callback.call::<()>(argument.to_string());
+        self.lua.remove_hook();
+
+        match outcome {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let text = error.to_string();
+                if text.contains("timed out") {
+                    Err(CallError::Timeout)
+                } else {
+                    Err(CallError::Failed(text))
+                }
+            }
+        }
+    }
+
     /// Retrieves a keymap callback from this runtime's VM.
     pub fn keymap_callback(&self, index: usize) -> mlua::Result<Function> {
         self.lua
@@ -1527,6 +1570,31 @@ fn parse_event(value: &str) -> mlua::Result<LifecycleEvent> {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn a_command_is_given_what_was_typed_after_its_name() {
+        let source = "local grove = require('grove')\n\
+                      seen = nil\n\
+                      grove.command('review', function(pr) seen = pr end)\n";
+        let runtime = TuiRuntime::load_source(source, "command").runtime;
+        assert_eq!(
+            runtime.call_command(0, "4471", Duration::from_secs(1)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_runaway_command_is_stopped_like_a_keymap() {
+        let source = "local grove = require('grove')\n\
+                      grove.command('hang', function() while true do end end)\n";
+        let runtime = TuiRuntime::load_source(source, "hang").runtime;
+        let started = Instant::now();
+        assert_eq!(
+            runtime.call_command(0, "", Duration::from_millis(150)),
+            Err(CallError::Timeout)
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
 
     #[test]
     fn a_column_is_given_the_worktree_and_returns_a_string() {

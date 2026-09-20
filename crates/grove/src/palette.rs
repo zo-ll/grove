@@ -137,10 +137,35 @@ pub enum Mode {
     /// palette stops filtering commands here: `new feat/x` is a branch name
     /// with a slash in it, not a fuzzy query.
     Arguing {
-        command: &'static Command,
+        command: Entry,
         argument: String,
         select: crate::select::Select,
     },
+}
+
+/// A command as the palette lists it, built-in or the user's.
+///
+/// Owned rather than a `&'static Command`, because a user's name comes from
+/// their config and outlives nothing. The `user` index is how `enter` finds
+/// the callback again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entry {
+    pub name: String,
+    pub summary: String,
+    pub takes: Takes,
+    /// `Some(index)` for a command from `config.lua`.
+    pub user: Option<usize>,
+}
+
+impl Entry {
+    fn built_in(command: &'static Command) -> Self {
+        Self {
+            name: command.name.to_string(),
+            summary: command.summary.to_string(),
+            takes: command.takes,
+            user: None,
+        }
+    }
 }
 
 /// The palette's state while it is open.
@@ -149,6 +174,9 @@ pub struct Palette {
     input: String,
     selected: usize,
     mode: Mode,
+    /// Names registered from `config.lua`, in registration order — the index
+    /// is what `enter` hands back to the runtime.
+    user: Vec<String>,
 }
 
 impl Default for Palette {
@@ -157,6 +185,7 @@ impl Default for Palette {
             input: String::new(),
             selected: 0,
             mode: Mode::Choosing,
+            user: Vec::new(),
         }
     }
 }
@@ -164,6 +193,11 @@ impl Default for Palette {
 impl Palette {
     /// Start again. Opening a palette that remembers the last query would make
     /// `^g /` mean two different things depending on history.
+    /// Take the names the user registered.
+    pub fn with_user(&mut self, names: Vec<String>) {
+        self.user = names;
+    }
+
     pub fn open(&mut self) {
         self.input.clear();
         self.selected = 0;
@@ -175,8 +209,8 @@ impl Palette {
     ///
     /// Called when a command is chosen — by `enter` or by typing its name and
     /// a space, which is how a command line behaves.
-    pub fn argue(&mut self, command: &'static Command, repos: &[grove_proto::RepoRow]) {
-        let select = match picker_for(command.name) {
+    pub fn argue(&mut self, command: Entry, repos: &[grove_proto::RepoRow]) {
+        let select = match picker_for(&command.name) {
             Some(wants) => crate::select::Select::build(repos, wants),
             None => crate::select::Select::default(),
         };
@@ -229,7 +263,7 @@ impl Palette {
     }
 
     /// The command being argued, if any.
-    pub fn arguing(&self) -> Option<&'static Command> {
+    pub fn arguing(&self) -> Option<&Entry> {
         match &self.mode {
             Mode::Choosing => None,
             Mode::Arguing { command, .. } => Some(command),
@@ -282,32 +316,48 @@ impl Palette {
     }
 
     /// The commands matching what has been typed, best first.
-    pub fn matches(&self) -> Vec<&'static Command> {
+    pub fn matches(&self) -> Vec<Entry> {
         if matches!(self.mode, Mode::Arguing { .. }) {
             // Not a command list any more.
             return Vec::new();
         }
+        // The user's sit alongside the built-ins rather than in a section of
+        // their own: they are commands, and a palette that files them
+        // elsewhere makes the user's own additions the hardest to reach.
+        let all: Vec<Entry> = COMMANDS
+            .iter()
+            .map(Entry::built_in)
+            .chain(self.user.iter().enumerate().map(|(index, name)| Entry {
+                name: name.clone(),
+                summary: "from your config".into(),
+                // What a user command wants is its own business; the palette
+                // hands over whatever was typed after the name.
+                takes: Takes::Argument("[argument]"),
+                user: Some(index),
+            }))
+            .collect();
+
         if self.input.is_empty() {
             // Nothing typed lists everything, in SPEC §5's order.
-            return COMMANDS.iter().collect();
+            return all;
         }
-        let mut scored: Vec<(i32, &'static Command)> = COMMANDS
-            .iter()
-            .filter_map(|command| score(&self.input, command.name).map(|s| (s, command)))
+        let mut scored: Vec<(i32, Entry)> = all
+            .into_iter()
+            .filter_map(|entry| score(&self.input, &entry.name).map(|s| (s, entry)))
             .collect();
         // Higher score first; ties go to the shorter name, which is the more
         // general command — `new` before `session new` for "new".
         scored.sort_by(|a, b| {
             b.0.cmp(&a.0)
                 .then_with(|| a.1.name.len().cmp(&b.1.name.len()))
-                .then_with(|| a.1.name.cmp(b.1.name))
+                .then_with(|| a.1.name.cmp(&b.1.name))
         });
-        scored.into_iter().map(|(_, command)| command).collect()
+        scored.into_iter().map(|(_, entry)| entry).collect()
     }
 
     /// The command `enter` would run.
-    pub fn selected(&self) -> Option<&'static Command> {
-        self.matches().get(self.selected).copied()
+    pub fn selected(&self) -> Option<Entry> {
+        self.matches().get(self.selected).cloned()
     }
 
     pub fn move_down(&mut self) -> bool {
@@ -421,7 +471,7 @@ impl Palette {
                 Span::styled(if chosen { "❯ " } else { "  " }, theme.style(Role::Accent)),
                 Span::styled(name, name_style),
                 Span::raw("  "),
-                Span::styled(truncate(command.summary, room), theme.style(Role::Muted)),
+                Span::styled(truncate(&command.summary, room), theme.style(Role::Muted)),
             ]));
         }
         Paragraph::new(lines).render(area, buf);
@@ -491,8 +541,8 @@ mod tests {
         palette
     }
 
-    fn names(palette: &Palette) -> Vec<&'static str> {
-        palette.matches().iter().map(|c| c.name).collect()
+    fn names(palette: &Palette) -> Vec<String> {
+        palette.matches().into_iter().map(|c| c.name).collect()
     }
 
     #[test]
@@ -500,7 +550,7 @@ mod tests {
         let palette = Palette::default();
         assert_eq!(names(&palette).len(), COMMANDS.len());
         assert_eq!(names(&palette)[0], "scan");
-        assert_eq!(names(&palette).last(), Some(&"keys"));
+        assert_eq!(names(&palette).last().map(String::as_str), Some("keys"));
     }
 
     #[test]
@@ -520,7 +570,7 @@ mod tests {
         // right.
         assert_eq!(names(&typed("sn"))[0], "snapshot");
         assert!(
-            names(&typed("sn")).contains(&"session new"),
+            names(&typed("sn")).iter().any(|n| n == "session new"),
             "but the initials still match"
         );
     }
@@ -530,7 +580,7 @@ mod tests {
         // "new" is both a command and the tail of "session new". Typing it
         // should offer the command itself first.
         assert_eq!(names(&typed("new"))[0], "new");
-        assert!(names(&typed("new")).contains(&"session new"));
+        assert!(names(&typed("new")).iter().any(|n| n == "session new"));
     }
 
     #[test]
@@ -556,7 +606,7 @@ mod tests {
         assert_eq!(palette.selected, 1, "the cursor moved off the best match");
         palette.push('c');
         assert_eq!(palette.selected, 0);
-        assert_eq!(palette.selected().map(|c| c.name), Some("scan"));
+        assert_eq!(palette.selected().map(|c| c.name), Some("scan".to_string()));
     }
 
     #[test]
@@ -676,6 +726,7 @@ mod tests {
         let chosen = COMMANDS
             .iter()
             .find(|c| c.name == command)
+            .map(Entry::built_in)
             .expect("a command");
         let mut palette = Palette::default();
         palette.argue(chosen, repos);
