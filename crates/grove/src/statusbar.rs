@@ -123,13 +123,45 @@ fn next_char(key: &str) -> Option<String> {
 /// while the hints are not — so a narrow terminal ellipsizes `repo · branch`
 /// rather than quietly unteaching the keys. The session is last to go,
 /// because it is the only place grove says which session you are in.
+/// Something the bar has to say, and where it came from.
+///
+/// The two are not interchangeable. A config problem has been true since
+/// startup and is about a file the user wrote; a refusal is about the key they
+/// just pressed. Labelling the second one `config:` sends someone to edit
+/// `config.lua` over "no open session to add in", which is a fault in neither
+/// the config nor the reader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Note<'a> {
+    Refused(&'a str),
+    Config(&'a str),
+}
+
+impl Note<'_> {
+    fn said(&self) -> String {
+        match self {
+            Self::Refused(text) => format!("{text}  "),
+            Self::Config(text) => format!("config: {text}  "),
+        }
+    }
+
+    fn style(&self, theme: &Theme) -> Style {
+        match self {
+            // A refusal is not a fault: grove declined, and said why. It gets
+            // the colour of something that needs attention rather than the
+            // one reserved for things that went wrong.
+            Self::Refused(_) => theme.style(Role::Dirty),
+            Self::Config(_) => theme.style(Role::Error),
+        }
+    }
+}
+
 pub fn render(
     screen: Screen,
     context: &str,
     session: &str,
     width: u16,
     theme: &Theme,
-    note: Option<&str>,
+    note: Option<Note<'_>>,
 ) -> Line<'static> {
     let ground = theme.ink(Ink::Frame);
     let on_ground = |style: Style| style.bg(ground);
@@ -141,9 +173,9 @@ pub fn render(
     // A config grove could not read outranks the hints: the user changed
     // something and needs to know it did not take.
     if let Some(note) = note {
-        let said = format!("config: {note}  ");
+        let said = note.said();
         spent += said.chars().count();
-        left.push(Span::styled(said, on_ground(theme.style(Role::Error))));
+        left.push(Span::styled(said, on_ground(note.style(theme))));
     }
 
     for hint in hints(screen) {
@@ -352,7 +384,7 @@ mod tests {
             "s",
             200,
             &theme,
-            Some("theme.accent is not a colour: \"peach\""),
+            Some(Note::Config("theme.accent is not a colour: \"peach\"")),
         );
         assert!(
             text(&bar).contains("theme.accent"),
@@ -364,6 +396,28 @@ mod tests {
                 .iter()
                 .any(|s| s.style.fg == Some(theme.color(Role::Error))),
             "a config problem must read as a problem"
+        );
+    }
+
+    #[test]
+    fn a_refusal_is_not_dressed_up_as_a_config_problem() {
+        // "no open session to add in" was rendered as `config: no open
+        // session to add in`, which sends the reader to edit config.lua over
+        // something neither the config nor they got wrong.
+        let theme = theme();
+        let bar = render(
+            Screen::Dash,
+            "",
+            "s",
+            200,
+            &theme,
+            Some(Note::Refused("no open session to add in")),
+        );
+        let said = text(&bar);
+        assert!(said.contains("no open session to add in"), "{said}");
+        assert!(
+            !said.contains("config:"),
+            "it is not a config problem: {said}"
         );
     }
 
