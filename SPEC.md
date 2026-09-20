@@ -525,7 +525,7 @@ grove.setup({
   shell           = "/usr/bin/fish",            -- default: $SHELL
   editor          = os.getenv("EDITOR"),        -- or "cursor {path}"; the daemon
                                                 -- has no tty, so this must not
-                                                -- need one (see §10)
+                                                -- need one (see §8)
   scratch_cwd     = "~",
   scrollback      = 10000,                      -- lines per pty
   worktree_path   = "~/grove/{repo}/{branch_slug}",
