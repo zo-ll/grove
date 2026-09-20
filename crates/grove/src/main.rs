@@ -64,6 +64,9 @@ struct Ui {
     terminals: Terminals,
     /// The terminal's current height, for sizing the pty. Width is `width`.
     height: u16,
+    /// The last size the terminal pane actually had, kept so hiding the pane
+    /// does not reflow the program inside its pty.
+    last_pane_size: (u16, u16),
     /// Something to say about the last thing the user pressed — a refusal, or
     /// a failure to reach the daemon. Cleared by the next successful action.
     note: Option<String>,
@@ -99,7 +102,29 @@ impl Ui {
                 rect.height.saturating_sub(2).max(1),
                 rect.width.saturating_sub(2).max(1),
             ),
-            None => (body.height.max(1), body.width.max(1)),
+            // Hidden. The pty keeps the size it had rather than taking the
+            // whole body: a program inside it would otherwise reflow twice
+            // around a `^g 3` to glance at something else, and vim redrawing
+            // itself at two different widths is a worse cost than a grid that
+            // is briefly the wrong size for a pane nobody is looking at.
+            None => self.last_pane_size,
+        }
+    }
+
+    /// Record the terminal pane's size while it is on screen, for the times
+    /// it is not.
+    fn remember_pane_size(&mut self) {
+        let body = Rect {
+            x: 0,
+            y: 0,
+            width: self.width,
+            height: self.height.saturating_sub(1),
+        };
+        if let Some(rect) = dash::split(body, self.panes).terminal {
+            self.last_pane_size = (
+                rect.height.saturating_sub(2).max(1),
+                rect.width.saturating_sub(2).max(1),
+            );
         }
     }
 
@@ -133,6 +158,7 @@ impl Ui {
             note: None,
             width: 80,
             height: 24,
+            last_pane_size: (22, 34),
             theme,
             config_note: (!notes.is_empty()).then(|| notes.join("; ")),
         }
@@ -315,6 +341,7 @@ fn ask_for_the_dash<W: std::io::Write>(daemon: &mut W) -> Result<(), grove_proto
 /// nothing when the selection did not actually move.
 fn follow_selection(state: &mut State, ui: &mut Ui) {
     let terminal = ui.worktrees.selected().and_then(|row| row.terminal);
+    ui.remember_pane_size();
     let (rows, cols) = ui.terminal_pane_size();
     for request in ui.terminals.show(terminal, rows, cols) {
         if let Err(e) = send(state, &request) {
@@ -514,6 +541,7 @@ fn handle(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
         Input::Terminal(TermEvent::Resize(width, height)) => {
             ui.width = width;
             ui.height = height;
+            ui.remember_pane_size();
             let (rows, cols) = ui.terminal_pane_size();
             if let Some(request) = ui.terminals.resize(rows, cols)
                 && let Err(e) = send(state, &request)
@@ -558,6 +586,23 @@ fn handle(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
                 .iter()
                 .find(|row| row.state == grove_domain::SessionState::Attached)
                 .map(|row| row.id.clone());
+            Flow::Continue { redraw: true }
+        }
+
+        // The pty `^g enter` asked for. Without this the terminal exists and
+        // the pane still says there is none, until something else happens to
+        // refresh the worktree rows.
+        Input::Daemon(DaemonEvent::TerminalSpawned { terminal, .. }) => {
+            let (rows, cols) = ui.terminal_pane_size();
+            for request in ui.terminals.show(Some(terminal), rows, cols) {
+                if let Err(e) = send(state, &request) {
+                    ui.note = Some(format!("could not reach the daemon: {e}"));
+                    break;
+                }
+            }
+            // The row still says it has no terminal, and that is the daemon's
+            // to correct — ask rather than edit the row here.
+            request_worktrees(state, ui);
             Flow::Continue { redraw: true }
         }
 
@@ -1650,6 +1695,78 @@ mod tests {
                 Request::SpawnTerminal(grove_proto::TerminalTarget::Worktree(_))
             )),
             "^g enter must ask for a terminal here: {asked:?}"
+        );
+    }
+
+    #[test]
+    fn hiding_the_terminal_pane_does_not_reflow_the_program_inside_it() {
+        // The review's medium: sizing the pty from "whatever is on screen"
+        // means `^g 3` to glance at something else reflows vim twice, once on
+        // the way out and once on the way back.
+        let (mut s, mut theirs) = wired();
+        let mut ui = Ui::new();
+        handle(Input::Terminal(TermEvent::Resize(200, 50)), &mut s, &mut ui);
+        dashed(&mut s, &mut ui);
+        let _ = sent(&mut theirs);
+        let attached = ui.terminal_pane_size();
+
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('3')), &mut s, &mut ui);
+        assert!(!ui.panes.visible(Focus::Terminal), "^g 3 hides the pane");
+        assert_eq!(
+            ui.terminal_pane_size(),
+            attached,
+            "a hidden pane must not resize the pty behind it"
+        );
+    }
+
+    #[test]
+    fn a_spawned_terminal_is_shown_without_waiting_to_be_told_twice() {
+        // The review's other medium: `^g enter` created the pty and the pane
+        // went on saying there was none, because nothing acted on the reply.
+        let (mut s, mut theirs) = wired();
+        let mut ui = Ui::new();
+        handle(
+            Input::Daemon(DaemonEvent::Repos(vec![repo_row("repo", 1)])),
+            &mut s,
+            &mut ui,
+        );
+        handle(
+            Input::Daemon(DaemonEvent::Worktrees {
+                repo: grove_domain::RepoId("repo".into()),
+                rows: vec![with_terminal("bare", None)],
+            }),
+            &mut s,
+            &mut ui,
+        );
+        let _ = sent(&mut theirs);
+
+        handle(
+            Input::Daemon(DaemonEvent::TerminalSpawned {
+                target: grove_proto::TerminalTarget::Worktree(grove_proto::WorktreeRef {
+                    repo: grove_domain::RepoId("repo".into()),
+                    branch: "bare".into(),
+                }),
+                terminal: grove_proto::TerminalId(9),
+            }),
+            &mut s,
+            &mut ui,
+        );
+        assert_eq!(
+            ui.terminals.showing(),
+            Some(grove_proto::TerminalId(9)),
+            "the pane must show the terminal it just asked for"
+        );
+        let asked = sent(&mut theirs);
+        assert!(
+            asked
+                .iter()
+                .any(|r| matches!(r, Request::AttachTerminal(a) if a.terminal == grove_proto::TerminalId(9))),
+            "and attach to it: {asked:?}"
+        );
+        assert!(
+            asked.contains(&Request::ListWorktrees(grove_domain::RepoId("repo".into()))),
+            "the row still says it has no terminal, which is the daemon's to correct: {asked:?}"
         );
     }
 

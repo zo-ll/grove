@@ -49,27 +49,66 @@ pub const SCROLL_STEP: isize = 3;
 struct Pty {
     parser: vt100::Parser,
     /// Backfill chunks in `seq` order, all older than the screen. Held apart
-    /// from the parser's scrollback until `done`, because they must end up
-    /// *before* anything live output has scrolled off since.
+    /// from the parser until `done`, because they must end up *before* both
+    /// the screen and anything live output has scrolled off since.
     backfill: Vec<String>,
     /// The next `seq` expected. A gap means a chunk was lost, and joining
     /// anyway would silently reorder history.
     next_seq: u32,
     joined: bool,
+    /// The attach snapshot, kept until the join so history can be replayed in
+    /// front of it. Dropped afterwards — the parser is the grid from then on.
+    snapshot: Option<Vec<u8>>,
+    /// Live output since the attach, for the same reason. Bounded by how long
+    /// backfill takes, which is one round trip.
+    live: Vec<u8>,
 }
 
 impl Pty {
     fn new(rows: u16, cols: u16) -> Self {
         Self {
             // The parser keeps its own scrollback for lines that leave the
-            // grid while we are watching.
-            parser: vt100::Parser::new(rows, cols, 10_000),
+            // grid while we are watching. The cap is grove's own: the daemon's
+            // `config.scrollback` bounds what it *retains* and belongs to the
+            // daemon VM (§10.4), so the client cannot read it and holds a
+            // generous window of its own instead.
+            parser: vt100::Parser::new(rows, cols, SCROLLBACK_LINES),
             backfill: Vec::new(),
             next_seq: 0,
             joined: false,
+            snapshot: None,
+            live: Vec::new(),
         }
     }
+
+    /// Put the backfill where it belongs: in front of everything.
+    ///
+    /// The parser cannot be prepended to, so it is rebuilt — history first,
+    /// then the snapshot the pane painted from, then whatever arrived while
+    /// the history was in flight. Rebuilding costs one pass over a buffer that
+    /// exists for the length of one round trip, and it is the only way the
+    /// ordering the contract describes ends up on screen.
+    fn join(&mut self) {
+        self.joined = true;
+        let (rows, cols) = self.parser.screen().size();
+        let mut parser = vt100::Parser::new(rows, cols, SCROLLBACK_LINES);
+        for line in &self.backfill {
+            parser.process(line.as_bytes());
+            parser.process(b"\r\n");
+        }
+        if let Some(snapshot) = &self.snapshot {
+            parser.process(snapshot);
+        }
+        parser.process(&self.live);
+        self.parser = parser;
+        // Held only for the rebuild.
+        self.snapshot = None;
+        self.live = Vec::new();
+    }
 }
+
+/// How much history grove keeps per terminal.
+const SCROLLBACK_LINES: usize = 10_000;
 
 /// Every terminal the pane has seen, and which one it is showing.
 #[derive(Default)]
@@ -139,7 +178,13 @@ impl Terminals {
             .entry(terminal)
             .or_insert_with(|| Pty::new(rows, cols));
         pty.parser.screen_mut().set_size(rows, cols);
-        pty.parser.process(&encode(screen));
+        let bytes = encode(screen);
+        pty.parser.process(&bytes);
+        // Kept until the join, which replays it after the history that
+        // precedes it. Once joined there is nothing to put in front of.
+        if !pty.joined {
+            pty.snapshot = Some(bytes);
+        }
     }
 
     /// Take a backfill chunk.
@@ -157,7 +202,7 @@ impl Terminals {
         pty.backfill.extend(lines.iter().cloned());
         pty.next_seq = seq.saturating_add(1);
         if done {
-            pty.joined = true;
+            pty.join();
         }
     }
 
@@ -165,6 +210,11 @@ impl Terminals {
     pub fn output(&mut self, terminal: TerminalId, bytes: &[u8]) {
         if let Some(pty) = self.ptys.get_mut(&terminal) {
             pty.parser.process(bytes);
+            // Also kept aside until the join: these bytes are newer than every
+            // backfill chunk, and the rebuild has to replay them last.
+            if !pty.joined {
+                pty.live.extend_from_slice(bytes);
+            }
         }
     }
 
@@ -218,16 +268,32 @@ impl Terminals {
         pty.parser.screen().scrollback() != at
     }
 
-    /// History older than the live grid, oldest first.
+    /// The history a scroll can reach, oldest first.
     ///
-    /// Backfill first, then whatever live output has scrolled off since —
-    /// which is the whole reason the two are kept apart.
+    /// Read back out of the parser — the grid the pane actually draws — so it
+    /// answers what a user would see rather than what was collected. Takes
+    /// `&mut` because reading history means moving the view over it, and puts
+    /// the view back where it was.
     #[cfg(test)]
-    pub fn history(&self, terminal: TerminalId) -> Vec<String> {
-        self.ptys
-            .get(&terminal)
-            .map(|pty| pty.backfill.clone())
-            .unwrap_or_default()
+    pub fn history(&mut self, terminal: TerminalId) -> Vec<String> {
+        let Some(pty) = self.ptys.get_mut(&terminal) else {
+            return Vec::new();
+        };
+        let was = pty.parser.screen().scrollback();
+        // Ask for more than there is; vt100 clamps, which is how the depth is
+        // discovered without the parser exposing it.
+        pty.parser.screen_mut().set_scrollback(usize::MAX);
+        let deepest = pty.parser.screen().scrollback();
+
+        let mut lines = Vec::new();
+        for offset in (1..=deepest).rev() {
+            pty.parser.screen_mut().set_scrollback(offset);
+            if let Some(top) = pty.parser.screen().contents().lines().next() {
+                lines.push(top.to_string());
+            }
+        }
+        pty.parser.screen_mut().set_scrollback(was);
+        lines
     }
 
     /// Draw the pane's contents into `area`, already inside the border.
@@ -294,7 +360,23 @@ pub fn encode_key(key: ratatui::crossterm::event::KeyEvent) -> Option<Vec<u8>> {
         KeyCode::PageDown => b"\x1b[6~".to_vec(),
         KeyCode::Insert => b"\x1b[2~".to_vec(),
         KeyCode::Delete => b"\x1b[3~".to_vec(),
+        // F1-F4 are SS3; F5 up are CSI with a number, and the numbering skips
+        // 16, 22, 27, 30 and 35 for historical reasons rather than any that
+        // still apply.
         KeyCode::F(n @ 1..=4) => vec![0x1b, b'O', b'P' + (n - 1)],
+        KeyCode::F(n @ 5..=12) => {
+            let code = match n {
+                5 => 15,
+                6 => 17,
+                7 => 18,
+                8 => 19,
+                9 => 20,
+                10 => 21,
+                11 => 23,
+                _ => 24,
+            };
+            format!("\x1b[{code}~").into_bytes()
+        }
         _ => return None,
     };
     if alt {
@@ -315,11 +397,22 @@ fn encode(screen: &WireScreen) -> Vec<u8> {
     // not an edit to whatever was there.
     let mut out = b"\x1b[2J\x1b[H\x1b[0m".to_vec();
     for (index, row) in screen.cells.iter().enumerate() {
-        if index > 0 {
-            out.extend_from_slice(b"\r\n");
-        }
+        // Each row is placed, not newline-separated. A row that fills the
+        // width wraps the cursor by itself, so a `\r\n` after it advances
+        // twice — which scrolls the top of the snapshot off its own grid
+        // before the pane ever draws it.
+        let line = u16::try_from(index).unwrap_or(u16::MAX).saturating_add(1);
+        out.extend_from_slice(format!("\x1b[{line};1H").as_bytes());
+        // Trailing blanks are not written at all. The screen was cleared, so
+        // they change nothing — and writing to the last column leaves the
+        // cursor in the pending-wrap state, where the *next* byte scrolls the
+        // grid. That is how the snapshot lost its own first row.
+        let end = row
+            .iter()
+            .rposition(|cell| !is_blank(cell))
+            .map_or(0, |at| at + 1);
         let mut current = Style::default();
-        for cell in row {
+        for cell in &row[..end] {
             let wanted = Style::of(cell);
             if wanted != current {
                 out.extend_from_slice(wanted.sgr().as_bytes());
@@ -347,10 +440,19 @@ fn encode(screen: &WireScreen) -> Vec<u8> {
             out.extend_from_slice(b"\x1b[?25h");
         }
         // A hidden cursor is a state the program chose; the snapshot carries
-        // it, so honour it rather than showing one it hid.
-        None => out.extend_from_slice(b"\x1b[?25l"),
+        // it, so honour it rather than showing one it hid. It is still placed,
+        // so the next byte writes somewhere defined.
+        None => out.extend_from_slice(b"\x1b[H\x1b[?25l"),
     }
     out
+}
+
+/// Whether a cell would paint nothing: no text, and no background to show.
+fn is_blank(cell: &Cell) -> bool {
+    (cell.text.is_empty() || cell.text == " ")
+        && matches!(cell.bg, WireColor::Default)
+        && !cell.attrs.reverse
+        && !cell.attrs.underline
 }
 
 /// The parts of a cell that map to an SGR sequence.
@@ -459,7 +561,10 @@ mod tests {
             rows,
             cols,
             cells,
-            cursor: None,
+            // Where a program would have left it: just past what it wrote.
+            // A real snapshot always carries this, and where the cursor is
+            // decides where the next live byte lands.
+            cursor: Some((0, u16::try_from(text.chars().count()).unwrap_or(0))),
         }
     }
 
@@ -484,9 +589,7 @@ mod tests {
         // One grid, not two: the parser holds the snapshot, so a delta that
         // edits it lands where the daemon said it would.
         let mut terminals = Terminals::default();
-        let mut screen = screen_of(2, 8, "abc");
-        screen.cursor = Some((0, 3));
-        terminals.screen(id(1), &screen);
+        terminals.screen(id(1), &screen_of(2, 8, "abc"));
         terminals.output(id(1), b"XYZ");
         let contents = grid(&terminals, id(1));
         assert!(contents.contains("abcXYZ"), "{contents:?}");
@@ -599,12 +702,28 @@ mod tests {
     }
 
     #[test]
-    fn backfill_arrives_oldest_first_and_joins_at_done() {
+    fn backfill_ends_up_in_front_of_everything_else() {
+        // The contract, asserted on the grid the pane draws rather than on the
+        // buffer it was staged in. A one-row terminal pushes everything but
+        // the newest line into history, which is where a scroll reaches it.
         let mut terminals = Terminals::default();
-        terminals.show(Some(id(1)), 24, 80);
+        terminals.show(Some(id(1)), 1, 20);
+        terminals.screen(id(1), &screen_of(1, 20, "screen"));
+        terminals.output(id(1), b"\r\nlive");
         terminals.scrollback(id(1), 0, &["oldest".into(), "older".into()], false);
         terminals.scrollback(id(1), 1, &["old".into()], true);
-        assert_eq!(terminals.history(id(1)), vec!["oldest", "older", "old"]);
+
+        let history: Vec<String> = terminals
+            .history(id(1))
+            .into_iter()
+            .map(|line| line.trim_end().to_string())
+            .filter(|line| !line.is_empty())
+            .collect();
+        assert_eq!(
+            history,
+            vec!["oldest", "older", "old", "screen"],
+            "history precedes the attach snapshot, which precedes live output"
+        );
     }
 
     #[test]
@@ -612,25 +731,29 @@ mod tests {
         // A gap means a chunk was lost. Appending anyway puts history in the
         // wrong order with nothing on screen to say so.
         let mut terminals = Terminals::default();
-        terminals.show(Some(id(1)), 24, 80);
+        terminals.show(Some(id(1)), 1, 20);
         terminals.scrollback(id(1), 0, &["first".into()], false);
-        terminals.scrollback(id(1), 2, &["skipped ahead".into()], false);
-        assert_eq!(
-            terminals.history(id(1)),
-            vec!["first"],
-            "a chunk after a gap must not be appended"
+        terminals.scrollback(id(1), 2, &["skipped ahead".into()], true);
+        let history = terminals.history(id(1));
+        assert!(
+            !history.iter().any(|line| line.contains("skipped ahead")),
+            "a chunk after a gap must not reach the grid: {history:?}"
         );
     }
 
     #[test]
     fn nothing_is_appended_after_the_join() {
-        // `done` means done; a late chunk arriving afterwards belongs to a
-        // backfill that is already finished.
+        // `done` means done; a late chunk belongs to a backfill that has
+        // already been placed.
         let mut terminals = Terminals::default();
-        terminals.show(Some(id(1)), 24, 80);
+        terminals.show(Some(id(1)), 1, 20);
         terminals.scrollback(id(1), 0, &["all of it".into()], true);
         terminals.scrollback(id(1), 1, &["too late".into()], false);
-        assert_eq!(terminals.history(id(1)), vec!["all of it"]);
+        let history = terminals.history(id(1));
+        assert!(
+            !history.iter().any(|line| line.contains("too late")),
+            "{history:?}"
+        );
     }
 
     #[test]
@@ -638,10 +761,26 @@ mod tests {
         // The protocol says one empty chunk with `done`, never zero chunks —
         // a client waiting to join would otherwise wait forever.
         let mut terminals = Terminals::default();
-        terminals.show(Some(id(1)), 24, 80);
+        terminals.show(Some(id(1)), 2, 20);
         terminals.scrollback(id(1), 0, &[], true);
-        assert!(terminals.history(id(1)).is_empty());
         assert!(terminals.ptys.get(&id(1)).expect("a pty").joined);
+    }
+
+    #[test]
+    fn the_grid_survives_the_rebuild() {
+        // The join throws the parser away and builds another. Whatever was on
+        // screen has to still be on screen afterwards, or the pane blinks back
+        // to nothing the moment history arrives.
+        let mut terminals = Terminals::default();
+        terminals.show(Some(id(1)), 4, 20);
+        terminals.screen(id(1), &screen_of(4, 20, "painted"));
+        terminals.output(id(1), b" and live");
+        terminals.scrollback(id(1), 0, &["history".into()], true);
+        assert!(
+            grid(&terminals, id(1)).contains("painted and live"),
+            "{:?}",
+            grid(&terminals, id(1))
+        );
     }
 
     #[test]
@@ -728,9 +867,24 @@ mod tests {
             key(KeyCode::Char('b'), KeyModifiers::ALT),
             Some(vec![0x1b, b'b'])
         );
+        // The function keys a program is likely to bind: F5 up are CSI with a
+        // number rather than SS3, and the numbering has gaps.
+        assert_eq!(
+            key(KeyCode::F(1), KeyModifiers::NONE),
+            Some(b"\x1bOP".to_vec())
+        );
+        assert_eq!(
+            key(KeyCode::F(5), KeyModifiers::NONE),
+            Some(b"\x1b[15~".to_vec())
+        );
+        assert_eq!(
+            key(KeyCode::F(12), KeyModifiers::NONE),
+            Some(b"\x1b[24~".to_vec())
+        );
         // A key with no pty spelling sends nothing: a stray byte is worse
         // than a keystroke that did not arrive.
-        assert_eq!(key(KeyCode::F(12), KeyModifiers::NONE), None);
+        assert_eq!(key(KeyCode::F(13), KeyModifiers::NONE), None);
+        assert_eq!(key(KeyCode::CapsLock, KeyModifiers::NONE), None);
     }
 
     #[test]
