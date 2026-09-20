@@ -16,6 +16,29 @@ each worktree.
 > **Status: specification only.** There is no code yet. This repository currently holds
 > the v1 spec and a design brief. See [SPEC.md](SPEC.md).
 
+## Install
+
+```sh
+scripts/install.sh                 # builds release, installs to ~/.local/bin
+scripts/install.sh --sample-config # and writes a starter config.lua
+```
+
+`--prefix DIR` installs elsewhere, `--debug` skips optimisation for a faster
+loop, and `--uninstall` removes the binaries while leaving your config alone.
+
+grove is **two programs**. `groved` owns the ptys and outlives the terminal;
+`grove` is the TUI that attaches to it. Start the daemon on a directory that
+holds your clones, then open the TUI on the same directory:
+
+```sh
+groved ~/code &
+grove ~/code
+```
+
+The daemon keeps running when the TUI exits — that is the point of it. `^g ?`
+lists the keys for whichever screen you are on, and `^g q` leaves the TUI
+without stopping your terminals.
+
 ## Why
 
 A clone shows one branch at a time. `git checkout` rewrites the files in place, so

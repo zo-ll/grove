@@ -31,8 +31,11 @@ jobs:
       - name: crate boundaries
         run: ./scripts/check-boundaries.sh
 
-      - name: shellcheck the boundary script
-        run: shellcheck scripts/check-boundaries.sh
+      - name: shellcheck every script
+        # Every one, not the boundary script by name: the install script is
+        # the first thing a new user runs, and a shell bug there is a worse
+        # first impression than any test failure.
+        run: shellcheck scripts/*.sh
 
   msrv:
     runs-on: ubuntu-latest
