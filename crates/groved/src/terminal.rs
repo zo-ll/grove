@@ -64,9 +64,18 @@ impl TerminalInputHandle {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RestoreReport {
-    pub restored: Vec<TerminalId>,
+    /// One entry per terminal the restore started, paired with the checkout
+    /// it was started in — the caller needs the path to track the terminal
+    /// it now owns, and the id alone cannot say it.
+    pub restored: Vec<RestoredTerminal>,
     pub missing: Vec<SnapshotTerminal>,
     pub failed: Vec<RestoreFailure>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RestoredTerminal {
+    pub terminal: TerminalId,
+    pub worktree: PathBuf,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -381,7 +390,10 @@ impl TerminalManager {
         let mut failed = Vec::new();
         for terminal in plan.terminals {
             match self.spawn_worktree(&terminal.worktree, terminal.rows, terminal.cols) {
-                Ok(id) => restored.push(id),
+                Ok(id) => restored.push(RestoredTerminal {
+                    terminal: id,
+                    worktree: terminal.worktree,
+                }),
                 Err(error) => failed.push(RestoreFailure {
                     terminal,
                     message: error.to_string(),
@@ -760,13 +772,19 @@ mod tests {
         assert_eq!(report.missing[0].worktree, deleted);
         assert_eq!(
             (
-                manager.snapshot(report.restored[0]).unwrap().rows,
-                manager.snapshot(report.restored[0]).unwrap().cols
+                manager.snapshot(report.restored[0].terminal).unwrap().rows,
+                manager.snapshot(report.restored[0].terminal).unwrap().cols
             ),
             (24, 80)
         );
-        manager.input(report.restored[0], b"pwd\r").unwrap();
-        wait_for(&manager, report.restored[0], &existing.to_string_lossy());
+        manager
+            .input(report.restored[0].terminal, b"pwd\r")
+            .unwrap();
+        wait_for(
+            &manager,
+            report.restored[0].terminal,
+            &existing.to_string_lossy(),
+        );
         thread::sleep(Duration::from_millis(50));
         assert!(
             !marker.exists(),
