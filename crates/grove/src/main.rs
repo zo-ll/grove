@@ -30,10 +30,13 @@ mod theme;
 mod userkeys;
 mod worktrees;
 
+use std::ffi::OsString;
 use std::io::Stdout;
 use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode, Stdio};
+use std::time::{Duration, Instant};
 
 use dash::Panes;
 use diff::Diff;
@@ -1608,15 +1611,173 @@ fn describe(ev: &DaemonEvent) -> String {
 /// A failure here is not fatal: the TUI comes up and says what went wrong,
 /// because "grove exited" and "grove cannot reach its daemon" are very
 /// different things to a user whose work is running inside that daemon.
+/// How long the TUI waits for a daemon it started to take the socket.
+///
+/// Generous, because the wait is once per workspace per boot and a machine
+/// under load is not a broken one. `groved` binds before it walks the
+/// workspace, so in practice this is a few milliseconds even for a directory
+/// full of repositories.
+const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The daemon binary to start, given where this grove is and what the
+/// environment asks for.
+///
+/// Beside grove first. The installer puts the pair in one directory, and the
+/// two halves speak a versioned protocol to each other — a `$PATH` that finds
+/// some other `groved` would pair an upgraded TUI with a stale daemon, which
+/// fails later and less clearly than this. `GROVE_DAEMON` overrides
+/// everything, which is also what lets this be tested without a real daemon.
+fn daemon_binary(current_exe: Option<&Path>, explicit: Option<OsString>) -> PathBuf {
+    if let Some(explicit) = explicit {
+        return PathBuf::from(explicit);
+    }
+    if let Some(beside) = current_exe
+        .and_then(Path::parent)
+        .map(|dir| dir.join("groved"))
+        .filter(|beside| beside.is_file())
+    {
+        return beside;
+    }
+    // Nothing beside grove — a `cargo run` or a half-installed pair. Let exec
+    // search $PATH and report what it finds, or does not.
+    PathBuf::from("groved")
+}
+
+/// Start the daemon and wait for it to take the socket.
+///
+/// grove does not link the daemon: that boundary is what the whole crate graph
+/// is arranged around, and `scripts/check-boundaries.sh` enforces it. Starting
+/// the *process* is not a breach of it. Nothing about git or a pty enters this
+/// address space, the two halves still meet over the socket and nothing else,
+/// and the daemon still outlives the TUI that started it.
+fn start_daemon(binary: &Path, workspace: &Path, socket: &Path) -> Result<UnixStream, String> {
+    let log = socket.with_extension("log");
+    if let Some(parent) = log.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    // The daemon outlives this process, so its output cannot go to a terminal
+    // that will be gone — and it certainly cannot go to one about to enter raw
+    // mode. A file beside the socket has exactly the right lifetime: both are
+    // per-workspace, and both go when the machine reboots.
+    let out = std::fs::File::create(&log).map_err(|e| {
+        format!(
+            "could not open {} for the daemon's output: {e}",
+            log.display()
+        )
+    })?;
+    let errs = out
+        .try_clone()
+        .map_err(|e| format!("could not open {} twice: {e}", log.display()))?;
+
+    let mut child = Command::new(binary)
+        .arg("--workspace")
+        .arg(workspace)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(out))
+        .stderr(Stdio::from(errs))
+        // Its own process group. ^C in the terminal running the TUI goes to
+        // the foreground group, and the daemon holding every session's shells
+        // must not be in it — quitting grove is not meant to kill your work.
+        .process_group(0)
+        .spawn()
+        .map_err(|e| format!("could not start {}: {e}", binary.display()))?;
+
+    let deadline = Instant::now() + DAEMON_START_TIMEOUT;
+    loop {
+        if let Ok(stream) = UnixStream::connect(socket) {
+            return Ok(stream);
+        }
+        // A daemon that has already exited will never bind. It may have exited
+        // precisely because another grove won the race and it found a live
+        // socket, so the socket is tried once more before the log is believed.
+        if let Ok(Some(status)) = child.try_wait() {
+            if let Ok(stream) = UnixStream::connect(socket) {
+                return Ok(stream);
+            }
+            return Err(match last_words(&log) {
+                Some(said) => format!("the daemon exited ({status}): {said}"),
+                None => format!(
+                    "the daemon exited ({status}) without saying why; see {}",
+                    log.display()
+                ),
+            });
+        }
+        if Instant::now() >= deadline {
+            // Deliberately not killed: it may be a slow start rather than a
+            // stuck one, and killing it would turn "wait a moment and try
+            // again" into "your daemon keeps dying".
+            return Err(format!(
+                "the daemon has not taken {} after {}s; it may still be starting — see {}",
+                socket.display(),
+                DAEMON_START_TIMEOUT.as_secs(),
+                log.display()
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// The tail of the daemon's log, for an error message that says why.
+///
+/// Bounded, because this ends up in a one-line note under a dashboard: a
+/// daemon that failed after printing a megabyte must not take the screen.
+fn last_words(log: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(log).ok()?;
+    let said = text
+        .lines()
+        .rev()
+        .filter(|line| !line.trim().is_empty())
+        .take(3)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("; ");
+    let said = said.trim();
+    if said.is_empty() {
+        return None;
+    }
+    Some(said.chars().take(400).collect())
+}
+
+/// Reach the daemon for this workspace, starting one if nobody has.
+///
+/// Typing `grove` is a reasonable way to say "run grove". Making it a
+/// two-command ritual — start the daemon, then the TUI — is a thing the
+/// program knows how to do for you, so it does. Setting `GROVE_NO_AUTOSTART`
+/// keeps the old behaviour, for anyone running the daemon under a supervisor
+/// that would rather grove did not.
+fn reach_daemon(workspace: &Path, socket: &Path) -> Result<UnixStream, String> {
+    let refused = match UnixStream::connect(socket) {
+        Ok(stream) => return Ok(stream),
+        Err(e) => e,
+    };
+    if std::env::var_os("GROVE_NO_AUTOSTART").is_some_and(|v| !v.is_empty()) {
+        return Err(format!(
+            "no daemon at {}: {refused} (GROVE_NO_AUTOSTART is set, so grove did not start one)",
+            socket.display()
+        ));
+    }
+    let binary = daemon_binary(
+        std::env::current_exe().ok().as_deref(),
+        std::env::var_os("GROVE_DAEMON"),
+    );
+    // Before the terminal is taken, and the only line grove prints on a normal
+    // start: a first run builds nothing but does have to walk the workspace,
+    // and a silent pause looks like a hang.
+    eprintln!("grove: starting {}", binary.display());
+    start_daemon(&binary, workspace, socket)
+}
+
 fn connect(workspace: &Path, inputs: &Inputs) -> State {
     let path = socket_path(workspace);
 
-    let stream = match UnixStream::connect(&path) {
+    let stream = match reach_daemon(workspace, &path) {
         Ok(s) => s,
-        Err(e) => {
+        Err(reason) => {
             return State::Disconnected {
                 workspace: workspace.to_path_buf(),
-                reason: format!("no daemon at {}: {e}", path.display()),
+                reason,
             };
         }
     };
@@ -4317,5 +4478,177 @@ mod tests {
             grove_proto::socket_path(&workspace)
         );
         assert!(socket_path(&workspace).to_string_lossy().ends_with(".sock"));
+    }
+
+    /// A short-lived directory under the real temp dir.
+    ///
+    /// Short on purpose: these tests bind unix sockets, and `sockaddr_un` runs
+    /// out of room around 108 bytes. A helper that nested deeply would fail
+    /// here for a reason that has nothing to do with what is being tested.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(label: &str) -> Self {
+            static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let unique = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path =
+                std::env::temp_dir().join(format!("grove-{label}-{}-{unique}", std::process::id()));
+            std::fs::create_dir_all(&path).expect("a scratch directory");
+            Self(path)
+        }
+
+        /// An executable that runs `body`, standing in for the daemon.
+        fn fake_daemon(&self, body: &str) -> PathBuf {
+            let path = self.0.join("fake-groved");
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("the fake daemon");
+            let mut perms = std::fs::metadata(&path).expect("metadata").permissions();
+            std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+            std::fs::set_permissions(&path, perms).expect("chmod");
+            path
+        }
+
+        fn join(&self, name: &str) -> PathBuf {
+            self.0.join(name)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn the_daemon_grove_starts_is_the_one_installed_beside_it() {
+        // The pair speak a versioned protocol to each other. A $PATH that
+        // finds some other groved pairs an upgraded TUI with a stale daemon,
+        // which fails later and far less clearly than this.
+        let scratch = Scratch::new("beside");
+        let grove = scratch.join("grove");
+        let groved = scratch.join("groved");
+        std::fs::write(&groved, "").expect("a daemon to sit beside");
+        assert_eq!(daemon_binary(Some(&grove), None), groved);
+    }
+
+    #[test]
+    fn with_nothing_beside_it_the_daemon_comes_off_the_path() {
+        // `cargo run`, or a half-installed pair. Bare, so exec searches $PATH
+        // and reports for itself what it did or did not find.
+        let scratch = Scratch::new("bare");
+        assert_eq!(
+            daemon_binary(Some(&scratch.join("grove")), None),
+            PathBuf::from("groved")
+        );
+        assert_eq!(daemon_binary(None, None), PathBuf::from("groved"));
+    }
+
+    #[test]
+    fn grove_daemon_names_the_daemon_outright() {
+        let scratch = Scratch::new("explicit");
+        let groved = scratch.join("groved");
+        std::fs::write(&groved, "").expect("a daemon to sit beside");
+        assert_eq!(
+            daemon_binary(Some(&scratch.join("grove")), Some("/opt/groved".into())),
+            PathBuf::from("/opt/groved"),
+            "an explicit daemon must win over the one beside grove"
+        );
+    }
+
+    #[test]
+    fn the_daemon_is_told_which_workspace_and_left_in_its_own_process_group() {
+        // ^C in the terminal running the TUI goes to the foreground process
+        // group. The daemon holds every session's shells, so it must not be in
+        // it: quitting grove is not meant to kill your work.
+        let scratch = Scratch::new("pgid");
+        let record = scratch.join("argv");
+        // Both groups are read inside the fake, from the fake's own view: its
+        // parent is the test process, so one `ps` answers both halves of the
+        // question without this crate taking a libc dependency for it.
+        let daemon = scratch.fake_daemon(&format!(
+            "{{ echo \"$1 $2\"; ps -o pgid= -p $$; ps -o pgid= -p $PPID; }} > {} 2>&1; exit 3",
+            record.display()
+        ));
+        let socket = scratch.join("s.sock");
+        let started = start_daemon(&daemon, Path::new("/some/workspace"), &socket);
+        assert!(started.is_err(), "the fake exits without binding anything");
+
+        let said = std::fs::read_to_string(&record).expect("the fake must have run");
+        let mut lines = said.lines();
+        assert_eq!(
+            lines.next().expect("argv"),
+            "--workspace /some/workspace",
+            "the daemon has to be told which workspace, or it serves the cwd"
+        );
+        let mut group = || -> i32 {
+            lines
+                .next()
+                .expect("a process group id")
+                .trim()
+                .parse()
+                .expect("a process group id")
+        };
+        let theirs = group();
+        let ours = group();
+        assert_ne!(
+            theirs, ours,
+            "the daemon must be in its own process group, not the TUI's"
+        );
+    }
+
+    #[test]
+    fn a_daemon_that_dies_reports_what_it_said() {
+        // The daemon's output goes to a file, because by the time it fails the
+        // terminal may be in raw mode or gone. That file is no use unless its
+        // last words reach the person who typed `grove`.
+        let scratch = Scratch::new("died");
+        let daemon = scratch.fake_daemon("echo 'workspace is not a directory' >&2; exit 1");
+        let socket = scratch.join("s.sock");
+        let reason = start_daemon(&daemon, Path::new("/nowhere"), &socket)
+            .expect_err("a daemon that exits 1 has not started");
+        assert!(
+            reason.contains("workspace is not a directory"),
+            "the reason must carry what the daemon said: {reason}"
+        );
+        assert!(
+            reason.contains("exited"),
+            "and that it was the daemon that failed: {reason}"
+        );
+    }
+
+    #[test]
+    fn a_daemon_that_takes_the_socket_late_is_waited_for() {
+        // groved binds before it walks the workspace, so this is usually
+        // instant — but "usually" is not a contract, and a TUI that gave up
+        // after one failed connect would race a daemon it started itself.
+        let scratch = Scratch::new("late");
+        let socket = scratch.join("s.sock");
+        let daemon = scratch.fake_daemon("sleep 5");
+        let binding = socket.clone();
+        let listener = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            std::os::unix::net::UnixListener::bind(&binding).expect("bind")
+        });
+        let started = start_daemon(&daemon, Path::new("/w"), &socket);
+        let _listener = listener.join().expect("the binding thread");
+        assert!(
+            started.is_ok(),
+            "a socket that appears within the timeout must be connected to: {started:?}"
+        );
+    }
+
+    #[test]
+    fn a_daemon_that_is_already_running_is_not_started_again() {
+        // The common case after the first run of the day. Starting a second
+        // daemon would be harmless — it would find the socket taken and exit —
+        // but paying for a process to discover that on every `grove` is not.
+        let scratch = Scratch::new("running");
+        let socket = scratch.join("s.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).expect("a daemon");
+        let reached = reach_daemon(Path::new("/w"), &socket);
+        assert!(reached.is_ok(), "the live socket must be used: {reached:?}");
+        assert!(
+            !socket.with_extension("log").exists(),
+            "nothing was started, so there is no daemon log to have written"
+        );
     }
 }

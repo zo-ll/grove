@@ -50,18 +50,30 @@ curl -fsSL https://raw.githubusercontent.com/zo-ll/grove/main/scripts/install.sh
 `GROVE_REF` builds a branch other than `main` and `GROVE_SRC` moves the checkout
 it keeps.
 
-grove is **two programs**. `groved` owns the ptys and outlives the terminal;
-`grove` is the TUI that attaches to it. Start the daemon on a directory that
-holds your clones, then open the TUI on the same directory:
+Point it at a directory that holds your clones:
 
 ```sh
-groved ~/code &
 grove ~/code
 ```
 
-The daemon keeps running when the TUI exits — that is the point of it. `^g ?`
-lists the keys for whichever screen you are on, and `^g q` leaves the TUI
-without stopping your terminals.
+grove is **two programs**: `groved` owns the ptys and outlives the terminal,
+and `grove` is the TUI that attaches to it. You do not have to start the daemon
+— if none is running for that directory, `grove` starts the `groved` installed
+beside it and waits for it. It keeps running when the TUI exits, which is the
+point of it: `^g q` leaves grove without stopping your terminals, and the next
+`grove ~/code` attaches to the same shells, still running.
+
+Start it yourself when you want it under a supervisor, or want to watch it:
+
+```sh
+groved ~/code
+```
+
+`GROVE_NO_AUTOSTART=1` stops grove starting one, and `GROVE_DAEMON` names a
+different daemon binary. The one grove starts logs beside its socket, and says
+where that is if it fails.
+
+`^g ?` lists the keys for whichever screen you are on.
 
 ## Why
 

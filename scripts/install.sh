@@ -181,13 +181,12 @@ esac
 
 cat <<EOF
 
-grove is two programs. Start the daemon on a directory that holds your clones,
-then open the TUI on the same directory:
+Point grove at a directory that holds your clones:
 
-    groved ~/code &
     grove ~/code
 
-The daemon keeps running when the TUI exits — that is the point of it. Inside
-grove, ^g ? lists the keys for the screen you are on and ^g q leaves without
-stopping your terminals.
+It starts the daemon itself if none is running there. The daemon keeps running
+when the TUI exits — that is the point of it: ^g q leaves grove without
+stopping your terminals, and the next \`grove ~/code\` finds them still going.
+Inside grove, ^g ? lists the keys for the screen you are on.
 EOF
