@@ -9,6 +9,7 @@
 //! See `SPEC.md` §3 and §4. This is issue #14: the shell every screen mounts
 //! into. Screens themselves are #18 through #30.
 
+mod columns;
 mod dash;
 mod diff;
 mod empty;
@@ -84,6 +85,8 @@ struct Ui {
     prune: Prune,
     /// Stored sessions, for the picker.
     sessions: Sessions,
+    /// The user's own worktree columns, computed when the rows change.
+    columns: columns::Columns,
     /// The user's own keymaps from `config.lua`, and the runtime they live in.
     keys: UserKeys,
     lua: Option<grove_lua::TuiRuntime>,
@@ -231,6 +234,7 @@ impl Ui {
             palette: Palette::default(),
             prune: Prune::default(),
             sessions: Sessions::default(),
+            columns: columns::Columns::default(),
             keys: UserKeys::default(),
             lua: None,
             diff: Diff::default(),
@@ -679,6 +683,24 @@ fn follow_selection(state: &mut State, ui: &mut Ui) {
 /// callback shelling out to `gh` has a chance — §10.5 asks for a bound, not a
 /// particular one.
 const USER_CALLBACK_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Recompute the user's columns for the rows now on screen.
+///
+/// Off the render path deliberately: a callback shelling out to `gh` takes as
+/// long as the network does, and a frame that waits for it is a pane that has
+/// stopped answering arrow keys. The arrival of a new worktree list is the
+/// invalidation point, because the cells describe those rows and nothing else.
+fn refresh_user_columns(ui: &mut Ui) {
+    let Some(runtime) = ui.lua.take() else {
+        return;
+    };
+    let rows = ui.worktrees.rows_for_columns();
+    ui.columns.refresh(&runtime, &rows);
+    if let Some(note) = ui.columns.take_note() {
+        ui.note = Some(note);
+    }
+    ui.lua = Some(runtime);
+}
 
 /// Run a user keymap's callback, containing whatever it does.
 fn run_user_key(index: usize, ui: &mut Ui) -> Flow {
@@ -1417,6 +1439,7 @@ fn handle(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
                 return Flow::Continue { redraw: false };
             }
             ui.worktrees.set(rows);
+            refresh_user_columns(ui);
             follow_selection(state, ui);
             Flow::Continue { redraw: true }
         }
@@ -1601,11 +1624,13 @@ fn draw(f: &mut ratatui::Frame, state: &State, ui: &Ui) {
                     f.render_widget(Paragraph::new(state.lines(&ui.theme)), area);
                 }
                 None => {
+                    let user = ui.columns.live();
                     ui.worktrees.render(
                         f.buffer_mut(),
                         area,
                         &ui.theme,
                         ui.focus == Focus::Worktrees,
+                        &user,
                     );
                 }
             }
@@ -3451,6 +3476,77 @@ mod tests {
             Flow::Quit => panic!("a keymap must not quit"),
         }
         assert!(ui.note.is_none(), "and said nothing, because it worked");
+    }
+
+    #[test]
+    fn a_user_column_is_computed_when_the_rows_arrive_and_painted_with_them() {
+        // Acceptance: it renders without blocking navigation, because it is
+        // computed at the invalidation point rather than during a frame.
+        let (mut s, _theirs) = wired();
+        let mut ui = with_lua(
+            "local grove = require('grove')\n             grove.column('pr', function(wt) return 'open' end)\n",
+        );
+        handle(
+            Input::Daemon(DaemonEvent::Repos(vec![repo_row("repo", 1)])),
+            &mut s,
+            &mut ui,
+        );
+        handle(
+            Input::Daemon(DaemonEvent::Worktrees {
+                repo: grove_domain::RepoId("repo".into()),
+                rows: vec![worktree_row("feat/x", grove_domain::Ownership::Ours)],
+            }),
+            &mut s,
+            &mut ui,
+        );
+
+        assert_eq!(ui.columns.live().len(), 1);
+        assert_eq!(ui.columns.live()[0].cell("repo", "feat/x"), "open");
+        let screen = painted_dash(&s, &ui, 120, 14).join("\n");
+        assert!(
+            screen.contains("open"),
+            "the user's column is drawn: {screen}"
+        );
+    }
+
+    #[test]
+    fn a_column_that_hangs_does_not_stop_the_dash_arriving() {
+        // The acceptance that matters: a slow column leaves the UI
+        // responsive and the cell empty.
+        let (mut s, _theirs) = wired();
+        let mut ui = with_lua(
+            "local grove = require('grove')\n             grove.column('slow', function() while true do end end)\n",
+        );
+        handle(
+            Input::Daemon(DaemonEvent::Repos(vec![repo_row("repo", 1)])),
+            &mut s,
+            &mut ui,
+        );
+        let started = std::time::Instant::now();
+        handle(
+            Input::Daemon(DaemonEvent::Worktrees {
+                repo: grove_domain::RepoId("repo".into()),
+                rows: vec![worktree_row("feat/x", grove_domain::Ownership::Ours)],
+            }),
+            &mut s,
+            &mut ui,
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "the rows waited {:?} on a user column",
+            started.elapsed()
+        );
+        assert_eq!(ui.columns.live()[0].cell("repo", "feat/x"), "");
+        assert!(
+            ui.note
+                .clone()
+                .is_some_and(|note| note.contains("timed out")),
+            "and it is reported"
+        );
+
+        // Navigation still works.
+        ui.focus = Focus::Worktrees;
+        handle(key(KeyCode::Down), &mut s, &mut ui);
     }
 
     #[test]

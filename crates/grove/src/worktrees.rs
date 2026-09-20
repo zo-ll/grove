@@ -91,6 +91,14 @@ impl Worktrees {
             .min(self.rows.len().saturating_sub(1));
     }
 
+    /// The rows as `(repo, branch)`, for computing user columns against.
+    pub fn rows_for_columns(&self) -> Vec<(String, String)> {
+        self.rows
+            .iter()
+            .map(|row| (row.worktree.repo.0.clone(), row.worktree.branch.clone()))
+            .collect()
+    }
+
     pub fn selected(&self) -> Option<&WorktreeRow> {
         self.rows.get(self.cursor)
     }
@@ -149,7 +157,14 @@ impl Worktrees {
     }
 
     /// Draw into `area`, which is already inside the pane's border.
-    pub fn render(&self, buf: &mut Buffer, area: Rect, theme: &Theme, focused: bool) {
+    pub fn render(
+        &self,
+        buf: &mut Buffer,
+        area: Rect,
+        theme: &Theme,
+        focused: bool,
+        columns: &[&crate::columns::Column],
+    ) {
         if area.width == 0 || area.height == 0 || self.rows.is_empty() {
             return;
         }
@@ -158,7 +173,25 @@ impl Worktrees {
             .iter()
             .take(area.height as usize)
             .enumerate()
-            .map(|(index, row)| self.line(row, index == self.cursor && focused, area.width, theme))
+            .map(|(index, row)| {
+                let mut line = self.line(row, index == self.cursor && focused, area.width, theme);
+                // User columns go after grove's own, so the built-in shape is
+                // what the eye lands on first and a config cannot push the
+                // ownership glyph off the row.
+                for column in columns {
+                    let value = column.cell(&row.worktree.repo.0, &row.worktree.branch);
+                    if value.is_empty() {
+                        continue;
+                    }
+                    line.spans.push(Span::styled(
+                        format!(" {}", truncate(value, column.width())),
+                        // Muted and marked: it is the user's data, not
+                        // grove's, and §10.3 asks for it to read as theirs.
+                        theme.style(Role::Muted).add_modifier(Modifier::ITALIC),
+                    ));
+                }
+                line
+            })
             .collect();
         Paragraph::new(lines).render(area, buf);
     }
@@ -304,7 +337,7 @@ mod tests {
             height: 10,
         };
         let mut buf = Buffer::empty(area);
-        worktrees.render(&mut buf, area, &theme(), true);
+        worktrees.render(&mut buf, area, &theme(), true, &[]);
         (0..area.height)
             .map(|y| {
                 (0..width)
