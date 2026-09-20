@@ -207,16 +207,24 @@ Six. Everything else is a palette command.
 ### 4.1 Dash
 
 ```
-┌─ REPOS ────────┬─ WORKTREES ────────────────┬─ billing-service · feat/ABC-4471 ─┐
-│ ● billing-svc 2│ ▣ feat/ABC-4471   ↑4 ↓2  2h│ $ pnpm test billing/invoice       │
-│ ● web-app    1 │ ◇ fix/ABC-4402    ↑1     1d│  PASS  src/invoice/split.test.ts  │
-│ ● sdk-js     1 │ ◇ spike/perf             4d│  FAIL  src/invoice/proration.ts   │
-│ ○ search-idx ·│ ▣ main            ↓11  now│    expected 4 items, received 3    │
-└────────────────┴────────────────────────────┴───────────────────────────────────┘
+╭──────────────────╮ ╭──────────────────────────────╮ ╭─────────────────────────────╮
+│ REPOS            │ │ WORKTREES                    │ │ billing-service · feat/ABC… │
+│                  │ │                              │ │                             │
+│ ● billing-svc  2 │ │ ▣ feat/ABC-4471    ↑4 ↓2  2h │ │ $ pnpm test billing/invoice │
+│ ● web-app      1 │ │ ◆ fix/ABC-4402     ↑1     1d │ │  PASS  src/invoice/split.te │
+│ ● sdk-js       1 │ │ ◇ spike/perf          ↓9 12d │ │  FAIL  src/invoice/proratio │
+│ ○ search-idx   · │ │ ─ main               ↓11 now │ │    expected 4 items, rec 3  │
+╰──────────────────╯ ╰──────────────────────────────╯ ╰─────────────────────────────╯
  ^g tab pane  ^g 1-3 hide  ^g s sessions  ^g d diff  ^g / palette   session: invoice split
 ```
 
-Three panes, each hideable, at least one always visible.
+Three panes, each hideable, at least one always visible. Separate boxes with a
+column between them, each headed on the line inside its top border rather than in
+it — this follows the design mock, which is the reference whenever the two
+disagree. The widths are the mock's flex line: REPOS asks for 31 columns and never
+takes spare, WORKTREES and the terminal ask for 58 and 44 and share what is left.
+Where the mock has no opinion — a terminal too narrow for it to render at all — a
+pane is dropped rather than starved.
 
 **REPOS** — the session's member repos. Dot shows worktree presence and dirtiness;
 trailing count is the number of branched worktrees grove can see in that repo, the
@@ -238,16 +246,18 @@ When the workspace has no repos or the session has nothing in it, the dash rende
 guidance in place of empty panes rather than a blank grid:
 
 ```
-┌─ REPOS ────────┬─ WORKTREES ──────────────────────────┐
-│                │  grove is empty                      │
-│  no repos      │                                      │
-│  registered    │  1  point grove at your clones       │
-│                │     ^g /  scan                       │
-│                │  2  add repos to this session        │
-│                │     ^g /  add <repo>                 │
-│                │  3  name a branch                    │
-│                │     ^g /  new <branch>               │
-└────────────────┴──────────────────────────────────────┘
+╭──────────────────╮ ╭──────────────────────────────────────╮
+│ REPOS            │ │ WORKTREES                            │
+│                  │ │                                      │
+│ no repos         │ │ grove is empty                       │
+│ registered       │ │                                      │
+│                  │ │ 1  point grove at your clones        │
+│                  │ │    ^g /  scan                        │
+│                  │ │ 2  add repos to this session         │
+│                  │ │    ^g /  add <repo>                  │
+│                  │ │ 3  name a branch                     │
+│                  │ │    ^g /  new <branch>                │
+╰──────────────────╯ ╰──────────────────────────────────────╯
 ```
 
 ### 4.2 Command palette — `^g /`
