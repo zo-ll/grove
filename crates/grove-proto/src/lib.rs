@@ -715,8 +715,10 @@ pub fn workspace_hash(path: &Path) -> String {
 pub enum Handshake {
     /// Versions match. `ownership_movable` carries the daemon's workspace
     /// capability through the handshake, so a client knows before its first
-    /// request whether adopt and release can ever succeed.
-    Agreed { ownership_movable: bool },
+    /// request whether adopt and release can ever succeed. `None` marks that
+    /// the deciding side did not decide — a hello matches on versions only,
+    /// and nothing here may advertise a workspace it has not seen.
+    Agreed { ownership_movable: Option<bool> },
     /// Versions differ. The caller reports which side is stale and stops; it
     /// does not attempt to speak the other version.
     Mismatch { daemon: u32, client: u32 },
@@ -738,7 +740,7 @@ pub fn accept_welcome(event: &Event) -> Handshake {
             version,
             ownership_movable,
         } if *version == PROTOCOL_VERSION => Handshake::Agreed {
-            ownership_movable: *ownership_movable,
+            ownership_movable: Some(*ownership_movable),
         },
         Event::Welcome { version, .. } => Handshake::Mismatch {
             daemon: *version,
@@ -760,7 +762,7 @@ pub fn accept_welcome(event: &Event) -> Handshake {
 pub fn accept_hello(request: &Request) -> Handshake {
     match request {
         Request::Hello { version } if *version == PROTOCOL_VERSION => Handshake::Agreed {
-            ownership_movable: true,
+            ownership_movable: None,
         },
         Request::Hello { version } => Handshake::Mismatch {
             daemon: PROTOCOL_VERSION,
@@ -1220,12 +1222,15 @@ mod tests {
 
     #[test]
     fn handshake_agrees_only_on_an_exact_match() {
+        // A hello matches on versions only: nothing here has seen a
+        // workspace, so the capability is None — unrepresentable as an
+        // advertised fact.
         assert_eq!(
             accept_hello(&Request::Hello {
                 version: PROTOCOL_VERSION
             }),
             Handshake::Agreed {
-                ownership_movable: true
+                ownership_movable: None
             }
         );
         assert_eq!(

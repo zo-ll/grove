@@ -596,7 +596,9 @@ fn connect(workspace: &Path, inputs: &Inputs) -> State {
             Handshake::Mismatch { daemon, client } => State::Disconnected {
                 workspace: workspace.to_path_buf(),
                 reason: format!(
-                    "protocol mismatch: the daemon speaks v{daemon}, this grove speaks v{client}"
+                    "protocol mismatch: the daemon speaks v{daemon}, this grove speaks v{client}; \
+                     the daemon outlives the TUI, so an upgraded grove meets an old groved — \
+                     stop that daemon for this workspace and start again"
                 ),
             },
             Handshake::NotHello => State::Disconnected {
