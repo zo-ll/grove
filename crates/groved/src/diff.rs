@@ -95,10 +95,13 @@ pub fn diff_screen(
             .map(|file| DiffFile {
                 path: file.path.to_string_lossy().into_owned(),
                 // The wire's status set is closed: a typechange is a
-                // modification of an existing path, so T rides as M.
+                // modification of an existing path, so T rides as M, and any
+                // letter the wire does not name falls to ? rather than
+                // leaking an undocumented state to clients.
                 status: match file.status {
                     'T' => 'M',
-                    other => other,
+                    known @ ('M' | 'A' | 'D' | '?') => known,
+                    _ => '?',
                 },
                 added: file.added.unwrap_or(0),
                 removed: file.deleted.unwrap_or(0),
@@ -122,16 +125,21 @@ fn classify(patch: &[u8]) -> Vec<DiffLine> {
     // starting `-- ` from being mistaken for a file header.
     let mut in_hunks = false;
     for line in String::from_utf8_lossy(patch).lines() {
-        if !in_hunks {
-            if line.starts_with("@@") {
-                in_hunks = true;
-                hunks.push(DiffLine::Header(line.to_string()));
-            }
+        // A hunk header — every one of them, not just the first: later hunks
+        // in the same file are separators too, not content that happens to
+        // start with @@.
+        if line.starts_with("@@") {
+            in_hunks = true;
+            hunks.push(DiffLine::Header(line.to_string()));
             continue;
         }
-        // After the first header: a hunk separator, a context line (git keeps
-        // the leading space even when the content is empty), and "\ No
-        // newline" is a byte-level remark the screen does not render.
+        // File metadata appears only before the first header.
+        if !in_hunks {
+            continue;
+        }
+        // A context line keeps its leading space even when the content is
+        // empty; "\ No newline" is a byte-level remark the screen does not
+        // render.
         if line.starts_with("\\ ") {
             continue;
         } else if let Some(added) = line.strip_prefix('+') {
@@ -333,6 +341,27 @@ mod tests {
         assert!(screen.files.is_empty());
         assert_eq!(screen.selected, None);
         assert!(screen.hunks.is_empty());
+    }
+
+    #[test]
+    fn every_hunk_header_is_a_header() {
+        // The first fix over-gated: only the first @@ was a Header and every
+        // later one fell through to Context. Two hunks in one file are the
+        // ordinary case.
+        let patch = b"diff --git a/x b/x\nindex aaa..bbb 100644\n--- a/x\n+++ b/x\n@@ -1,2 +1,2 @@\n one\n-old\n+new\n@@ -10,2 +10,2 @@\n more\n-context\n+changed\n";
+        assert_eq!(
+            classify(patch),
+            vec![
+                DiffLine::Header("@@ -1,2 +1,2 @@".to_string()),
+                DiffLine::Context("one".to_string()),
+                DiffLine::Removed("old".to_string()),
+                DiffLine::Added("new".to_string()),
+                DiffLine::Header("@@ -10,2 +10,2 @@".to_string()),
+                DiffLine::Context("more".to_string()),
+                DiffLine::Removed("context".to_string()),
+                DiffLine::Added("changed".to_string()),
+            ]
+        );
     }
 
     #[test]
