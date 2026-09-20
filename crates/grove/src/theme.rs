@@ -149,6 +149,7 @@ pub struct Theme {
     dirty: Color,
     error: Color,
     muted: Color,
+    frame: Color,
     corners: Corners,
     density: Density,
 }
@@ -187,7 +188,18 @@ impl Theme {
             Depth::True => rgb.map(|(r, g, b)| Color::Rgb(r, g, b)),
         };
 
+        // Fixed, not configurable: the mock's panes are the accent colour when
+        // focused and this grey when not, and the five roles are about what a
+        // thing *is* — a frame is not clean, dirty, muted or wrong. Resolved
+        // through the same depth logic so it degrades with everything else.
+        let frame = match depth {
+            Depth::Ansi16 => Color::Indexed(nearest_16(FRAME)),
+            Depth::Ansi256 => Color::Indexed(nearest_256(FRAME)),
+            Depth::True => Color::Rgb(FRAME.0, FRAME.1, FRAME.2),
+        };
+
         let theme = Self {
+            frame,
             accent: colours[0],
             clean: colours[1],
             dirty: colours[2],
@@ -213,6 +225,15 @@ impl Theme {
     /// The style for a role — what call sites actually want.
     pub fn style(&self, role: Role) -> Style {
         Style::default().fg(self.color(role))
+    }
+
+    /// The colour of a pane's border when it does not have focus.
+    ///
+    /// Dimmer than [`Role::Muted`], which is text: a frame that reads as
+    /// loudly as the words inside it competes with them, and in the mock the
+    /// unfocused panes recede almost to the background.
+    pub fn frame_style(&self) -> Style {
+        Style::default().fg(self.frame)
     }
 
     /// The border treatment for panes and overlays.
@@ -244,6 +265,9 @@ impl Theme {
         }
     }
 }
+
+/// Catppuccin Mocha's `surface0`, the mock's unfocused pane border.
+const FRAME: (u8, u8, u8) = (0x31, 0x32, 0x44);
 
 /// `#rrggbb` or `rrggbb`, case-insensitive.
 ///

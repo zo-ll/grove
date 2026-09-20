@@ -1887,7 +1887,15 @@ fn draw(f: &mut ratatui::Frame, state: &State, ui: &Ui) {
             Some(_) => ui.panes.for_guidance(),
             None => ui.panes,
         };
-        let inner = dash::render(f.buffer_mut(), body_area, panes, ui.focus, &ui.theme);
+        let selection = ui.selection();
+        let inner = dash::render(
+            f.buffer_mut(),
+            body_area,
+            panes,
+            ui.focus,
+            &ui.theme,
+            &selection,
+        );
         if let Some(area) = inner.repos {
             ui.repos
                 .render(f.buffer_mut(), area, &ui.theme, ui.focus == Focus::Repos);
@@ -2070,6 +2078,22 @@ fn overlay(f: &mut ratatui::Frame, area: Rect, title: &'static str, ui: &Ui) -> 
 }
 
 /// The one row along the bottom, drawn the same way whatever is above it.
+impl Ui {
+    /// What the terminal pane is showing, as the mock heads it: `repo · branch`.
+    ///
+    /// The same string the status bar puts on its right, because they are
+    /// answering the same question and two ways of phrasing it would drift.
+    fn selection(&self) -> String {
+        match (self.repos.selected(), self.worktrees.selected()) {
+            (Some(repo), Some(worktree)) => format!("{} · {}", repo.name, worktree.worktree.branch),
+            // A repo with the cursor on it but nothing under that cursor: the
+            // pane is honest about which half it has.
+            (Some(repo), None) => format!("{} · no worktrees", repo.name),
+            _ => "no worktree selected".to_string(),
+        }
+    }
+}
+
 fn status_bar(f: &mut ratatui::Frame, area: Rect, ui: &Ui) {
     let context = if ui.router.prefix_pending() {
         "^g …".to_string()

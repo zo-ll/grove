@@ -16,8 +16,11 @@
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Modifier;
+use ratatui::text::Line;
 use ratatui::text::Span;
-use ratatui::widgets::{Block, Borders, Widget};
+use ratatui::widgets::{Block, Borders, Paragraph, Widget};
+
+use crate::text;
 
 use crate::keymap::{Focus, Screen};
 use crate::theme::{Role, Theme};
@@ -29,20 +32,63 @@ use crate::theme::{Role, Theme};
 /// moment a fourth pane appears.
 pub type Pane = Focus;
 
-/// Smallest widths worth drawing. Below these a pane is all border and no
-/// content, which is worse than the pane being absent.
-const REPOS_IDEAL: u16 = 18;
-const REPOS_MIN: u16 = 14;
-const WORKTREES_MIN: u16 = 26;
-const TERMINAL_MIN: u16 = 24;
+/// How a pane takes width, taken from the mock's flex line.
+///
+/// `Grove TUI v6` sizes the dash with CSS flex, and the numbers there are
+/// already in characters — `flex:0 1 31ch` for REPOS, `flex:1 1 58ch` for
+/// WORKTREES, `flex:1 1 44ch` for the terminal — so the bases and the grow
+/// flags carry over to a terminal grid unchanged.
+///
+/// The floors do not come from the mock. Its `min-width`s (21, 34, 28) total
+/// more than an 80-column terminal has once the gaps are paid for, which would
+/// drop the terminal pane on the commonest terminal there is. The mock never
+/// renders that narrow — below 760px it overflows rather than reflowing — so
+/// it has no opinion to be faithful to, and these stay where they were.
+struct Flex {
+    /// The width the pane asks for.
+    basis: u16,
+    /// The width below which it is all border and no content, so not drawn.
+    min: u16,
+    /// Whether spare width is this pane's to take. REPOS is `flex:0`: a list
+    /// of repository names does not get better with sixty columns.
+    grow: bool,
+}
+
+const REPOS: Flex = Flex {
+    basis: 31,
+    min: 14,
+    grow: false,
+};
+const WORKTREES: Flex = Flex {
+    basis: 58,
+    min: 26,
+    grow: true,
+};
+const TERMINAL: Flex = Flex {
+    basis: 44,
+    min: 24,
+    grow: true,
+};
+
+/// The gap the mock leaves between panes.
+///
+/// The panes are separate boxes with `gap:16px` between them — a little over
+/// one character at the mock's font size — not cells of one frame. One column
+/// is the terminal's nearest whole equivalent, and it is what keeps two
+/// adjacent borders from reading as a single doubled line.
+const GAP: u16 = 1;
+
+fn flex(pane: Pane) -> Flex {
+    match pane {
+        Focus::Repos => REPOS,
+        Focus::Worktrees => WORKTREES,
+        Focus::Terminal => TERMINAL,
+    }
+}
 
 /// The width below which a pane is not worth drawing at all.
 fn floor(pane: Pane) -> u16 {
-    match pane {
-        Focus::Repos => REPOS_MIN,
-        Focus::Worktrees => WORKTREES_MIN,
-        Focus::Terminal => TERMINAL_MIN,
-    }
+    flex(pane).min
 }
 
 /// Which panes the user can see.
@@ -188,7 +234,10 @@ impl Panes {
             if showing.len() == 1 {
                 return panes;
             }
-            let needed: u16 = showing.iter().map(|pane| floor(*pane)).sum();
+            // The gaps are part of what has to fit: three panes at their floor
+            // and no room for the two columns between them is not three panes.
+            let needed: u16 = showing.iter().map(|pane| floor(*pane)).sum::<u16>()
+                + GAP * (showing.len() as u16 - 1);
             if needed <= width {
                 return panes;
             }
@@ -224,6 +273,14 @@ impl Areas {
             Focus::Repos => self.repos,
             Focus::Worktrees => self.worktrees,
             Focus::Terminal => self.terminal,
+        }
+    }
+
+    fn set(&mut self, pane: Pane, rect: Option<Rect>) {
+        match pane {
+            Focus::Repos => self.repos = rect,
+            Focus::Worktrees => self.worktrees = rect,
+            Focus::Terminal => self.terminal = rect,
         }
     }
 }
@@ -268,56 +325,90 @@ pub fn split(area: Rect, panes: Panes) -> Areas {
             Focus::Worktrees => areas.worktrees = Some(rect),
             Focus::Terminal => areas.terminal = Some(rect),
         }
-        x = x.saturating_add(width);
+        // Past this pane and over the gap: the next box starts a column clear
+        // of this one, as the mock's `gap:16px` leaves it.
+        x = x.saturating_add(width).saturating_add(GAP);
     }
     areas
 }
 
 /// Column widths for the visible panes, left to right.
 ///
-/// The order the shortfall is taken in is the whole of the degradation policy:
-/// the terminal gives up columns first, then WORKTREES, and REPOS last —
-/// REPOS is the narrowest and the one whose content is a fixed-width list of
-/// names, so shaving it costs more than it saves.
+/// This is CSS flex, because the mock is: every pane starts at its basis, the
+/// spare goes to the panes that grow, and a shortfall is taken from each in
+/// proportion to how much width it asked for, never below its floor. The old
+/// hand-rolled version took the shortfall from one pane at a time in a fixed
+/// order, which is a different layout at every width but the one it was
+/// checked at.
 fn widths_for(total: u16, showing: &[Pane]) -> Vec<u16> {
-    let ideal = |pane: &Pane| match pane {
-        Focus::Repos => REPOS_IDEAL,
-        Focus::Worktrees => WORKTREES_MIN,
-        Focus::Terminal => TERMINAL_MIN,
-    };
-    let mut widths: Vec<u16> = showing.iter().map(ideal).collect();
+    if showing.is_empty() {
+        return Vec::new();
+    }
+    let gaps = GAP * (showing.len() as u16 - 1);
+    let available = total.saturating_sub(gaps);
+    let flexes: Vec<Flex> = showing.iter().map(|pane| flex(*pane)).collect();
+    let mut widths: Vec<u16> = flexes.iter().map(|f| f.basis).collect();
     let claimed: u16 = widths.iter().copied().sum();
 
-    if claimed <= total {
-        // Everything that is left goes to the rightmost flexible pane — the
-        // terminal if it is showing, WORKTREES otherwise. REPOS never grows:
-        // §4.1 calls it fixed-ish, and a half-empty 60-column list of repo
-        // names is wasted width.
-        let spare = total - claimed;
-        let grow = showing
+    if claimed <= available {
+        let mut spare = available - claimed;
+        let growers: Vec<usize> = flexes
             .iter()
-            .rposition(|pane| !matches!(pane, Focus::Repos))
-            .or(showing.len().checked_sub(1));
-        if let Some(index) = grow {
-            widths[index] = widths[index].saturating_add(spare);
+            .enumerate()
+            .filter(|(_, f)| f.grow)
+            .map(|(i, _)| i)
+            .collect();
+        // Nothing here grows — REPOS alone, in practice. It still takes the
+        // width rather than leaving a gap at the right edge, because a pane
+        // that does not fill the dash looks like a pane that failed to draw.
+        let growers = if growers.is_empty() {
+            vec![widths.len() - 1]
+        } else {
+            growers
+        };
+        let each = spare / growers.len() as u16;
+        for &i in &growers {
+            widths[i] = widths[i].saturating_add(each);
+            spare -= each;
+        }
+        // The odd column goes to the last grower — the terminal when it is
+        // showing — so the panes end flush with the right edge.
+        if let Some(&last) = growers.last() {
+            widths[last] = widths[last].saturating_add(spare);
         }
         return widths;
     }
 
-    // Too narrow for every pane's ideal. Take the shortfall in policy order,
-    // never below a pane's floor, and if it still does not fit let the last
-    // pane be clipped rather than wrapping the layout round to x = 0.
-    let mut shortfall = claimed - total;
-    for pane in [Focus::Terminal, Focus::Worktrees, Focus::Repos] {
-        if shortfall == 0 {
+    // Too narrow for every basis. Shrink in proportion to what each asked for,
+    // clamped at its floor, repeating because clamping one pane hands its
+    // share back to the others.
+    let mut shortfall = claimed - available;
+    while shortfall > 0 {
+        let shrinkable: Vec<usize> = (0..widths.len())
+            .filter(|&i| widths[i] > flexes[i].min)
+            .collect();
+        if shrinkable.is_empty() {
             break;
         }
-        let Some(index) = showing.iter().position(|p| *p == pane) else {
-            continue;
-        };
-        let give = widths[index].saturating_sub(floor(pane)).min(shortfall);
-        widths[index] -= give;
-        shortfall -= give;
+        let basis_sum: u32 = shrinkable.iter().map(|&i| u32::from(flexes[i].basis)).sum();
+        let mut taken = 0u16;
+        for &i in &shrinkable {
+            if taken == shortfall {
+                break;
+            }
+            // Rounded up, or a shortfall smaller than the pane count makes no
+            // progress and the loop never ends.
+            let share = (u32::from(shortfall) * u32::from(flexes[i].basis)).div_ceil(basis_sum);
+            let give = (share as u16)
+                .min(widths[i] - flexes[i].min)
+                .min(shortfall - taken);
+            widths[i] -= give;
+            taken += give;
+        }
+        if taken == 0 {
+            break;
+        }
+        shortfall -= taken;
     }
     if shortfall > 0 {
         // Only reachable with a single pane left, since `drawable` has already
@@ -327,21 +418,23 @@ fn widths_for(total: u16, showing: &[Pane]) -> Vec<u16> {
         widths[last] = widths[last].saturating_sub(shortfall);
     }
     debug_assert!(
-        widths.iter().copied().sum::<u16>() <= total,
-        "the panes must never claim more columns than the dash has"
+        widths.iter().copied().sum::<u16>() + gaps <= total,
+        "the panes and their gaps must never claim more columns than the dash has"
     );
     widths
 }
 
-/// The title §4.1 puts on each pane.
+/// The label the mock puts at the top of each pane.
 ///
-/// The terminal's is the selected worktree once #21 fills it in; until then it
-/// says what it is rather than lying about a worktree.
-fn title(pane: Pane) -> &'static str {
+/// The terminal's is not a label at all — it is the selection, `repo · branch`
+/// — so it is passed in. A pane headed `TERMINAL` tells you what you are
+/// already looking at; the mock's tells you which worktree's shell it is,
+/// which is the only question the header can answer.
+fn label(pane: Pane, terminal: &str) -> &str {
     match pane {
         Focus::Repos => "REPOS",
         Focus::Worktrees => "WORKTREES",
-        Focus::Terminal => "TERMINAL",
+        Focus::Terminal => terminal,
     }
 }
 
@@ -379,7 +472,14 @@ pub fn list_under_arrows(screen: Screen, focus: Pane, panes: Panes, width: u16) 
 /// The focused pane is drawn in the accent colour and bold, everything else
 /// muted. That is the whole focus indicator, and it is a colour *and* a weight
 /// because colour alone disappears on a terminal that has themed its palette.
-pub fn render(buf: &mut Buffer, area: Rect, panes: Panes, focus: Pane, theme: &Theme) -> Areas {
+pub fn render(
+    buf: &mut Buffer,
+    area: Rect,
+    panes: Panes,
+    focus: Pane,
+    theme: &Theme,
+    terminal: &str,
+) -> Areas {
     let areas = split(area, panes);
     let mut inner = Areas {
         repos: None,
@@ -391,25 +491,76 @@ pub fn render(buf: &mut Buffer, area: Rect, panes: Panes, focus: Pane, theme: &T
             continue;
         };
         let focused = pane == focus;
-        let style = if focused {
+        // The mock's focus ring is the border colour and nothing else: accent
+        // when focused, the frame grey when not. Bold as well, because colour
+        // alone disappears on a terminal that has themed its palette.
+        let border = if focused {
             theme.style(Role::Accent).add_modifier(Modifier::BOLD)
         } else {
-            theme.style(Role::Muted)
+            theme.frame_style()
         };
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(theme.border())
-            .border_style(style)
-            .title(Span::styled(title(pane), style));
+            .border_style(border);
         let within = block.inner(rect);
         block.render(rect, buf);
-        match pane {
-            Focus::Repos => inner.repos = Some(within),
-            Focus::Worktrees => inner.worktrees = Some(within),
-            Focus::Terminal => inner.terminal = Some(within),
-        }
+        inner.set(
+            pane,
+            header(buf, within, label(pane, terminal), focused, theme),
+        );
     }
     inner
+}
+
+/// Write a pane's header and return what is left for its contents.
+///
+/// The header is a line *inside* the pane rather than a word let into the top
+/// border, which is how the mock draws it and why the panes there have a
+/// title, a gap, and then their rows. Returns `None` when the pane is too
+/// short to have contents once the header has taken its line: a pane showing
+/// only a header is not showing anything.
+fn header(
+    buf: &mut Buffer,
+    within: Rect,
+    label: &str,
+    focused: bool,
+    theme: &Theme,
+) -> Option<Rect> {
+    if within.width == 0 || within.height == 0 {
+        return None;
+    }
+    let pad = theme.padding();
+    let style = if focused {
+        theme.style(Role::Accent)
+    } else {
+        theme.style(Role::Muted)
+    };
+    let room = within.width.saturating_sub(pad * 2);
+    let line = Line::from(Span::styled(text::truncate(label, room as usize), style));
+    let at = Rect {
+        x: within.x + pad,
+        y: within.y,
+        width: room,
+        height: 1,
+    };
+    Paragraph::new(line).render(at, buf);
+
+    // The mock puts space under the header before the first row — 8px of
+    // padding, which is a blank line here. Compact spends neither that line
+    // nor the side columns.
+    let gap = if pad == 0 { 0 } else { 1 };
+    let taken = 1 + gap;
+    let height = within.height.checked_sub(taken)?;
+    if height == 0 {
+        return None;
+    }
+    Some(Rect {
+        x: within.x + pad,
+        y: within.y + taken,
+        width: room,
+        height,
+    })
 }
 
 #[cfg(test)]
@@ -492,9 +643,10 @@ mod tests {
     }
 
     #[test]
-    fn the_panes_tile_the_width_exactly_and_in_order() {
-        // No gaps, no overlaps, no column of the dash unaccounted for — and
-        // left to right in the order §4.1 draws them.
+    fn the_panes_tile_the_width_with_one_gap_between_them() {
+        // The mock separates the panes by `gap:16px` rather than sharing one
+        // frame, so exactly one column stands between them — no more, and
+        // never none, which would read as a single doubled border.
         for width in [80u16, 100, 120, 160, 200, 240] {
             let area = Rect { width, ..NARROW };
             let areas = split(area, Panes::default());
@@ -502,11 +654,15 @@ mod tests {
             let worktrees = areas.worktrees.expect("visible");
             let terminal = areas.terminal.expect("visible");
             assert_eq!(repos.x, 0);
-            assert_eq!(worktrees.x, repos.x + repos.width, "gap before WORKTREES");
+            assert_eq!(
+                worktrees.x,
+                repos.x + repos.width + GAP,
+                "one column between REPOS and WORKTREES"
+            );
             assert_eq!(
                 terminal.x,
-                worktrees.x + worktrees.width,
-                "gap before terminal"
+                worktrees.x + worktrees.width + GAP,
+                "one column between WORKTREES and the terminal"
             );
             assert_eq!(
                 terminal.x + terminal.width,
@@ -521,25 +677,35 @@ mod tests {
         // The acceptance floor. Each pane needs room for two border columns
         // plus content; a pane narrower than its floor is all frame.
         let areas = split(NARROW, Panes::default());
-        assert!(areas.repos.expect("visible").width >= REPOS_MIN);
-        assert!(areas.worktrees.expect("visible").width >= WORKTREES_MIN);
-        assert!(areas.terminal.expect("visible").width >= TERMINAL_MIN);
+        assert!(areas.repos.expect("visible").width >= REPOS.min);
+        assert!(areas.worktrees.expect("visible").width >= WORKTREES.min);
+        assert!(areas.terminal.expect("visible").width >= TERMINAL.min);
     }
 
     #[test]
-    fn extra_width_goes_to_the_terminal_not_to_repos() {
-        // §4.1: REPOS is fixed-ish. A repo list stretched across 80 columns is
-        // whitespace where the terminal wanted characters.
-        let narrow = split(NARROW, Panes::default());
+    fn extra_width_is_shared_by_the_two_panes_that_grow() {
+        // The mock's flex line: REPOS is `flex:0`, the other two are `flex:1`.
+        // So spare width is split between WORKTREES and the terminal rather
+        // than all landing on the terminal, and a repo list is never stretched
+        // across eighty columns of whitespace.
+        // Both wide enough that nothing is shrinking: REPOS is `flex:0 1`, so
+        // it does give columns back when the dash is too narrow for every
+        // basis — it just never takes any when there are spare.
+        let narrow = split(Rect { width: 140, ..WIDE }, Panes::default());
         let wide = split(WIDE, Panes::default());
         assert_eq!(
             narrow.repos.expect("visible").width,
             wide.repos.expect("visible").width,
-            "REPOS must not grow with the terminal"
+            "REPOS must not grow"
         );
+        let grew_worktrees =
+            wide.worktrees.expect("visible").width - narrow.worktrees.expect("visible").width;
+        let grew_terminal =
+            wide.terminal.expect("visible").width - narrow.terminal.expect("visible").width;
+        assert!(grew_worktrees > 0 && grew_terminal > 0, "both must grow");
         assert!(
-            wide.terminal.expect("visible").width > narrow.terminal.expect("visible").width + 100,
-            "the terminal takes the remainder"
+            grew_worktrees.abs_diff(grew_terminal) <= 1,
+            "evenly, give or take the odd column: {grew_worktrees} vs {grew_terminal}"
         );
     }
 
@@ -575,11 +741,19 @@ mod tests {
         // used to come off the rightmost pane until it hit zero width, so the
         // terminal was "visible", focusable, zero columns wide — and the
         // panes together still overflowed the area.
+        // One column wider than the two floors, because the gap between them
+        // is part of what has to fit — at 40 even two panes do not.
         let tiny = Rect {
-            width: 40,
+            width: 41,
             height: 10,
             ..NARROW
         };
+        assert!(
+            split(Rect { width: 40, ..tiny }, Panes::default())
+                .worktrees
+                .is_none(),
+            "a column short of two floors plus their gap is one pane, not two"
+        );
         let areas = split(tiny, Panes::default());
         assert!(
             areas.terminal.is_none(),
@@ -588,7 +762,7 @@ mod tests {
         let repos = areas.repos.expect("visible");
         let worktrees = areas.worktrees.expect("visible");
         assert_eq!(repos.x, 0);
-        assert_eq!(worktrees.x, repos.x + repos.width);
+        assert_eq!(worktrees.x, repos.x + repos.width + GAP);
         assert_eq!(
             worktrees.x + worktrees.width,
             tiny.width,
@@ -685,7 +859,14 @@ mod tests {
         // that themes its palette, and weight alone is subtle at a glance.
         let theme = theme();
         let mut buf = Buffer::empty(NARROW);
-        let _ = render(&mut buf, NARROW, Panes::default(), Focus::Worktrees, &theme);
+        let _ = render(
+            &mut buf,
+            NARROW,
+            Panes::default(),
+            Focus::Worktrees,
+            &theme,
+            "billing-service · feat/ABC-4471",
+        );
 
         let areas = split(NARROW, Panes::default());
         let focused = corner(&buf, areas.worktrees.expect("visible"));
@@ -696,7 +877,16 @@ mod tests {
             focused.add_modifier.contains(Modifier::BOLD),
             "the focused pane must differ by weight as well as colour"
         );
-        assert_eq!(unfocused.fg, Some(theme.color(Role::Muted)));
+        assert_eq!(
+            unfocused.fg,
+            theme.frame_style().fg,
+            "an unfocused pane recedes to the frame grey, as it does in the mock"
+        );
+        assert_ne!(
+            unfocused.fg,
+            Some(theme.color(Role::Accent)),
+            "and is unmistakably not the focused one"
+        );
         assert!(!unfocused.add_modifier.contains(Modifier::BOLD));
     }
 
@@ -708,19 +898,22 @@ mod tests {
         let areas = split(NARROW, Panes::default());
         for focus in [Focus::Repos, Focus::Worktrees, Focus::Terminal] {
             let mut buf = Buffer::empty(NARROW);
-            let _ = render(&mut buf, NARROW, Panes::default(), focus, &theme);
+            let _ = render(
+                &mut buf,
+                NARROW,
+                Panes::default(),
+                focus,
+                &theme,
+                "billing-service · feat/ABC-4471",
+            );
             for pane in [Focus::Repos, Focus::Worktrees, Focus::Terminal] {
                 let style = corner(&buf, areas.of(pane).expect("visible"));
                 let expected = if pane == focus {
-                    theme.color(Role::Accent)
+                    Some(theme.color(Role::Accent))
                 } else {
-                    theme.color(Role::Muted)
+                    theme.frame_style().fg
                 };
-                assert_eq!(
-                    style.fg,
-                    Some(expected),
-                    "{pane:?} while focus is {focus:?}"
-                );
+                assert_eq!(style.fg, expected, "{pane:?} while focus is {focus:?}");
             }
         }
     }
@@ -734,18 +927,29 @@ mod tests {
         let mut panes = Panes::default();
         assert!(panes.toggle(Focus::Repos));
         let mut buf = Buffer::empty(NARROW);
-        let _ = render(&mut buf, NARROW, panes, Focus::Worktrees, &theme);
+        let _ = render(
+            &mut buf,
+            NARROW,
+            panes,
+            Focus::Worktrees,
+            &theme,
+            "billing-service · feat/ABC-4471",
+        );
 
         let worktrees = split(NARROW, panes).worktrees.expect("visible");
         assert_eq!(worktrees.x, 0, "WORKTREES takes the left edge");
+        // The mock heads a pane on the line below its top border, not in it.
         let painted: String = (0..NARROW.width)
-            .map(|x| buf[(x, 0)].symbol().to_string())
+            .map(|x| buf[(x, 1)].symbol().to_string())
             .collect();
         assert!(
             !painted.contains("REPOS"),
             "a hidden pane must not be painted: {painted}"
         );
-        assert!(painted.contains("WORKTREES"));
+        assert!(
+            painted.contains("WORKTREES"),
+            "the pane is headed inside itself: {painted}"
+        );
     }
 
     #[test]
