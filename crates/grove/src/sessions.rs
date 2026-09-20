@@ -79,6 +79,11 @@ impl Sessions {
         &self.rows
     }
 
+    /// The session with this id, for naming the one that is open.
+    pub fn by_id(&self, id: &grove_domain::SessionId) -> Option<&SessionRow> {
+        self.rows.iter().find(|row| &row.id == id)
+    }
+
     pub fn move_down(&mut self) -> bool {
         let last = self.rows.len().saturating_sub(1);
         if self.rows.is_empty() || self.cursor >= last {
