@@ -241,7 +241,13 @@ clone excluded. A member with zero worktrees shows `·`.
 clone. Columns: ownership glyph · branch · `↑ahead` · `↓behind` · age. A stale-refs
 marker appears when the underlying refs have aged past the threshold.
 
-Glyphs: `▣` has a terminal · `◆` dirty, no terminal · `◇` clean, no terminal.
+Glyphs say **ownership**, which is what the mock's do and what the dash draws:
+`▣` this session's, with a terminal · `◆` this session's without one, or another
+session's · `◇` unowned and adoptable · `─` the clone itself. Colour separates the
+two meanings of `◆`: yours reads clean or dirty, another session's is muted.
+
+A terminal can be running in a worktree nobody owns — §2 hangs a pty off a
+worktree, not off an owned one — so `◇` does not mean "no terminal".
 
 **Terminal** — the live pty of the currently selected worktree, following the WORKTREES
 cursor. This is a real terminal, not a preview: with focus on it, keystrokes go to the
