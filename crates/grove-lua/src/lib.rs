@@ -25,6 +25,35 @@ const DEFAULT_WORKTREE_PATH: &str = "~/grove/{repo}/{branch_slug}";
 const MAX_BRANCH_SLUG_BYTES: usize = 120;
 const BRANCH_SLUG_HASH_BYTES: usize = 16;
 
+/// Something a user's callback asked grove to do.
+///
+/// The helpers do not act. They record, and the TUI performs the recording
+/// after the callback returns — which is what lets this crate stay on neither
+/// lane's side: `grove-lua` is shared by both binaries and the boundary script
+/// forbids it depending on the protocol, so it cannot send a request even if
+/// the borrow checker would let a callback reach the socket mid-call.
+///
+/// Every field is a plain string for the same reason: a `RepoId` here would be
+/// a domain type this crate has no business knowing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Ask {
+    /// `grove.new_worktree{ repo = …, branch = … }`
+    NewWorktree { repo: String, branch: String },
+    /// `grove.open_session("name")`
+    OpenSession { name: String },
+    /// `grove.send("text")` — to the terminal on screen.
+    Send { text: String },
+    /// `grove.palette("new ")` — open the palette, prefilled.
+    Palette { prefill: String },
+}
+
+/// What the TUI tells the VM about where the user is, before a callback runs.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Context {
+    /// The repo under the REPOS cursor, for `grove.current_repo()`.
+    pub current_repo: Option<String>,
+}
+
 /// Why a user callback did not finish.
 ///
 /// Separate variants because they want different handling: a timeout is a
@@ -225,6 +254,11 @@ pub struct TuiRuntime {
     config: TuiConfig,
     registrations: TuiRegistrations,
     lua: Lua,
+    /// What callbacks have asked for, in the order they asked. Drained by the
+    /// TUI after each call.
+    asks: Arc<Mutex<Vec<Ask>>>,
+    /// Where the user is, as the TUI last described it.
+    context: Arc<Mutex<Context>>,
 }
 
 impl TuiRuntime {
@@ -265,6 +299,21 @@ impl TuiRuntime {
     /// Returns the extension registrations owned by the TUI.
     pub fn registrations(&self) -> &TuiRegistrations {
         &self.registrations
+    }
+
+    /// Tell the VM where the user is, before a callback runs.
+    pub fn set_context(&self, context: Context) {
+        *self.context.lock().expect("context lock poisoned") = context;
+    }
+
+    /// Take what the last callback asked for.
+    ///
+    /// Drained rather than read, so an ask is performed once: a callback that
+    /// runs again asks again, and one that timed out mid-way leaves behind
+    /// only what it managed to record — which is the honest outcome, since
+    /// those calls already happened as far as the user's script is concerned.
+    pub fn take_asks(&self) -> Vec<Ask> {
+        std::mem::take(&mut *self.asks.lock().expect("asks lock poisoned"))
     }
 
     /// Run a keymap's callback, bounded in time.
@@ -434,6 +483,8 @@ impl TuiRuntime {
             config: TuiConfig::default(),
             registrations: TuiRegistrations::default(),
             lua: Lua::new(),
+            asks: Arc::new(Mutex::new(Vec::new())),
+            context: Arc::new(Mutex::new(Context::default())),
         }
     }
 
@@ -441,7 +492,15 @@ impl TuiRuntime {
         let lua = Lua::new();
         let config = Arc::new(Mutex::new(Some(TuiConfig::default())));
         let registrations = Arc::new(Mutex::new(Some(TuiRegistrations::default())));
-        install_tui_module(&lua, Arc::clone(&config), Arc::clone(&registrations))?;
+        let asks = Arc::new(Mutex::new(Vec::new()));
+        let context = Arc::new(Mutex::new(Context::default()));
+        install_tui_module(
+            &lua,
+            Arc::clone(&config),
+            Arc::clone(&registrations),
+            Arc::clone(&asks),
+            Arc::clone(&context),
+        )?;
         lua.load(source).set_name(name).exec()?;
         let config = config
             .lock()
@@ -457,6 +516,8 @@ impl TuiRuntime {
             config,
             registrations,
             lua,
+            asks,
+            context,
         })
     }
 }
@@ -987,8 +1048,72 @@ fn install_tui_module(
     lua: &Lua,
     config: Arc<Mutex<Option<TuiConfig>>>,
     registrations: Arc<Mutex<Option<TuiRegistrations>>>,
+    asks: Arc<Mutex<Vec<Ask>>>,
+    context: Arc<Mutex<Context>>,
 ) -> mlua::Result<()> {
     let module = lua.create_table()?;
+
+    // The stateful helpers (§10.4). They record; the TUI performs. See `Ask`
+    // for why this crate cannot do it itself.
+    let record = |asks: Arc<Mutex<Vec<Ask>>>| {
+        move |ask: Ask| {
+            asks.lock().expect("asks lock poisoned").push(ask);
+        }
+    };
+
+    let push = record(Arc::clone(&asks));
+    module.set(
+        "new_worktree",
+        lua.create_function(move |_, spec: Table| {
+            // Named fields, as §10.3's example writes it, so a caller cannot
+            // transpose repo and branch silently.
+            let repo: String = spec.get("repo")?;
+            let branch: String = spec.get("branch")?;
+            push(Ask::NewWorktree { repo, branch });
+            Ok(())
+        })?,
+    )?;
+
+    let push = record(Arc::clone(&asks));
+    module.set(
+        "open_session",
+        lua.create_function(move |_, name: String| {
+            push(Ask::OpenSession { name });
+            Ok(())
+        })?,
+    )?;
+
+    let push = record(Arc::clone(&asks));
+    module.set(
+        "send",
+        lua.create_function(move |_, text: String| {
+            push(Ask::Send { text });
+            Ok(())
+        })?,
+    )?;
+
+    let push = record(Arc::clone(&asks));
+    module.set(
+        "palette",
+        lua.create_function(move |_, prefill: String| {
+            push(Ask::Palette { prefill });
+            Ok(())
+        })?,
+    )?;
+
+    let current = Arc::clone(&context);
+    module.set(
+        "current_repo",
+        lua.create_function(move |_, ()| {
+            // `nil` when nothing is selected, which a script can test for —
+            // an empty string would read as a repo with no name.
+            Ok(current
+                .lock()
+                .expect("context lock poisoned")
+                .current_repo
+                .clone())
+        })?,
+    )?;
 
     let setup_config = Arc::clone(&config);
     module.set(
@@ -1570,6 +1695,62 @@ fn parse_event(value: &str) -> mlua::Result<LifecycleEvent> {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn a_callback_records_what_it_wants_and_the_host_performs_it() {
+        // The helpers cannot send: this crate is shared and the boundary
+        // script forbids it depending on the protocol. So they record, in
+        // order, and the TUI drains.
+        let source = "local grove = require('grove')\n\
+                      grove.command('go', function(branch)\n\
+                        grove.new_worktree({ repo = grove.current_repo(), branch = branch })\n\
+                        grove.palette('new ')\n\
+                      end)\n";
+        let runtime = TuiRuntime::load_source(source, "asks").runtime;
+        runtime.set_context(Context {
+            current_repo: Some("billing".into()),
+        });
+        assert_eq!(
+            runtime.call_command(0, "feat/x", Duration::from_secs(1)),
+            Ok(())
+        );
+        assert_eq!(
+            runtime.take_asks(),
+            vec![
+                Ask::NewWorktree {
+                    repo: "billing".into(),
+                    branch: "feat/x".into(),
+                },
+                Ask::Palette {
+                    prefill: "new ".into(),
+                },
+            ]
+        );
+        assert!(
+            runtime.take_asks().is_empty(),
+            "draining means performed once, not once per frame"
+        );
+    }
+
+    #[test]
+    fn current_repo_is_nil_when_nothing_is_selected() {
+        // A script can test for nil. An empty string would read as a repo
+        // with no name.
+        let source = "local grove = require('grove')\n\
+                      grove.command('go', function()\n\
+                        if grove.current_repo() == nil then\n\
+                          grove.send('none')\n\
+                        end\n\
+                      end)\n";
+        let runtime = TuiRuntime::load_source(source, "norepo").runtime;
+        assert_eq!(runtime.call_command(0, "", Duration::from_secs(1)), Ok(()));
+        assert_eq!(
+            runtime.take_asks(),
+            vec![Ask::Send {
+                text: "none".into()
+            }]
+        );
+    }
 
     #[test]
     fn a_command_is_given_what_was_typed_after_its_name() {
