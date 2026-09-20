@@ -719,6 +719,7 @@ mod tests {
         ("events.rs", include_str!("events.rs")),
         ("keymap.rs", include_str!("keymap.rs")),
         ("main.rs", include_str!("main.rs")),
+        ("palette.rs", include_str!("palette.rs")),
         ("repos.rs", include_str!("repos.rs")),
         ("statusbar.rs", include_str!("statusbar.rs")),
         ("terminal.rs", include_str!("terminal.rs")),
