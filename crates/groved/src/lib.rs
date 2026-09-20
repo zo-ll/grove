@@ -97,17 +97,27 @@ impl DaemonSocket {
             match lock.lock_exclusive() {
                 Ok(()) => break,
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {
-                    assert!(
-                        Instant::now() < lock_deadline,
-                        "socket lock acquisition was interrupted for five seconds"
-                    );
+                    // A sustained signal storm is not a healthy condition,
+                    // but it is a reportable one: bind_at is library API, so
+                    // the answer is an Err like its sibling arms, not a
+                    // panic the daemon cannot survive gracefully.
+                    if Instant::now() >= lock_deadline {
+                        return Err(socket_error(
+                            &lock_path,
+                            io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                "socket lock acquisition was interrupted for five seconds",
+                            ),
+                        ));
+                    }
+                    thread::sleep(Duration::from_millis(1));
                 }
                 Err(source) => return Err(socket_error(&lock_path, source)),
             }
         }
 
         if socket_path.exists() {
-            match configured_stream(&socket_path) {
+            match connect_stale(&socket_path) {
                 Ok(stream) => return Ok(BindOutcome::Existing(stream)),
                 Err(error)
                     if matches!(
@@ -433,6 +443,27 @@ impl LiveFeed {
 
 // Every way a feed can be lost — detach, re-attach, replacement, connection
 // teardown — goes through the Drop below.
+
+/// Connects to a socket that is believed stale, retrying briefly first.
+///
+/// The stale check is one connect away from a spurious lifecycle error: on a
+/// loaded machine a live daemon's accept backlog can saturate, and connect
+/// answers EAGAIN — a daemon that is present, not a stale file. Retrying for
+/// a bounded window lets a busy-but-alive daemon accept; a socket that keeps
+/// refusing is stale and the caller removes it.
+fn connect_stale(path: &Path) -> io::Result<UnixStream> {
+    let deadline = Instant::now() + Duration::from_millis(100);
+    loop {
+        match configured_stream(path) {
+            Err(error)
+                if error.kind() == io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+            {
+                thread::sleep(Duration::from_millis(1));
+            }
+            other => return other,
+        }
+    }
+}
 
 fn socket_error(path: &Path, source: io::Error) -> LifecycleError {
     LifecycleError::Socket {
