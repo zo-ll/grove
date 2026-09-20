@@ -13,12 +13,13 @@
 //!   a hidden pane leaves the arrow keys driving a list that is not on screen,
 //!   and hiding the focused pane has to move focus rather than orphan it.
 
+use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Widget};
+use ratatui::widgets::{Block, Borders, Widget};
 
-use crate::keymap::Focus;
+use crate::keymap::{Focus, Screen};
 use crate::theme::{Role, Theme};
 
 /// A pane is identified by the focus it would hold.
@@ -332,20 +333,47 @@ fn placeholder(pane: Pane) -> &'static str {
     }
 }
 
-/// Draw the frame.
+/// Which dash list the arrows are driving, if any.
+///
+/// Three conditions, and each one has already been a bug once. The screen must
+/// be the dash, because an overlay owns the keyboard while it is open and
+/// focus still holds whichever pane was selected behind it — the same mistake
+/// as the keymap's, one layer up: without this, `↓` in the session picker
+/// scrolls the REPOS list nobody can see. The pane must be one that holds a
+/// list, since the terminal takes keys rather than a cursor. And it must be
+/// drawable at the current width, because a pane the dash dropped is not on
+/// screen however the toggles are set.
+pub fn list_under_arrows(screen: Screen, focus: Pane, panes: Panes, width: u16) -> Option<Pane> {
+    if screen != Screen::Dash {
+        return None;
+    }
+    if !panes.drawable(width).visible(focus) {
+        return None;
+    }
+    match focus {
+        Focus::Repos | Focus::Worktrees => Some(focus),
+        // The terminal is a pty: its keys go to the program, not to a cursor.
+        Focus::Terminal => None,
+    }
+}
+
+/// Draw the frame and return the area inside each pane's border.
+///
+/// The frame is this module's; what goes in the areas it returns belongs to
+/// the panes themselves — #19, #20 and #21. Returning the inner rects rather
+/// than taking the contents as an argument keeps that split honest: this
+/// module never learns what a repo is.
 ///
 /// The focused pane is drawn in the accent colour and bold, everything else
-/// muted. That is the whole focus indicator, and it has to survive the theme
-/// degrading to sixteen colours — which is why it is a colour *and* a weight
-/// rather than a colour alone.
-pub fn render(
-    buf: &mut ratatui::buffer::Buffer,
-    area: Rect,
-    panes: Panes,
-    focus: Pane,
-    theme: &Theme,
-) {
+/// muted. That is the whole focus indicator, and it is a colour *and* a weight
+/// because colour alone disappears on a terminal that has themed its palette.
+pub fn render(buf: &mut Buffer, area: Rect, panes: Panes, focus: Pane, theme: &Theme) -> Areas {
     let areas = split(area, panes);
+    let mut inner = Areas {
+        repos: None,
+        worktrees: None,
+        terminal: None,
+    };
     for pane in [Focus::Repos, Focus::Worktrees, Focus::Terminal] {
         let Some(rect) = areas.of(pane) else {
             continue;
@@ -361,11 +389,23 @@ pub fn render(
             .border_type(theme.border())
             .border_style(style)
             .title(Span::styled(title(pane), style));
-        let inner = block.inner(rect);
+        let within = block.inner(rect);
         block.render(rect, buf);
-        Paragraph::new(Line::styled(placeholder(pane), theme.style(Role::Muted)))
-            .render(inner, buf);
+        match pane {
+            Focus::Repos => inner.repos = Some(within),
+            Focus::Worktrees => inner.worktrees = Some(within),
+            Focus::Terminal => inner.terminal = Some(within),
+        }
     }
+    inner
+}
+
+/// What a pane says while the issue that fills it is still open.
+///
+/// Drawn by the caller into the area `render` hands back, so it disappears
+/// one pane at a time as #19 through #21 land rather than all at once.
+pub fn placeholder_line(pane: Pane, theme: &Theme) -> Line<'static> {
+    Line::styled(placeholder(pane), theme.style(Role::Muted))
 }
 
 #[cfg(test)]
@@ -630,7 +670,7 @@ mod tests {
     }
 
     /// The style of the cell at a pane's top-left corner — its border.
-    fn corner(buf: &ratatui::buffer::Buffer, rect: Rect) -> ratatui::style::Style {
+    fn corner(buf: &Buffer, rect: Rect) -> ratatui::style::Style {
         buf[(rect.x, rect.y)].style()
     }
 
@@ -640,8 +680,8 @@ mod tests {
         // signals are checked because colour alone disappears on a terminal
         // that themes its palette, and weight alone is subtle at a glance.
         let theme = theme();
-        let mut buf = ratatui::buffer::Buffer::empty(NARROW);
-        render(&mut buf, NARROW, Panes::default(), Focus::Worktrees, &theme);
+        let mut buf = Buffer::empty(NARROW);
+        let _ = render(&mut buf, NARROW, Panes::default(), Focus::Worktrees, &theme);
 
         let areas = split(NARROW, Panes::default());
         let focused = corner(&buf, areas.worktrees.expect("visible"));
@@ -663,8 +703,8 @@ mod tests {
         let theme = theme();
         let areas = split(NARROW, Panes::default());
         for focus in [Focus::Repos, Focus::Worktrees, Focus::Terminal] {
-            let mut buf = ratatui::buffer::Buffer::empty(NARROW);
-            render(&mut buf, NARROW, Panes::default(), focus, &theme);
+            let mut buf = Buffer::empty(NARROW);
+            let _ = render(&mut buf, NARROW, Panes::default(), focus, &theme);
             for pane in [Focus::Repos, Focus::Worktrees, Focus::Terminal] {
                 let style = corner(&buf, areas.of(pane).expect("visible"));
                 let expected = if pane == focus {
@@ -689,8 +729,8 @@ mod tests {
         let theme = theme();
         let mut panes = Panes::default();
         assert!(panes.toggle(Focus::Repos));
-        let mut buf = ratatui::buffer::Buffer::empty(NARROW);
-        render(&mut buf, NARROW, panes, Focus::Worktrees, &theme);
+        let mut buf = Buffer::empty(NARROW);
+        let _ = render(&mut buf, NARROW, panes, Focus::Worktrees, &theme);
 
         let worktrees = split(NARROW, panes).worktrees.expect("visible");
         assert_eq!(worktrees.x, 0, "WORKTREES takes the left edge");
@@ -702,6 +742,57 @@ mod tests {
             "a hidden pane must not be painted: {painted}"
         );
         assert!(painted.contains("WORKTREES"));
+    }
+
+    #[test]
+    fn an_overlay_takes_the_arrows_away_from_the_dash_lists() {
+        // The review's medium, and the same class as the keymap's M4 one layer
+        // up: focus still holds a dash pane while an overlay is open, so
+        // asking focus alone scrolls a list behind the picker.
+        for screen in [
+            Screen::Palette,
+            Screen::Picker,
+            Screen::Diff,
+            Screen::Shell,
+            Screen::EndSession,
+        ] {
+            assert_eq!(
+                list_under_arrows(screen, Focus::Repos, Panes::default(), 200),
+                None,
+                "{screen:?} owns the keyboard while it is open"
+            );
+        }
+        assert_eq!(
+            list_under_arrows(Screen::Dash, Focus::Repos, Panes::default(), 200),
+            Some(Focus::Repos)
+        );
+    }
+
+    #[test]
+    fn the_terminal_pane_has_no_cursor_for_the_arrows_to_move() {
+        // It is a pty: `↓` belongs to the program inside it.
+        assert_eq!(
+            list_under_arrows(Screen::Dash, Focus::Terminal, Panes::default(), 200),
+            None
+        );
+    }
+
+    #[test]
+    fn a_pane_that_is_not_drawn_does_not_take_the_arrows() {
+        // Whether by toggle or by width — both are "not on screen", and the
+        // arrows must not drive either.
+        let mut hidden = Panes::default();
+        assert!(hidden.toggle(Focus::Repos));
+        assert_eq!(
+            list_under_arrows(Screen::Dash, Focus::Repos, hidden, 200),
+            None,
+            "a hidden pane"
+        );
+        assert_eq!(
+            list_under_arrows(Screen::Dash, Focus::Terminal, Panes::default(), 40),
+            None,
+            "a pane too narrow to draw"
+        );
     }
 
     #[test]
