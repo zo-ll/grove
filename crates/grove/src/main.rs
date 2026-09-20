@@ -536,10 +536,6 @@ fn confirm_argument(state: &mut State, ui: &mut Ui) -> bool {
         return run_user_command(index, &argument, state, ui);
     }
     let argument = ui.palette.argument().unwrap_or_default().to_string();
-    let Some(session) = ui.session.clone() else {
-        ui.note = Some(format!("no open session to {} in", command.name));
-        return true;
-    };
 
     let picked: Vec<select::Row> = ui
         .palette
@@ -548,6 +544,31 @@ fn confirm_argument(state: &mut State, ui: &mut Ui) -> bool {
         .unwrap_or_default();
 
     let mut requests: Vec<Request> = Vec::new();
+
+    // `session new` is how you get a session, so it is answered before one is
+    // looked for. Requiring an open session to run it left a fresh workspace
+    // with no way in: the dash said to start a session, the palette took the
+    // name, and `enter` answered "no open session to session new in" — a
+    // sentence assembled from a template, about the one command that does not
+    // need what it was asking for.
+    if command.name == "session new" {
+        if argument.trim().is_empty() {
+            ui.note = Some("name the session first".into());
+            return true;
+        }
+        requests.push(Request::SessionNew {
+            name: argument.trim().to_string(),
+        });
+        return dispatch(requests, state, ui);
+    }
+
+    // Everything else belongs to a session: membership and worktrees are a
+    // session's, not the workspace's.
+    let Some(session) = ui.session.clone() else {
+        ui.note = Some(format!("{} needs an open session", command.name));
+        return true;
+    };
+
     match command.name.as_str() {
         "new" => {
             if argument.trim().is_empty() {
@@ -591,9 +612,6 @@ fn confirm_argument(state: &mut State, ui: &mut Ui) -> bool {
                 });
             }
         }
-        "session new" => requests.push(Request::SessionNew {
-            name: argument.trim().to_string(),
-        }),
         "session rename" => requests.push(Request::SessionRename {
             session: session.clone(),
             name: argument.trim().to_string(),
@@ -606,6 +624,14 @@ fn confirm_argument(state: &mut State, ui: &mut Ui) -> bool {
         }
     }
 
+    dispatch(requests, state, ui)
+}
+
+/// Send what a confirmed command asked for, and go back to the dash.
+///
+/// Shared so that `session new`, which is answered before the session lookup,
+/// finishes the same way as everything after it.
+fn dispatch(requests: Vec<Request>, state: &mut State, ui: &mut Ui) -> bool {
     for request in &requests {
         if let Err(e) = send(state, request) {
             ui.note = Some(format!("could not reach the daemon: {e}"));
@@ -3159,6 +3185,62 @@ mod tests {
         assert!(
             screen.contains("point grove at your clones"),
             "the guidance must not be cut off: {screen}"
+        );
+    }
+
+    #[test]
+    fn starting_a_session_does_not_require_one() {
+        // The last door on the first run: the dash says to start a session,
+        // the palette takes the name, and `enter` answered "no open session
+        // to session new in" — the one command that creates the thing it was
+        // being refused for.
+        let (mut s, mut theirs) = wired();
+        let mut ui = Ui::new();
+        assert!(ui.session.is_none(), "a fresh grove has no session");
+
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('/')), &mut s, &mut ui);
+        for c in "session new".chars() {
+            handle(key(KeyCode::Char(c)), &mut s, &mut ui);
+        }
+        handle(key(KeyCode::Enter), &mut s, &mut ui);
+        for c in "invoice split".chars() {
+            handle(key(KeyCode::Char(c)), &mut s, &mut ui);
+        }
+        handle(key(KeyCode::Enter), &mut s, &mut ui);
+
+        assert_eq!(ui.note, None, "it must not refuse");
+        let asked = sent(&mut theirs);
+        assert!(
+            asked.iter().any(|request| matches!(
+                request,
+                Request::SessionNew { name } if name == "invoice split"
+            )),
+            "the daemon must have been asked for the session: {asked:?}"
+        );
+    }
+
+    #[test]
+    fn a_session_is_not_created_without_a_name() {
+        // The other half: `enter` on an empty name would ask the daemon for a
+        // session called nothing.
+        let (mut s, mut theirs) = wired();
+        let mut ui = Ui::new();
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('/')), &mut s, &mut ui);
+        for c in "session new".chars() {
+            handle(key(KeyCode::Char(c)), &mut s, &mut ui);
+        }
+        handle(key(KeyCode::Enter), &mut s, &mut ui);
+        handle(key(KeyCode::Enter), &mut s, &mut ui);
+
+        assert!(ui.note.is_some(), "it must say why nothing happened");
+        let asked = sent(&mut theirs);
+        assert!(
+            !asked
+                .iter()
+                .any(|request| matches!(request, Request::SessionNew { .. })),
+            "and must not have asked: {asked:?}"
         );
     }
 
