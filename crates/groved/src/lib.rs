@@ -20,6 +20,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
+pub mod diff;
 pub mod fetch;
 pub mod prune;
 pub mod session;

@@ -409,7 +409,7 @@ The complete set grove performs. Anything not on this list, grove does not do.
 | ahead / behind | `git -C <wt> rev-list --left-right --count @{upstream}...HEAD` |
 | merged | `git -C <repo> merge-base --is-ancestor <branch> <base>` |
 | upstream gone | absent remote ref after `fetch --prune` |
-| diff | `git -C <wt> diff <base>...HEAD --numstat` + patch per file |
+| diff | `git -C <wt> diff <base>...HEAD --numstat --name-status` + patch for the selected file |
 | size | filesystem walk of the worktree path |
 
 **Write**

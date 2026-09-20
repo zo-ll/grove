@@ -14,7 +14,7 @@
 
 use grove_domain::RepoId;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs;
 use std::io;
@@ -84,9 +84,16 @@ pub enum Tracking {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiffFile {
     pub path: PathBuf,
+    /// `M`, `A`, `D` or `T` as git's name-status reports it; untracked files
+    /// are separate (`?`), and renames are suppressed.
+    pub status: char,
     /// Binary files have no line counts.
     pub added: Option<u64>,
     pub deleted: Option<u64>,
+    /// The patch, fetched only for the selected file — `git diff <range> --
+    /// <path>` costs a subprocess per file, and a screen that shows one
+    /// file's hunks must not pay for every file's patch. Empty when the file
+    /// is binary (git emits no textual patch) or not selected.
     pub patch: Vec<u8>,
 }
 
@@ -340,12 +347,33 @@ pub fn is_merged(repo: &Path, branch: &str, base: &str) -> Result<bool, Error> {
 }
 
 pub fn diff(worktree: &Path, base: &str) -> Result<Vec<DiffFile>, Error> {
+    diff_selected(worktree, base, None)
+}
+
+/// The worktree's diff against `base`, one entry per changed file.
+///
+/// `selected` names the one file whose patch is wanted: the diff screen shows
+/// the list plus one file's hunks (§4.4), so fetching every patch would pay
+/// one subprocess per changed file for hunks the screen never shows. A file
+/// deleted between this call's list and its patch pass is simply absent —
+/// git answers an empty patch, which the caller reports as no hunks.
+pub fn diff_selected(
+    worktree: &Path,
+    base: &str,
+    selected: Option<&Path>,
+) -> Result<Vec<DiffFile>, Error> {
     let range = format!("{base}...HEAD");
     let numstat = git_success(
         worktree,
         "diff numstat",
         &["diff", &range, "--numstat", "--no-renames", "-z"],
     )?;
+    let statuses = git_success(
+        worktree,
+        "diff name-status",
+        &["diff", &range, "--name-status", "--no-renames", "-z"],
+    )?;
+    let status_of = status_pairs(&statuses)?;
     let mut files = Vec::new();
     for row in numstat
         .split(|byte| *byte == 0)
@@ -360,23 +388,89 @@ pub fn diff(worktree: &Path, base: &str) -> Result<Vec<DiffFile>, Error> {
             message: "numstat row has fewer than three columns".into(),
         })?;
         let file_path = PathBuf::from(String::from_utf8_lossy(path).into_owned());
-        let patch = git_success_os(
-            worktree,
-            "diff patch",
-            [
-                OsStr::new("diff"),
-                OsStr::new(&range),
-                OsStr::new("--no-renames"),
-                OsStr::new("--"),
-                file_path.as_os_str(),
-            ],
-        )?;
+        let binary = parse_numstat(added).is_none();
+        let wanted = selected.is_some_and(|wanted| wanted == file_path);
+        let patch = if wanted && !binary {
+            diff_patch(worktree, base, &file_path)?
+        } else {
+            Vec::new()
+        };
         files.push(DiffFile {
+            status: status_of(&file_path),
             path: file_path,
             added: parse_numstat(added),
             deleted: parse_numstat(deleted),
             patch,
         });
+    }
+    Ok(files)
+}
+
+/// One file's patch against `base`. The single-subprocess counterpart of
+/// [`diff_selected`]'s embedded patch, for a cursor that only knows its
+/// target after the list has come back.
+pub fn diff_patch(worktree: &Path, base: &str, path: &Path) -> Result<Vec<u8>, Error> {
+    let range = format!("{base}...HEAD");
+    git_success_os(
+        worktree,
+        "diff patch",
+        [
+            OsStr::new("diff"),
+            OsStr::new(&range),
+            OsStr::new("--no-renames"),
+            OsStr::new("--"),
+            path.as_os_str(),
+        ],
+    )
+}
+
+/// Pairs `status \0 path` from a `-z` name-status listing.
+fn status_pairs(bytes: &[u8]) -> Result<impl Fn(&Path) -> char + '_, Error> {
+    let mut pairs = HashMap::new();
+    let mut records = bytes.split(|byte| *byte == 0).filter(|row| !row.is_empty());
+    while let Some(status) = records.next() {
+        let Some(path) = records.next() else {
+            return Err(Error::MalformedGitOutput {
+                operation: "diff name-status",
+                path: PathBuf::new(),
+                message: "status record has no path".into(),
+            });
+        };
+        let letter = String::from_utf8_lossy(status)
+            .chars()
+            .next()
+            .unwrap_or('?');
+        pairs.insert(
+            PathBuf::from(String::from_utf8_lossy(path).into_owned()),
+            letter,
+        );
+    }
+    Ok(move |path: &Path| pairs.get(path).copied().unwrap_or('?'))
+}
+
+/// Untracked files, the `?` rows of the diff screen (§4.4). `git diff` never
+/// lists them, but the screen shows them, so the dirty-state op answers.
+///
+/// The listing is `-z` and split on NUL, like every other machine-read
+/// porcelain here: git's default `core.quotePath` prints a non-ASCII name as
+/// `?? "caf\303\251.txt"` in text mode — quotes and octal escapes that
+/// would reach the wire as the row's path — while `-z` prints the name
+/// itself, and NUL records are the only way a newline in a filename survives.
+pub fn untracked_files(worktree: &Path) -> Result<Vec<PathBuf>, Error> {
+    let status = git_success(
+        worktree,
+        "status porcelain",
+        &["status", "--porcelain", "-z"],
+    )?;
+    let mut files = Vec::new();
+    for record in status
+        .split(|byte| *byte == 0)
+        .filter(|row| !row.is_empty())
+    {
+        let text = String::from_utf8_lossy(record);
+        if let Some(path) = text.strip_prefix("?? ") {
+            files.push(PathBuf::from(path));
+        }
     }
     Ok(files)
 }
@@ -1017,7 +1111,10 @@ mod tests {
     }
 
     #[test]
-    fn diff_has_numstat_and_a_patch_per_file() {
+    fn diff_lists_status_and_a_patch_for_the_selected_file_only() {
+        // The diff screen (§4.4) shows every file's counts but one file's
+        // hunks, so the patch is fetched for the selection: one subprocess
+        // per refetch, not one per changed file.
         let temp = TempDir::new("diff");
         repo(&temp.0);
         git(&temp.0, &["branch", "base"]);
@@ -1026,11 +1123,72 @@ mod tests {
         git(&temp.0, &["commit", "-qm", "change"]);
         let files = diff(&temp.0, "base").unwrap();
         assert_eq!(files.len(), 1);
+        assert_eq!(files[0].status, 'M');
         assert_eq!(files[0].added, Some(1));
         assert_eq!(files[0].deleted, Some(0));
-        assert!(String::from_utf8_lossy(&files[0].patch).contains("+two"));
+        // Not selected, no patch: the counts travelled, the hunks were not paid for.
+        assert!(files[0].patch.is_empty());
+
+        let selected = diff_selected(&temp.0, "base", Some(Path::new("tracked"))).unwrap();
+        assert!(String::from_utf8_lossy(&selected[0].patch).contains("+two"));
         assert!(!is_merged(&temp.0, "main", "base").unwrap());
         assert!(is_merged(&temp.0, "base", "main").unwrap());
+    }
+
+    #[test]
+    fn diff_reports_binary_without_a_patch_and_untracked_files_separately() {
+        let temp = TempDir::new("diff-binary");
+        repo(&temp.0);
+        git(&temp.0, &["branch", "base"]);
+        fs::write(temp.0.join("bytes"), vec![0_u8, 1, 2, 0]).unwrap();
+        git(&temp.0, &["add", "bytes"]);
+        git(&temp.0, &["commit", "-qm", "binary"]);
+        let files = diff_selected(&temp.0, "base", Some(Path::new("bytes"))).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].added, None, "binary has no line counts");
+        assert!(files[0].patch.is_empty(), "binary emits no textual patch");
+
+        fs::write(temp.0.join("scratch"), "untracked\n").unwrap();
+        assert_eq!(
+            untracked_files(&temp.0).unwrap(),
+            [PathBuf::from("scratch")]
+        );
+    }
+
+    #[test]
+    fn untracked_names_survive_git_quotes_default() {
+        // git's default core.quotePath escapes a non-ASCII name in text mode
+        // (?? "caf\303\251.txt"); the -z listing prints the name itself, which
+        // is why this listing is -z and the wire never carries the escapes.
+        let temp = TempDir::new("quoted");
+        repo(&temp.0);
+        fs::write(temp.0.join("café.txt"), "non-ascii\n").unwrap();
+        assert_eq!(
+            untracked_files(&temp.0).unwrap(),
+            [PathBuf::from("café.txt")]
+        );
+    }
+
+    #[test]
+    fn a_typechange_is_reported_as_git_says() {
+        // file → symlink: git's name-status says T. The crate reports what
+        // git says; the wire maps T to M (a typechange modifies an existing
+        // path), keeping the wire's status set closed.
+        let temp = TempDir::new("typechange");
+        repo(&temp.0);
+        fs::write(temp.0.join("shape"), "file\n").unwrap();
+        git(&temp.0, &["add", "shape"]);
+        git(&temp.0, &["commit", "-qm", "file"]);
+        // The branch point has the file; HEAD has the symlink.
+        git(&temp.0, &["branch", "base"]);
+        fs::remove_file(temp.0.join("shape")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("target", temp.0.join("shape")).unwrap();
+        git(&temp.0, &["add", "shape"]);
+        git(&temp.0, &["commit", "-qm", "symlink"]);
+        let files = diff(&temp.0, "base").unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].status, 'T');
     }
 
     #[test]
