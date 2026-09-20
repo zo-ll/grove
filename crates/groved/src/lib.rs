@@ -86,11 +86,38 @@ impl DaemonSocket {
             .mode(0o600)
             .open(&lock_path)
             .map_err(|source| socket_error(&lock_path, source))?;
-        lock.lock_exclusive()
-            .map_err(|source| socket_error(&lock_path, source))?;
+        // flock blocks until the holder releases, but it can also be
+        // interrupted by a signal and return EINTR — once in a long run of
+        // runs, on a loaded machine, which is exactly the shape of the
+        // unrepeatable failure this file's tests saw once. A lock
+        // acquisition is seconds-cheap to retry, so interrupting a signal
+        // costs a retry, not a daemon lifecycle.
+        let lock_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match lock.lock_exclusive() {
+                Ok(()) => break,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                    // A sustained signal storm is not a healthy condition,
+                    // but it is a reportable one: bind_at is library API, so
+                    // the answer is an Err like its sibling arms, not a
+                    // panic the daemon cannot survive gracefully.
+                    if Instant::now() >= lock_deadline {
+                        return Err(socket_error(
+                            &lock_path,
+                            io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                "socket lock acquisition was interrupted for five seconds",
+                            ),
+                        ));
+                    }
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(source) => return Err(socket_error(&lock_path, source)),
+            }
+        }
 
         if socket_path.exists() {
-            match configured_stream(&socket_path) {
+            match connect_stale(&socket_path) {
                 Ok(stream) => return Ok(BindOutcome::Existing(stream)),
                 Err(error)
                     if matches!(
@@ -184,10 +211,15 @@ pub fn connect_or_spawn(
 ) -> Result<UnixStream, LifecycleError> {
     match connect(workspace) {
         Ok(stream) => return Ok(stream),
+        // A busy daemon's backlog answers EAGAIN (WouldBlock) rather than
+        // refused: the daemon is present, so the wait loop below — which
+        // owns the deadline — should see it again, not this arm.
         Err(LifecycleError::Socket { source, .. })
             if matches!(
                 source.kind(),
-                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                io::ErrorKind::NotFound
+                    | io::ErrorKind::ConnectionRefused
+                    | io::ErrorKind::WouldBlock
             ) => {}
         Err(error) => return Err(error),
     }
@@ -212,9 +244,14 @@ pub fn connect_or_spawn(
             Err(LifecycleError::Socket { source, .. })
                 if matches!(
                     source.kind(),
-                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                    io::ErrorKind::NotFound
+                        | io::ErrorKind::ConnectionRefused
+                        | io::ErrorKind::WouldBlock
                 ) && Instant::now() < deadline =>
             {
+                // WouldBlock here is a saturated accept backlog: the daemon
+                // is alive, and attaching is worth waiting its window out —
+                // not a reason to report a startup failure.
                 thread::sleep(Duration::from_millis(20));
             }
             Err(LifecycleError::Socket { .. }) => {
@@ -417,6 +454,27 @@ impl LiveFeed {
 // Every way a feed can be lost — detach, re-attach, replacement, connection
 // teardown — goes through the Drop below.
 
+/// Connects to a socket that is believed stale, retrying briefly first.
+///
+/// The stale check is one connect away from a spurious lifecycle error: on a
+/// loaded machine a live daemon's accept backlog can saturate, and connect
+/// answers EAGAIN — a daemon that is present, not a stale file. Retrying for
+/// a bounded window lets a busy-but-alive daemon accept; a socket that keeps
+/// refusing is stale and the caller removes it.
+fn connect_stale(path: &Path) -> io::Result<UnixStream> {
+    let deadline = Instant::now() + Duration::from_millis(100);
+    loop {
+        match configured_stream(path) {
+            Err(error)
+                if error.kind() == io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+            {
+                thread::sleep(Duration::from_millis(1));
+            }
+            other => return other,
+        }
+    }
+}
+
 fn socket_error(path: &Path, source: io::Error) -> LifecycleError {
     LifecycleError::Socket {
         path: path.to_owned(),
@@ -469,13 +527,19 @@ mod tests {
         let path = socket_path_at(&temp.0, Path::new("/workspace"));
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         drop(UnixListener::bind(&path).unwrap());
+        // Every test in this file holds its own runtime directory, named by
+        // pid, timestamp and sequence — so no leftover socket from any other
+        // run or test can ever be probed here, which is the isolation the
+        // reported one-off failure asked for. The probe itself is a bounded
+        // wait, not a busy spin: under a loaded suite, yield_now is a hot
+        // loop for as long as the deadline runs.
         let deadline = Instant::now() + Duration::from_secs(1);
         while UnixStream::connect(&path).is_ok() {
             assert!(
                 Instant::now() < deadline,
                 "closed listener stayed connectable"
             );
-            thread::yield_now();
+            thread::sleep(Duration::from_millis(1));
         }
         let outcome = DaemonSocket::bind_at(&temp.0, Path::new("/workspace")).unwrap();
         let BindOutcome::Owner(owner) = outcome else {
