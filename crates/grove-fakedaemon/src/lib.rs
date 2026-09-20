@@ -29,6 +29,9 @@ pub fn respond(s: &Scenario, req: &Request) -> Vec<Event> {
         Request::Hello { version } => vec![if *version == PROTOCOL_VERSION {
             Event::Welcome {
                 version: PROTOCOL_VERSION,
+                // The scenario has no session-scoped paths; the harness is
+                // not enforcing anything.
+                ownership_movable: true,
             }
         } else {
             Event::VersionMismatch {
@@ -157,11 +160,12 @@ pub fn serve<S: Read + Write>(s: &Scenario, mut conn: S) -> io::Result<()> {
         Err(_) => return Ok(()),
     };
     match accept_hello(&hello) {
-        Handshake::Agreed => {
+        Handshake::Agreed { .. } => {
             let _ = write_frame(
                 &mut conn,
                 &Event::Welcome {
                     version: PROTOCOL_VERSION,
+                    ownership_movable: true,
                 },
             );
         }

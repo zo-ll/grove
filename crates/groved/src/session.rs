@@ -1049,6 +1049,15 @@ impl SessionOrchestrator {
         Ok(size)
     }
 
+    /// Whether worktree ownership can change hands, as the store's path
+    /// template decides: a `{session}` template makes a worktree's location
+    /// depend on the session that made it, so adopt and release are refused.
+    /// Carried on the handshake as the client's affordance; the store's
+    /// refusal remains the enforcement.
+    pub fn ownership_movable(&self) -> bool {
+        self.store.ownership_movable()
+    }
+
     /// Re-walks the workspace with the configured `ignore` globs (§5's `scan`)
     /// and adopts the result as the workspace's repositories.
     fn scan_workspace(&mut self) -> Result<(), OrchestrationError> {
@@ -3404,5 +3413,65 @@ mod editor_tests {
             Event::Failed { message, .. }
                 if message.contains("config.lua") && message.contains("$EDITOR")
         )));
+    }
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_dir() -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("groved-capability-{unique}"));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn the_handshake_capability_follows_the_path_template() {
+        let temp = temp_dir();
+        let movable = Store::load_at(&temp.join("state"), &temp, "trees/{repo}");
+        let store_session_scoped = Store::load_at(
+            &temp.join("state2"),
+            &temp,
+            "{session}/{repo}/{branch_slug}",
+        );
+        let fetch = FetchPolicy::new(2, Duration::from_secs(60));
+        let runtime = DaemonRuntime::load_source(
+            "local grove = require('grove'); grove.setup({})",
+            "capability-config",
+        )
+        .runtime;
+        let movable = SessionOrchestrator::new(
+            movable,
+            Vec::new(),
+            temp.clone(),
+            TerminalManager::new(PathBuf::from("/bin/sh"), temp.clone(), 100),
+            fetch,
+            runtime,
+        );
+        let runtime = DaemonRuntime::load_source(
+            "local grove = require('grove'); grove.setup({})",
+            "capability-config-2",
+        )
+        .runtime;
+        let session_scoped = SessionOrchestrator::new(
+            store_session_scoped,
+            Vec::new(),
+            temp.clone(),
+            TerminalManager::new(PathBuf::from("/bin/sh"), temp.clone(), 100),
+            FetchPolicy::new(2, Duration::from_secs(60)),
+            runtime,
+        );
+        assert!(movable.ownership_movable());
+        // §2.4: a worktree's location then depends on the session that made
+        // it, so ownership cannot change hands — and the client learns that
+        // from the handshake instead of from a refused key.
+        assert!(!session_scoped.ownership_movable());
     }
 }

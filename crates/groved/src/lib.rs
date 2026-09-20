@@ -197,7 +197,7 @@ pub fn connect_path(path: &Path) -> Result<UnixStream, LifecycleError> {
     )?;
     let event: Event = read_frame(&mut stream)?;
     match accept_welcome(&event) {
-        Handshake::Agreed => Ok(stream),
+        Handshake::Agreed { .. } => Ok(stream),
         Handshake::Mismatch { daemon, client } => {
             Err(LifecycleError::VersionMismatch { daemon, client })
         }
@@ -281,11 +281,24 @@ fn serve_client_with(
     stream.set_read_timeout(Some(IO_TIMEOUT))?;
     stream.set_write_timeout(Some(IO_TIMEOUT))?;
     let hello: Request = read_frame(&mut stream)?;
+    // The capability is a workspace fact, decided by the service the socket
+    // serves: when a session-scoped path template makes worktree location
+    // depend on the owning session, adopt and release are refused, and the
+    // client should withhold the affordance rather than offer a key that only
+    // fails (§2.4). The daemon's refusal stays; this is the affordance, not
+    // the enforcement.
+    let ownership_movable = service
+        .as_ref()
+        // Fail closed: a service the caller cannot ask (poisoned lock) must
+        // not advertise a capability it did not see.
+        .and_then(|service| service.lock().ok().map(|s| s.ownership_movable()))
+        .unwrap_or(false);
     match accept_hello(&hello) {
-        Handshake::Agreed => write_frame(
+        Handshake::Agreed { .. } => write_frame(
             &mut stream,
             &Event::Welcome {
                 version: PROTOCOL_VERSION,
+                ownership_movable,
             },
         )?,
         Handshake::Mismatch { daemon, client } => {
@@ -573,7 +586,14 @@ mod tests {
         )
         .unwrap();
         let event: Event = read_frame(&mut client).unwrap();
-        assert_eq!(accept_welcome(&event), Handshake::Agreed);
+        // No service to ask, so the capability fails closed: a harness that
+        // cannot know a workspace must not advertise a capability for it.
+        assert_eq!(
+            accept_welcome(&event),
+            Handshake::Agreed {
+                ownership_movable: Some(false)
+            }
+        );
         drop(client);
         worker.join().unwrap();
     }
@@ -607,7 +627,18 @@ mod tests {
             },
         )
         .unwrap();
-        let _: Event = read_frame(&mut client).unwrap();
+        // The handshake carries the workspace capability: this service's
+        // store was built without a session-scoped template, so the pane may
+        // offer adopt and release.
+        let Event::Welcome {
+            version,
+            ownership_movable,
+        } = read_frame(&mut client).unwrap()
+        else {
+            panic!("expected Welcome")
+        };
+        assert_eq!(version, PROTOCOL_VERSION);
+        assert!(ownership_movable);
 
         // Spawn over the socket; the id comes back and the attach follows it.
         write_frame(
@@ -736,6 +767,72 @@ mod tests {
             event,
             Event::Failed { message, .. } if message.contains("does not exist")
         ));
+        drop(client);
+        worker.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::*;
+    use grove_lua::DaemonRuntime;
+    use grove_state::Store;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = env::temp_dir().join(format!("groved-capability-{label}-{unique}"));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    /// The handshake is the one wire fact the client sees before any
+    /// request; the review found every committed assertion pinned `true`,
+    /// which a hardcoded flag would have passed. This one is session-scoped
+    /// and fails against a hardcoded `true`.
+    #[test]
+    fn a_session_scoped_workspace_reports_its_capability_as_false() {
+        let temp = temp_dir("session-scoped");
+        let runtime = DaemonRuntime::load(
+            env::temp_dir().join(format!("groved-missing-{}.lua", std::process::id())),
+        )
+        .runtime;
+        let store = Store::load_at(&temp.join("state"), &temp, "{session}/{repo}/{branch_slug}");
+        let fetch = fetch::FetchPolicy::from_config(2, runtime.config()).unwrap();
+        let terminals = terminal::TerminalManager::new(PathBuf::from("/bin/sh"), temp.clone(), 100);
+        let service = session::SessionOrchestrator::new(
+            store,
+            Vec::new(),
+            temp.clone(),
+            terminals,
+            fetch,
+            runtime,
+        );
+        let service = Arc::new(Mutex::new(service));
+        let (client, server) = UnixStream::pair().unwrap();
+        let worker = thread::spawn(move || serve_client_with(server, Some(service)).unwrap());
+        let mut client = client;
+        client.set_read_timeout(Some(IO_TIMEOUT)).unwrap();
+        write_frame(
+            &mut client,
+            &Request::Hello {
+                version: PROTOCOL_VERSION,
+            },
+        )
+        .unwrap();
+        let Event::Welcome {
+            ownership_movable, ..
+        } = read_frame(&mut client).unwrap()
+        else {
+            panic!("expected Welcome")
+        };
+        // §2.4: the worktree's location depends on the session that made it,
+        // so ownership cannot change hands — the pane must not offer the key.
+        assert!(!ownership_movable);
         drop(client);
         worker.join().unwrap();
     }
