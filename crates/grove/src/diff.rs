@@ -13,14 +13,13 @@
 
 use grove_proto::{DiffFile, DiffLine};
 use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
-use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 use unicode_width::UnicodeWidthStr;
 
 use crate::text::ELLIPSIS;
-use crate::theme::{Role, Theme};
+use crate::text::truncate;
+use crate::theme::{Ink, Role, Theme};
 
 /// A `Diff` event, as the screen takes it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,65 +147,86 @@ impl Diff {
     }
 
     /// Draw the screen.
-    pub fn render(&self, buf: &mut Buffer, area: Rect, theme: &Theme) {
-        if area.width == 0 || area.height == 0 {
+    /// The keys this screen offers, for the overlay's footer.
+    pub fn footer(&self) -> Vec<crate::statusbar::Hint> {
+        crate::statusbar::hints(crate::keymap::Screen::Diff)
+    }
+
+    /// Draw the diff into the overlay's parts.
+    pub fn render(&self, buf: &mut Buffer, parts: crate::overlay::Parts, theme: &Theme) {
+        let (header, body) = (parts.header, parts.body);
+        if body.width == 0 || body.height == 0 {
             return;
         }
-        // Left: the file list. Right: the patch. The list is fixed-ish because
-        // its content is paths and counts; the patch takes the rest.
-        let left = (area.width / 3).clamp(20, 48).min(area.width);
-        let mut lines = vec![Line::from(vec![
+        // `diff`, then what is being compared, then the totals — the mock's
+        // header, where the word is the label and the rest is the answer.
+        let what = format!("{} · {} vs {}", self.repo, self.branch, self.base);
+        let totals = format!("{} {}", plus(self.added), minus(self.removed));
+        let room = usize::from(header.width)
+            .saturating_sub(5 + what.chars().count() + totals.chars().count());
+        Line::from(vec![
+            Span::styled("diff ", theme.style(Role::Accent)),
             Span::styled(
-                format!(" diff · {} · {} vs {}", self.repo, self.branch, self.base),
-                theme.style(Role::Accent),
+                truncate(&what, header.width as usize),
+                theme.ink_style(Ink::Subtext),
             ),
-            Span::raw("  "),
+            Span::raw(" ".repeat(room)),
             // Omitted when there are none, for the same reason the rows omit
             // them: a binary-only diff showing `+0 −0` reads as "nothing
             // changed" rather than "nothing countable changed".
             Span::styled(plus(self.added), theme.style(Role::Clean)),
             Span::raw(" "),
             Span::styled(minus(self.removed), theme.style(Role::Error)),
-        ])];
+        ])
+        .render(header, buf);
 
-        let room = usize::from(area.height).saturating_sub(2);
+        // Left: the file list, the mock's 34 columns. Right: the patch.
+        let left = 34u16.min(body.width / 2);
+        let mut lines = Vec::new();
+        let room = usize::from(body.height);
         let patch: Vec<&DiffLine> = self.hunks.iter().skip(self.offset).take(room).collect();
         for index in 0..room {
             let mut spans = Vec::new();
             match self.files.get(index) {
                 Some(file) => {
                     let here = index == self.cursor;
-                    let style = if here {
-                        theme.style(Role::Accent).add_modifier(Modifier::BOLD)
-                    } else {
-                        theme.style(Role::Muted)
-                    };
+                    // The status, the path, and two five-column counts, with
+                    // a space between each: fourteen columns that are not
+                    // path. Get this wrong and the rule between the list and
+                    // the patch moves on the rows that have no file.
+                    let width = usize::from(left).saturating_sub(14);
                     // Path first from the left, because the filename is what
                     // identifies it and the directories are what repeat.
-                    let path = ellipsise_left(&file.path, usize::from(left).saturating_sub(14));
-                    spans.push(Span::styled(
-                        format!(" {} ", file.status),
-                        theme.style(status_role(file.status)),
-                    ));
-                    spans.push(Span::styled(
-                        format!(
-                            "{path:<width$}",
-                            width = usize::from(left).saturating_sub(14)
-                        ),
-                        style,
-                    ));
-                    spans.push(Span::styled(
-                        format!("{:>5}", plus(file.added)),
-                        theme.style(Role::Clean),
-                    ));
-                    spans.push(Span::styled(
-                        format!("{:>5}", minus(file.removed)),
-                        theme.style(Role::Error),
-                    ));
+                    let path = ellipsise_left(&file.path, width);
+                    let mut cells = crate::overlay::row(
+                        here,
+                        vec![
+                            (file.status.to_string(), Ink::Subtext),
+                            (format!("{path:<width$}"), Ink::Text),
+                            (format!("{:>5}", plus(file.added)), Ink::Subtext),
+                            (format!("{:>5}", minus(file.removed)), Ink::Subtext),
+                        ],
+                        theme,
+                    );
+                    if !here {
+                        cells[0] = Span::styled(
+                            file.status.to_string(),
+                            theme.style(status_role(file.status)),
+                        );
+                        cells[4] = Span::styled(
+                            format!("{:>5}", plus(file.added)),
+                            theme.style(Role::Clean),
+                        );
+                        cells[6] = Span::styled(
+                            format!("{:>5}", minus(file.removed)),
+                            theme.style(Role::Error),
+                        );
+                    }
+                    spans.append(&mut cells);
                 }
                 None => spans.push(Span::raw(" ".repeat(usize::from(left)))),
             }
-            spans.push(Span::styled(" │ ", theme.style(Role::Muted)));
+            spans.push(Span::styled(" │ ", theme.ink_style(Ink::Divider)));
             if let Some(line) = patch.get(index) {
                 let (text, role) = match line {
                     DiffLine::Header(text) => (text, Role::Accent),
@@ -218,13 +238,7 @@ impl Diff {
             }
             lines.push(Line::from(spans));
         }
-
-        lines.push(Line::from(vec![
-            Span::styled(" ↑↓ file", theme.style(Role::Muted)),
-            Span::raw("   "),
-            Span::styled("esc close", theme.style(Role::Muted)),
-        ]));
-        Paragraph::new(lines).render(area, buf);
+        Paragraph::new(lines).render(body, buf);
     }
 }
 
@@ -288,6 +302,7 @@ fn ellipsise_left(path: &str, room: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::layout::Rect;
 
     fn file(path: &str, status: char, added: u64, removed: u64) -> DiffFile {
         DiffFile {
@@ -335,7 +350,7 @@ mod tests {
             height: 10,
         };
         let mut buf = Buffer::empty(area);
-        diff.render(&mut buf, area, &theme());
+        diff.render(&mut buf, crate::overlay::Parts::of(area), &theme());
         (0..area.height)
             .map(|y| {
                 (0..area.width)
@@ -479,12 +494,36 @@ mod tests {
         // The screen's promise: read-only. No `s stage`, no `w session diff` —
         // those are git write-verbs and the worktree's own shell is one pane
         // away.
+        // The footer is the overlay's now, so this asks what the screen hands
+        // it rather than what it paints: two keys, and neither of them writes.
+        let offered: Vec<String> = loaded()
+            .footer()
+            .into_iter()
+            .map(|hint| format!("{} {}", hint.keys, hint.label))
+            .collect();
+        assert_eq!(offered, ["↑↓ file", "esc close"]);
         let screen = painted(&loaded());
-        assert!(screen.contains("↑↓ file"), "{screen}");
-        assert!(screen.contains("esc close"), "{screen}");
         for verb in ["stage", "commit", "discard", "revert", "session diff"] {
             assert!(!screen.contains(verb), "{verb} in:\n{screen}");
         }
+    }
+
+    #[test]
+    fn the_rule_between_the_list_and_the_patch_does_not_wobble() {
+        // It used to: a file row was one column wider than an empty one, so
+        // the rule stepped sideways at the end of the file list — which reads
+        // as a rendering fault, because it is one.
+        let screen = painted(&loaded());
+        let columns: Vec<usize> = screen
+            .lines()
+            .filter(|line| line.contains('│'))
+            .map(|line| line.chars().position(|c| c == '│').expect("a rule"))
+            .collect();
+        assert!(columns.len() > 2, "there must be rows to compare");
+        assert!(
+            columns.windows(2).all(|pair| pair[0] == pair[1]),
+            "the rule moved: {columns:?}"
+        );
     }
 
     #[test]

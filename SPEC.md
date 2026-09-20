@@ -204,6 +204,13 @@ Raw keys, no prefix — the picker is not a pty.
 
 Six. Everything else is a palette command.
 
+The sketches below say what each screen contains. How it is drawn comes from the
+design mock, which is the reference wherever the two disagree: the dash is three
+separate panes headed inside their borders, and the other five are one shape —
+a box of at most 98 columns centred over the dimmed dash, with a header line,
+its rows, and a footer of the keys that work there. The footers in the sketches
+are that chrome's, generated from the keymap rather than written out.
+
 ### 4.1 Dash
 
 ```
