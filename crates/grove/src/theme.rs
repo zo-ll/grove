@@ -701,40 +701,36 @@ mod tests {
         assert_eq!(square.top_left, "┌");
     }
 
+    /// Every source in the crate except this one, baked in at compile time.
+    ///
+    /// `include_str!` rather than reading the tree at run time, for two
+    /// reasons. It cannot flake: the guard used to walk `CARGO_MANIFEST_DIR`,
+    /// which is fixed when the test is compiled, so a binary built in a
+    /// throwaway worktree — a reviewer exporting the branch, say — panicked
+    /// with a bare `NotFound` once that directory was cleaned up, and the
+    /// failure looked like a colour problem. And it cannot silently pass: a
+    /// missing file is a compile error rather than one fewer file walked.
+    ///
+    /// The cost is a hand-kept list, so `the_guard_covers_every_source` holds
+    /// it to the tree.
+    const SCANNED: &[(&str, &str)] = &[
+        ("events.rs", include_str!("events.rs")),
+        ("keymap.rs", include_str!("keymap.rs")),
+        ("main.rs", include_str!("main.rs")),
+        ("statusbar.rs", include_str!("statusbar.rs")),
+        ("terminal.rs", include_str!("terminal.rs")),
+    ];
+
     #[test]
     fn no_hex_literal_outside_this_module() {
         // The rule call sites have to follow, asserted rather than trusted:
         // once a screen writes its own `#rrggbb`, changing the palette stops
         // changing the screen, and nobody finds out until it looks wrong.
-        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut offenders = Vec::new();
-        // The whole tree, not one directory: the crate is flat today and the
-        // screens in #18-#30 will not be, and a guard that silently stops
-        // covering the code is worse than no guard.
-        let mut pending = vec![src];
-        while let Some(dir) = pending.pop() {
-            for entry in std::fs::read_dir(&dir).expect("the crate has a src directory") {
-                let path = entry.expect("readable directory entry").path();
-                if path.is_dir() {
-                    pending.push(path);
-                    continue;
-                }
-                if path.file_name().is_some_and(|n| n == "theme.rs") {
-                    continue;
-                }
-                if path.extension().is_none_or(|e| e != "rs") {
-                    continue;
-                }
-                let text = std::fs::read_to_string(&path).expect("source is readable");
-                for (number, line) in text.lines().enumerate() {
-                    if looks_like_a_hex_colour(line) {
-                        offenders.push(format!(
-                            "{}:{}: {}",
-                            path.display(),
-                            number + 1,
-                            line.trim()
-                        ));
-                    }
+        for (name, text) in SCANNED {
+            for (number, line) in text.lines().enumerate() {
+                if looks_like_a_hex_colour(line) {
+                    offenders.push(format!("{name}:{}: {}", number + 1, line.trim()));
                 }
             }
         }
@@ -742,6 +738,69 @@ mod tests {
             offenders.is_empty(),
             "colours belong to the theme module, not to screens:\n{}",
             offenders.join("\n")
+        );
+    }
+
+    #[test]
+    fn the_guard_covers_every_source() {
+        // The list above is hand-kept, so this walks the tree and fails if a
+        // file escaped it — the screens in #18-#30 will add files and
+        // subdirectories, and a guard that quietly stops covering the code is
+        // worse than no guard.
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let Ok(root) = std::fs::read_dir(&src) else {
+            // The only way this happens is the tree the test was compiled in
+            // having been removed since — a reviewer's exported worktree, or a
+            // `cargo clean` of a checkout that no longer exists. There is
+            // nothing to compare against, and the guard itself is unaffected
+            // because its sources are baked in.
+            eprintln!(
+                "skipping coverage check: {} is gone, so the tree cannot be compared",
+                src.display()
+            );
+            return;
+        };
+
+        let mut found = Vec::new();
+        let mut pending = vec![(src.clone(), root)];
+        while let Some((dir, entries)) = pending.pop() {
+            for entry in entries {
+                let path = match entry {
+                    Ok(entry) => entry.path(),
+                    // Name the directory rather than panicking bare: a failure
+                    // here is about the filesystem, not about colours, and the
+                    // message is the only thing the next reader will have.
+                    Err(error) => panic!("reading {}: {error}", dir.display()),
+                };
+                if path.is_dir() {
+                    match std::fs::read_dir(&path) {
+                        Ok(entries) => pending.push((path, entries)),
+                        Err(error) => panic!("reading {}: {error}", path.display()),
+                    }
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs") {
+                    continue;
+                }
+                let name = path
+                    .strip_prefix(&src)
+                    .expect("walked from src")
+                    .to_string_lossy()
+                    .into_owned();
+                if name != "theme.rs" {
+                    found.push(name);
+                }
+            }
+        }
+
+        let listed: Vec<&str> = SCANNED.iter().map(|(name, _)| *name).collect();
+        let missed: Vec<&String> = found
+            .iter()
+            .filter(|f| !listed.contains(&f.as_str()))
+            .collect();
+        assert!(
+            missed.is_empty(),
+            "these sources are not covered by the hex guard — add them to SCANNED: {missed:?}"
         );
     }
 
