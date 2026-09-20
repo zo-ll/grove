@@ -307,6 +307,17 @@ pub enum WorktreePath {
 pub struct DaemonConfig {
     /// Program spawned for worktree and scratch terminals.
     pub shell: String,
+    /// Program that opens a worktree in an editor (§3.3's `^g o`), with an
+    /// optional `{path}` placeholder; empty when neither the config nor
+    /// `$EDITOR` names one, which makes the open request report instead of
+    /// spawn.
+    ///
+    /// The string is split on whitespace with no quoting rule, so a program
+    /// path containing spaces cannot be expressed directly — a macOS `.app`
+    /// bundle, say — and needs a wrapper script. The daemon gives the editor
+    /// no terminal; a tty editor exits silently, so this must name a
+    /// graphical editor or a command that does not need one (SPEC §10).
+    pub editor: String,
     /// Starting directory for the standalone scratch terminal.
     pub scratch_cwd: String,
     /// Maximum retained lines for each terminal.
@@ -325,6 +336,7 @@ impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
             shell: std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()),
+            editor: std::env::var("EDITOR").unwrap_or_default(),
             scratch_cwd: std::env::var("HOME").unwrap_or_else(|_| "~".into()),
             scrollback: 10_000,
             worktree_path: WorktreePath::Template(DEFAULT_WORKTREE_PATH.into()),
@@ -1281,6 +1293,7 @@ fn apply_tui_setup(config: &mut TuiConfig, table: Table) -> mlua::Result<()> {
 
 fn apply_daemon_setup(lua: &Lua, config: &mut DaemonConfig, table: Table) -> mlua::Result<()> {
     set_optional(&table, "shell", &mut config.shell)?;
+    set_optional(&table, "editor", &mut config.editor)?;
     set_optional(&table, "scratch_cwd", &mut config.scratch_cwd)?;
     set_optional(&table, "scrollback", &mut config.scrollback)?;
     set_optional(&table, "branch_template", &mut config.branch_template)?;
@@ -1407,6 +1420,7 @@ mod tests {
         local grove = require("grove")
         grove.setup({
             shell = "/usr/bin/fish",
+            editor = "/usr/local/bin/edit {path}",
             scratch_cwd = "/tmp",
             scrollback = 42,
             worktree_path = "{clone_parent}/trees/{repo}/{branch_slug}/{session}",
@@ -1461,6 +1475,7 @@ mod tests {
         let loaded = DaemonRuntime::load_source(SHARED_CONFIG, "test-config");
         assert!(loaded.error.is_none());
         assert_eq!(loaded.runtime.config().shell, "/usr/bin/fish");
+        assert_eq!(loaded.runtime.config().editor, "/usr/local/bin/edit {path}");
         assert_eq!(loaded.runtime.config().scrollback, 42);
         assert_eq!(loaded.runtime.config().ignore, ["vendor"]);
         assert_eq!(loaded.runtime.lifecycle().len(), 1);

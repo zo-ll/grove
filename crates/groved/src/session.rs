@@ -13,9 +13,12 @@ use grove_proto::{
 use grove_state::{OwnedWorktree, Store, StoredSession};
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
+use std::thread;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -294,6 +297,18 @@ impl SessionOrchestrator {
                 repo: repo.clone(),
                 rows: self.worktree_rows(&repo)?,
             }]),
+            Request::OpenEditor(worktree) => {
+                let repository = self.repository(&worktree.repo)?.clone();
+                let checkout = self
+                    .find_checkout(&repository, &worktree.branch)?
+                    .ok_or_else(|| {
+                        OrchestrationError::WorktreeMissing(OwnedWorktree {
+                            repo: worktree.repo.clone(),
+                            branch: worktree.branch.clone(),
+                        })
+                    })?;
+                Ok(self.open_editor(&checkout.path))
+            }
             Request::DiffWorktree { worktree, file } => {
                 let repository = self.repository(&worktree.repo)?.clone();
                 let checkout = self
@@ -796,6 +811,68 @@ impl SessionOrchestrator {
             });
         }
         Ok(rows)
+    }
+
+    /// Spawns the configured editor for a checkout, detached (§3.3's `^g o`).
+    ///
+    /// The configured string is split into words first and `{path}` is
+    /// substituted inside whichever word carries it, so a worktree path with
+    /// spaces stays one argument; a configuration without the placeholder
+    /// receives the path as its last argument.
+    ///
+    /// Detached means what it says: the child gets its own process group and
+    /// a thread reaps it, so its exit is not grove's business and it holds no
+    /// part of the request loop. It inherits no terminal — the daemon has
+    /// none to give — so an editor that must own a tty belongs in the
+    /// worktree's own shell, and the config example is a graphical editor.
+    /// Everything that can fail — no editor named, program missing — is one
+    /// `Failed` event; nothing here can take the loop down.
+    fn open_editor(&mut self, path: &Path) -> Vec<Event> {
+        let editor = self.runtime.config().editor.clone();
+        if editor.is_empty() {
+            return vec![Event::Failed {
+                context: "open editor".into(),
+                message: "no editor configured; set `editor = \"cursor {path}\"` \
+                     in config.lua or export $EDITOR"
+                    .into(),
+            }];
+        }
+        let path = path.to_string_lossy().into_owned();
+        let mut words = editor.split_whitespace();
+        let Some(program) = words.next() else {
+            return vec![Event::Failed {
+                context: "open editor".into(),
+                message: "the configured editor is empty".into(),
+            }];
+        };
+        let mut args: Vec<String> = words.map(|word| word.replace("{path}", &path)).collect();
+        if !editor.contains("{path}") {
+            // No placeholder: the path is the last argument, so the command
+            // can stay unaware of grove.
+            args.push(path);
+        }
+        let spawn = Command::new(program)
+            .args(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn();
+        match spawn {
+            Ok(child) => {
+                // Its exit is reaped here and nowhere the request loop waits:
+                // a thread, not a join, because nobody is waiting on it.
+                thread::spawn(move || {
+                    let mut child = child;
+                    let _ = child.wait();
+                });
+                Vec::new()
+            }
+            Err(error) => vec![Event::Failed {
+                context: "open editor".into(),
+                message: format!("could not launch {program:?}: {error}"),
+            }],
+        }
     }
 
     /// The branch mergedness is judged against for a repo: a repo override
@@ -3128,5 +3205,204 @@ mod tests {
                 "missing {event}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod editor_tests {
+    use super::*;
+    use std::env;
+    use std::fs;
+    use std::path::Path;
+    use std::path::PathBuf;
+    use std::process::Command;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = env::temp_dir().join(format!("groved-editor-{label}-{unique}"));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new() -> Self {
+            Self(temp_dir("case"))
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn git(path: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn runtime_with(editor: &str) -> DaemonRuntime {
+        DaemonRuntime::load_source(
+            &format!("local grove = require('grove'); grove.setup({{ editor = {editor:?} }})"),
+            "editor-config",
+        )
+        .runtime
+    }
+
+    /// A checkout plus a recorder script: the "editor" appends its arguments,
+    /// one per line, to a fixed log, so the test asserts what the editor
+    /// actually received rather than trusting the configuration.
+    fn orchestrator(
+        editor: &str,
+        branch: &str,
+        spaced: bool,
+    ) -> (SessionOrchestrator, TempDir, PathBuf) {
+        let temp = TempDir::new();
+        let clone = temp.0.join("repo");
+        fs::create_dir_all(&clone).unwrap();
+        git(&clone, &["init", "-q", "-b", "main"]);
+        git(&clone, &["config", "user.name", "Grove Test"]);
+        git(&clone, &["config", "user.email", "grove@example.test"]);
+        fs::write(clone.join("tracked"), "base\n").unwrap();
+        git(&clone, &["add", "tracked"]);
+        git(&clone, &["commit", "-qm", "base"]);
+        let worktree = if spaced {
+            temp.0.join("a b repo")
+        } else {
+            temp.0.join("plain")
+        };
+        git(
+            &clone,
+            &["worktree", "add", "-qb", branch, worktree.to_str().unwrap()],
+        );
+        let store = Store::load_at(&temp.0.join("state"), &temp.0, "");
+        let terminals = TerminalManager::new(PathBuf::from("/bin/sh"), temp.0.clone(), 100);
+        let fetch = FetchPolicy::new(2, Duration::from_secs(60));
+        let daemon = SessionOrchestrator::new(
+            store,
+            vec![Repository {
+                id: RepoId("repo".into()),
+                name: "repo".into(),
+                path: clone.clone(),
+                base_branch: None,
+            }],
+            temp.0.clone(),
+            terminals,
+            fetch,
+            runtime_with(editor),
+        );
+        (daemon, temp, worktree)
+    }
+
+    fn open(daemon: &mut SessionOrchestrator, branch: &str) -> Vec<Event> {
+        daemon.handle_request(Request::OpenEditor(WorktreeRef {
+            repo: RepoId("repo".into()),
+            branch: branch.into(),
+        }))
+    }
+
+    fn recorder(temp: &Path, log: &Path) -> String {
+        let script = temp.join("record.sh");
+        let log = log.to_string_lossy().replace(' ', "\\ ");
+        use std::os::unix::fs::PermissionsExt;
+        fs::write(
+            &script,
+            format!("#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{log}'\n"),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        script.to_string_lossy().into_owned()
+    }
+
+    fn logged(log: &Path) -> String {
+        // The child races the test by a scheduler tick; the wait thread is
+        // the reaper, and the log exists once the editor has run.
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Ok(contents) = fs::read_to_string(log)
+                && !contents.is_empty()
+            {
+                return contents;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the editor was never invoked"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn the_editor_receives_the_path_where_the_placeholder_sits() {
+        let temp = temp_dir("placeholder");
+        let log = temp.join("argv.log");
+        let editor = format!("{} {{path}}", recorder(&temp, &log));
+        let (mut daemon, _temp, worktree) = orchestrator(&editor, "spaced", true);
+        assert!(open(&mut daemon, "spaced").is_empty(), "spawn is silent");
+        let logged = logged(&log);
+        // The path — spaces and all — was exactly one argument.
+        assert_eq!(logged.lines().next().unwrap(), worktree.to_string_lossy());
+    }
+
+    #[test]
+    fn an_editor_without_a_placeholder_gets_the_path_last() {
+        let temp = temp_dir("no-placeholder");
+        let log = temp.join("argv.log");
+        let editor = recorder(&temp, &log);
+        let (mut daemon, _temp, worktree) = orchestrator(&editor, "plain", false);
+        assert!(open(&mut daemon, "plain").is_empty());
+        assert_eq!(
+            logged(&log).lines().last().unwrap(),
+            worktree.to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn an_editor_that_exits_immediately_affects_nothing() {
+        let (mut daemon, _temp, _worktree) = orchestrator("/bin/true", "plain", false);
+        assert!(open(&mut daemon, "plain").is_empty());
+        // The session surface still answers after a fast exit.
+        let events = daemon.handle_request(Request::ListSessions);
+        assert!(matches!(events.first(), Some(Event::Sessions(_))));
+    }
+
+    #[test]
+    fn a_missing_editor_program_reports_instead_of_killing_the_loop() {
+        let (mut daemon, _temp, _worktree) =
+            orchestrator("/nonexistent-editor-xyz", "plain", false);
+        let events = open(&mut daemon, "plain");
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Event::Failed { message, .. } if message.contains("could not launch")
+        )));
+        // The loop is alive: the same client gets answers afterwards.
+        assert!(matches!(
+            open(&mut daemon, "plain").first(),
+            Some(Event::Failed { .. })
+        ));
+    }
+
+    #[test]
+    fn no_editor_anywhere_is_reported_something_a_user_can_act_on() {
+        let (mut daemon, _temp, _worktree) = orchestrator("", "plain", false);
+        let events = open(&mut daemon, "plain");
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Event::Failed { message, .. }
+                if message.contains("config.lua") && message.contains("$EDITOR")
+        )));
     }
 }

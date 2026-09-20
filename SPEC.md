@@ -497,7 +497,11 @@ paragraph rather than whether it matched the screens.
   what it just created, and the live terminals can be listed so a reattaching
   client finds the scratch shell again.
 - **Editor** — open a worktree in the configured editor. The daemon runs it: it
-  holds the configuration, and the TUI does not touch the filesystem.
+  holds the configuration, and the TUI does not touch the filesystem. The daemon
+  has no terminal to give it, so a full-screen editor launched this way exits
+  at once with nowhere to complain: name a graphical editor, or a command that
+  does not need a tty — an editor that must own a terminal belongs in the
+  worktree's own shell.
 - **Snapshot** — save and restore.
 - **Fetch** — refresh a session's member repos, per §7's policy. Never on a
   timer.
@@ -519,7 +523,9 @@ local grove = require("grove")
 
 grove.setup({
   shell           = "/usr/bin/fish",            -- default: $SHELL
-  editor          = os.getenv("EDITOR"),        -- or "cursor {path}"
+  editor          = os.getenv("EDITOR"),        -- or "cursor {path}"; the daemon
+                                                -- has no tty, so this must not
+                                                -- need one (see §8)
   scratch_cwd     = "~",
   scrollback      = 10000,                      -- lines per pty
   worktree_path   = "~/grove/{repo}/{branch_slug}",
@@ -664,7 +670,7 @@ without guards.
 |---|---|---|
 | `theme`, `corners`, `density` | ✓ | — |
 | `keymap`, `command`, `column`, `session_template` | ✓ | — |
-| `shell`, `scrollback`, `scratch_cwd` | — | ✓ |
+| `shell`, `scrollback`, `scratch_cwd`, `editor` | — | ✓ |
 | `worktree_path`, `branch_template`, `ignore`, `stale_after` | — | ✓ |
 | `on(...)` lifecycle events | — | ✓ |
 | `repo(...)` overrides | theme parts | the rest |
