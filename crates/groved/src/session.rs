@@ -845,23 +845,7 @@ impl SessionOrchestrator {
         // One worktree listing per repo for this request, not per terminal:
         // the manager knows paths, and resolving them one git subprocess per
         // terminal would run under the service lock for no reason.
-        let mut names: HashMap<PathBuf, TerminalTarget> = HashMap::new();
-        for repository in self.repositories.values() {
-            let Ok(checkouts) = grove_git::worktrees(&repository.path) else {
-                // A repo git cannot answer for contributes no names; the
-                // same degradation the pane rows apply.
-                continue;
-            };
-            for checkout in checkouts {
-                names.insert(
-                    checkout.path,
-                    TerminalTarget::Worktree(WorktreeRef {
-                        repo: repository.id.clone(),
-                        branch: checkout.branch.unwrap_or_default(),
-                    }),
-                );
-            }
-        }
+        let names: HashMap<PathBuf, OwnedWorktree> = self.worktree_index();
         let mut rows = Vec::new();
         for (id, key, alive) in self.terminals.list() {
             if !alive {
@@ -872,7 +856,10 @@ impl SessionOrchestrator {
                 // A checkout git no longer names (removed while its terminal
                 // was alive) is omitted from the list.
                 TerminalKey::Worktree(path) => match names.get(path) {
-                    Some(target) => target.clone(),
+                    Some(owned) => TerminalTarget::Worktree(WorktreeRef {
+                        repo: owned.repo.clone(),
+                        branch: owned.branch.clone(),
+                    }),
                     None => continue,
                 },
             };
@@ -3710,8 +3697,6 @@ mod snapshot_tests {
             )),
             "a missing snapshot must be reported: {events:?}"
         );
-
-        // Re-create the session and its worktrees so the save has content.
 
         // End the session: its worktrees go, its live terminals die — then
         // re-create the session and save again, break one worktree, restore.
