@@ -119,6 +119,9 @@ pub enum Action {
     /// unprefixed arrows.
     ScrollUp,
     ScrollDown,
+    /// Erase the last character typed. Only where there is text to erase; a
+    /// list has nothing to backspace.
+    Erase,
     /// Open a terminal for the selected worktree, for the worktrees that have
     /// none — an adopted one, or any of them after the daemon restarted.
     SpawnTerminal,
@@ -247,6 +250,7 @@ const END: &[Binding] = &[
 const SHELL: &[Binding] = &[];
 
 const PALETTE: &[Binding] = &[
+    b(false, KeyCode::Backspace, Action::Erase, "erase"),
     b(false, KeyCode::Up, Action::MoveUp, "move"),
     b(false, KeyCode::Down, Action::MoveDown, "move"),
     b(false, KeyCode::Enter, Action::Confirm, "run"),

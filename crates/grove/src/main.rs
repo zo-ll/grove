@@ -13,6 +13,7 @@ mod dash;
 mod empty;
 mod events;
 mod keymap;
+mod palette;
 mod repos;
 mod statusbar;
 mod terminal;
@@ -33,6 +34,7 @@ use grove_proto::{
     Event as DaemonEvent, Handshake, PROTOCOL_VERSION, Request, accept_welcome, socket_path,
 };
 use keymap::{Action, Focus, Routed, Router, Screen};
+use palette::{Palette, Takes};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::Event as TermEvent;
@@ -63,6 +65,8 @@ struct Ui {
     worktrees: Worktrees,
     /// The grids of every pty this pane has shown, and which one is on screen.
     terminals: Terminals,
+    /// grove's command line, while it is open.
+    palette: Palette,
     /// The terminal's current height, for sizing the pty. Width is `width`.
     height: u16,
     /// The last size the terminal pane actually had, kept so hiding the pane
@@ -155,6 +159,7 @@ impl Ui {
             repos: Repos::default(),
             worktrees: Worktrees::default(),
             terminals: Terminals::default(),
+            palette: Palette::default(),
             session: None,
             note: None,
             width: 80,
@@ -272,6 +277,54 @@ fn run(workspace: PathBuf) -> std::io::Result<()> {
                 // after the guard has restored the terminal.
                 Flow::Quit => return finish(&state),
             }
+        }
+    }
+}
+
+/// Run the command the palette has selected, or say why it cannot yet.
+///
+/// Only the argumentless commands that already have a request behind them run
+/// today. The rest are honest about it rather than closing the palette and
+/// doing nothing: a command line that swallows `enter` teaches the user that
+/// grove is unreliable, which is a harder thing to unlearn than a wait.
+fn run_command(chosen: Option<&'static palette::Command>, state: &mut State, ui: &mut Ui) -> bool {
+    let Some(command) = chosen else {
+        // Nothing matched what was typed. The palette already says so.
+        return false;
+    };
+    if let Takes::Argument(what) = command.takes {
+        ui.note = Some(format!(
+            "{} needs {what} — argument mode is #24",
+            command.name
+        ));
+        return true;
+    }
+
+    let request = match command.name {
+        "scan" => Some(Request::Scan),
+        "snapshot" => ui.session.clone().map(Request::SaveSnapshot),
+        // `prune` opens a picker (#25), `defaults` an editor, `keys` the help
+        // overlay (#30). Each is a screen rather than a request.
+        _ => {
+            ui.note = Some(format!("{} lands with its screen", command.name));
+            return true;
+        }
+    };
+    let Some(request) = request else {
+        ui.note = Some("no open session to snapshot".into());
+        return true;
+    };
+    match send(state, &request) {
+        Ok(()) => {
+            // Ran. The palette closes, because a command line that stays open
+            // after running invites the same command twice.
+            ui.screen = Screen::Dash;
+            ui.note = None;
+            true
+        }
+        Err(e) => {
+            ui.note = Some(format!("could not reach the daemon: {e}"));
+            true
         }
     }
 }
@@ -496,6 +549,32 @@ fn handle(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
                         redraw: act_on_worktree(intent, state, ui),
                     }
                 }
+                Routed::Act(Action::OpenPalette) => {
+                    ui.screen = Screen::Palette;
+                    ui.palette.open();
+                    Flow::Continue { redraw: true }
+                }
+                Routed::Act(Action::MoveDown) if ui.screen == Screen::Palette => Flow::Continue {
+                    redraw: ui.palette.move_down(),
+                },
+                Routed::Act(Action::MoveUp) if ui.screen == Screen::Palette => Flow::Continue {
+                    redraw: ui.palette.move_up(),
+                },
+                Routed::Act(Action::Erase) if ui.screen == Screen::Palette => Flow::Continue {
+                    redraw: ui.palette.backspace(),
+                },
+                Routed::Act(Action::Cancel) if ui.screen == Screen::Palette => {
+                    // `esc` closes without side effects: nothing has been run,
+                    // so there is nothing to undo.
+                    ui.screen = Screen::Dash;
+                    Flow::Continue { redraw: true }
+                }
+                Routed::Act(Action::Confirm) if ui.screen == Screen::Palette => {
+                    let chosen = ui.palette.selected();
+                    Flow::Continue {
+                        redraw: run_command(chosen, state, ui),
+                    }
+                }
                 Routed::Act(Action::TogglePane(index)) => {
                     let Some(pane) = Panes::addressed(index) else {
                         return Flow::Continue { redraw: false };
@@ -534,6 +613,10 @@ fn handle(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
                 Routed::PrefixPending => Flow::Continue { redraw: true },
                 Routed::Unbound => Flow::Continue { redraw: true },
                 // Consumed by the palette in #23; routed correctly now.
+                Routed::Text(c) if ui.screen == Screen::Palette => {
+                    ui.palette.push(c);
+                    Flow::Continue { redraw: true }
+                }
                 Routed::Text(_) => Flow::Continue { redraw: false },
                 Routed::Ignored => Flow::Continue { redraw: false },
             }
@@ -843,6 +926,19 @@ fn draw(f: &mut ratatui::Frame, state: &State, ui: &Ui) {
                 .is_some_and(|row| row.terminal.is_some());
             ui.terminals
                 .render(f.buffer_mut(), area, &ui.theme, has_terminal);
+        }
+        status_bar(f, bar_area, ui);
+        return;
+    }
+
+    if matches!(state, State::Connected { .. }) && ui.screen == Screen::Palette {
+        // Over the dash rather than beside it: §4.2 calls it grove's command
+        // line, and a command line that moves the screen under it makes the
+        // thing you were looking at harder to act on.
+        let inner = dash::render(f.buffer_mut(), body_area, ui.panes, ui.focus, &ui.theme);
+        let over = inner.worktrees.or(inner.repos).or(inner.terminal);
+        if let Some(area) = over {
+            ui.palette.render(f.buffer_mut(), area, &ui.theme);
         }
         status_bar(f, bar_area, ui);
         return;
@@ -1909,6 +2005,100 @@ mod tests {
         let screen = painted_dash(&s, &ui, 100, 20).join("\n");
         assert!(!screen.contains("grove is empty"), "{screen}");
         assert!(screen.contains("now-a-member"), "{screen}");
+    }
+
+    #[test]
+    fn the_palette_opens_takes_keys_directly_and_closes_clean() {
+        // It is not a pty, so no prefix once it is open — and `esc` closes
+        // without side effects, which means nothing was sent.
+        let (mut s, mut theirs) = wired();
+        let mut ui = Ui::new();
+
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('/')), &mut s, &mut ui);
+        assert_eq!(ui.screen, Screen::Palette);
+
+        for c in "sca".chars() {
+            handle(key(KeyCode::Char(c)), &mut s, &mut ui);
+        }
+        assert_eq!(ui.palette.input(), "sca");
+        assert_eq!(ui.palette.selected().map(|c| c.name), Some("scan"));
+
+        // A command line you cannot correct is a worse command line than one
+        // you cannot filter.
+        handle(key(KeyCode::Backspace), &mut s, &mut ui);
+        assert_eq!(ui.palette.input(), "sc");
+
+        handle(key(KeyCode::Esc), &mut s, &mut ui);
+        assert_eq!(ui.screen, Screen::Dash);
+        assert!(
+            sent(&mut theirs).is_empty(),
+            "esc must close without doing anything"
+        );
+    }
+
+    #[test]
+    fn running_a_command_reaches_the_daemon_and_closes_the_palette() {
+        let (mut s, mut theirs) = wired();
+        let mut ui = Ui::new();
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('/')), &mut s, &mut ui);
+        for c in "scan".chars() {
+            handle(key(KeyCode::Char(c)), &mut s, &mut ui);
+        }
+        handle(key(KeyCode::Enter), &mut s, &mut ui);
+
+        assert!(
+            sent(&mut theirs).contains(&Request::Scan),
+            "scan must reach the daemon"
+        );
+        assert_eq!(
+            ui.screen,
+            Screen::Dash,
+            "a command line that stays open invites the same command twice"
+        );
+    }
+
+    #[test]
+    fn a_command_that_needs_an_argument_says_so_rather_than_swallowing_enter() {
+        // Collecting the argument is #24. Until then `enter` on `add` must
+        // not look like grove ignored it.
+        let (mut s, mut theirs) = wired();
+        let mut ui = Ui::new();
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('/')), &mut s, &mut ui);
+        for c in "add".chars() {
+            handle(key(KeyCode::Char(c)), &mut s, &mut ui);
+        }
+        handle(key(KeyCode::Enter), &mut s, &mut ui);
+
+        let note = ui.note.clone().expect("a reason");
+        assert!(note.contains("add"), "{note}");
+        assert!(sent(&mut theirs).is_empty(), "nothing may be sent for it");
+        assert_eq!(ui.screen, Screen::Palette, "the palette stays open");
+    }
+
+    #[test]
+    fn the_palette_draws_over_the_dash() {
+        let mut s = connected();
+        let mut ui = Ui::new();
+        handle(
+            Input::Daemon(DaemonEvent::Repos(vec![repo_row("repo", 1)])),
+            &mut s,
+            &mut ui,
+        );
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('/')), &mut s, &mut ui);
+
+        let screen = painted_dash(&s, &ui, 100, 20).join("\n");
+        assert!(
+            screen.contains("scan"),
+            "the command list is on screen: {screen}"
+        );
+        assert!(
+            screen.contains("REPOS"),
+            "over the dash, not instead of it: {screen}"
+        );
     }
 
     #[test]
