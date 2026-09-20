@@ -149,7 +149,8 @@ pub struct Theme {
     dirty: Color,
     error: Color,
     muted: Color,
-    frame: Color,
+    /// Kept so the fixed inks resolve the same way the roles did.
+    depth: Depth,
     corners: Corners,
     density: Density,
 }
@@ -188,18 +189,8 @@ impl Theme {
             Depth::True => rgb.map(|(r, g, b)| Color::Rgb(r, g, b)),
         };
 
-        // Fixed, not configurable: the mock's panes are the accent colour when
-        // focused and this grey when not, and the five roles are about what a
-        // thing *is* — a frame is not clean, dirty, muted or wrong. Resolved
-        // through the same depth logic so it degrades with everything else.
-        let frame = match depth {
-            Depth::Ansi16 => Color::Indexed(nearest_16(FRAME)),
-            Depth::Ansi256 => Color::Indexed(nearest_256(FRAME)),
-            Depth::True => Color::Rgb(FRAME.0, FRAME.1, FRAME.2),
-        };
-
         let theme = Self {
-            frame,
+            depth,
             accent: colours[0],
             clean: colours[1],
             dirty: colours[2],
@@ -227,13 +218,32 @@ impl Theme {
         Style::default().fg(self.color(role))
     }
 
+    /// The colour of one of the mock's fixed inks.
+    ///
+    /// Resolved through the same depth logic as the roles, so a 16-colour
+    /// terminal degrades the whole palette together rather than leaving the
+    /// frames in truecolour beside downgraded text.
+    pub fn ink(&self, ink: Ink) -> Color {
+        let rgb = ink.rgb();
+        match self.depth {
+            Depth::Ansi16 => Color::Indexed(nearest_16(rgb)),
+            Depth::Ansi256 => Color::Indexed(nearest_256(rgb)),
+            Depth::True => Color::Rgb(rgb.0, rgb.1, rgb.2),
+        }
+    }
+
+    /// The style for a fixed ink — what call sites actually want.
+    pub fn ink_style(&self, ink: Ink) -> Style {
+        Style::default().fg(self.ink(ink))
+    }
+
     /// The colour of a pane's border when it does not have focus.
     ///
     /// Dimmer than [`Role::Muted`], which is text: a frame that reads as
     /// loudly as the words inside it competes with them, and in the mock the
     /// unfocused panes recede almost to the background.
     pub fn frame_style(&self) -> Style {
-        Style::default().fg(self.frame)
+        self.ink_style(Ink::Frame)
     }
 
     /// The border treatment for panes and overlays.
@@ -266,8 +276,49 @@ impl Theme {
     }
 }
 
-/// Catppuccin Mocha's `surface0`, the mock's unfocused pane border.
-const FRAME: (u8, u8, u8) = (0x31, 0x32, 0x44);
+/// The mock's fixed colours, as opposed to the five a config may set.
+///
+/// These are structure rather than meaning: a frame, a rule, the weight of a
+/// line of text against the line above it. [`Role`] is about what a thing *is*
+/// — clean, dirty, wrong — and none of these are any of those, which is why
+/// they are not configurable and not in that enum. Every value is Catppuccin
+/// Mocha's, because the mock is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "Text, Faint and Other are the overlays' — the palette, picker, \
+              diff and end-session screens land next, and splitting one \
+              palette across those commits would mean choosing its colours \
+              four times"
+)]
+pub enum Ink {
+    /// `surface0`. An unfocused pane's border, and the status bar's ground.
+    Frame,
+    /// `surface1`. A rule between two things on one line.
+    Divider,
+    /// `text`. A row the cursor is on, or a name being acted on.
+    Text,
+    /// `subtext0`. Ordinary rows, and the status bar's labels.
+    Subtext,
+    /// `overlay0`. Present but not the point: a row's owner, a hint's number.
+    Faint,
+    /// `blue`. Another session's claim on a worktree — the one ownership
+    /// state that is neither yours nor free, and so has a colour of its own.
+    Other,
+}
+
+impl Ink {
+    const fn rgb(self) -> (u8, u8, u8) {
+        match self {
+            Self::Frame => (0x31, 0x32, 0x44),
+            Self::Divider => (0x45, 0x47, 0x5a),
+            Self::Text => (0xcd, 0xd6, 0xf4),
+            Self::Subtext => (0xa6, 0xad, 0xc8),
+            Self::Faint => (0x6c, 0x70, 0x86),
+            Self::Other => (0x89, 0xb4, 0xfa),
+        }
+    }
+}
 
 /// `#rrggbb` or `rrggbb`, case-insensitive.
 ///

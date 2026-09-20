@@ -153,6 +153,13 @@ pub struct Binding {
     pub action: Action,
     /// How the status bar and help overlay label it, e.g. `"sessions"`.
     pub label: &'static str,
+    /// Whether the status bar carries it.
+    ///
+    /// The bar is not a list of everything bound — the mock's has five entries
+    /// on the dash and grove has fourteen. It is the shortlist, and marking it
+    /// here rather than in the bar keeps one table: `^g ?` still lists them
+    /// all, and a binding that moves takes its label with it either way.
+    pub on_bar: bool,
 }
 
 const fn b(prefixed: bool, key: KeyCode, action: Action, label: &'static str) -> Binding {
@@ -162,6 +169,15 @@ const fn b(prefixed: bool, key: KeyCode, action: Action, label: &'static str) ->
         modifiers: KeyModifiers::NONE,
         action,
         label,
+        on_bar: false,
+    }
+}
+
+/// A binding the status bar carries.
+const fn bar(prefixed: bool, key: KeyCode, action: Action, label: &'static str) -> Binding {
+    Binding {
+        on_bar: true,
+        ..b(prefixed, key, action, label)
     }
 }
 
@@ -237,9 +253,11 @@ pub fn key_label(action: Action) -> String {
 /// Bindings available on every screen, per SPEC §3.2. All prefixed: they must
 /// work while a pty has focus, which is the whole point of the prefix.
 const GLOBAL: &[Binding] = &[
-    b(true, KeyCode::Char('/'), Action::OpenPalette, "palette"),
-    b(true, KeyCode::Char('s'), Action::OpenPicker, "sessions"),
-    b(true, KeyCode::Char('d'), Action::OpenDiff, "diff"),
+    // Ordered as the mock's bar reads them, because the bar is generated from
+    // this table and nothing else decides what comes first.
+    bar(true, KeyCode::Char('s'), Action::OpenPicker, "sessions"),
+    bar(true, KeyCode::Char('d'), Action::OpenDiff, "diff"),
+    bar(true, KeyCode::Char('/'), Action::OpenPalette, "palette"),
     b(true, KeyCode::Char('i'), Action::OpenShell, "shell"),
     b(true, KeyCode::Char('n'), Action::PrefillNew, "new"),
     b(true, KeyCode::Char('X'), Action::EndSession, "end"),
@@ -251,11 +269,14 @@ const GLOBAL: &[Binding] = &[
 /// Dash bindings, per SPEC §3.3. The pane-focus and visibility keys are
 /// prefixed; list movement is not, because a list is not a pty.
 const DASH: &[Binding] = &[
-    b(true, KeyCode::Tab, Action::CycleFocus, "pane"),
+    bar(true, KeyCode::Tab, Action::CycleFocus, "pane"),
     b(true, KeyCode::BackTab, Action::CycleFocusBack, "pane back"),
-    b(true, KeyCode::Char('1'), Action::TogglePane(1), "hide"),
-    b(true, KeyCode::Char('2'), Action::TogglePane(2), "hide"),
-    b(true, KeyCode::Char('3'), Action::TogglePane(3), "hide"),
+    // Three keys, one entry: the bar folds them to `^g 1-3 hide`, which is
+    // what the mock shows and what a reader needs — the pane numbers are
+    // obvious once you know the range exists.
+    bar(true, KeyCode::Char('1'), Action::TogglePane(1), "hide"),
+    bar(true, KeyCode::Char('2'), Action::TogglePane(2), "hide"),
+    bar(true, KeyCode::Char('3'), Action::TogglePane(3), "hide"),
     b(true, KeyCode::Char('a'), Action::Adopt, "adopt"),
     b(true, KeyCode::Char('r'), Action::Release, "release"),
     b(true, KeyCode::Char('o'), Action::OpenEditor, "editor"),
@@ -274,35 +295,35 @@ const DASH: &[Binding] = &[
 /// work, a key one keystroke from `enter` must never reach a row the daemon
 /// judged unsafe.
 const PRUNE: &[Binding] = &[
-    b(false, KeyCode::Char(' '), Action::Toggle, "toggle"),
-    b(false, KeyCode::Char('a'), Action::SelectSafe, "all safe"),
-    b(false, KeyCode::Up, Action::MoveUp, "move"),
-    b(false, KeyCode::Down, Action::MoveDown, "move"),
-    b(false, KeyCode::Enter, Action::Confirm, "prune"),
-    b(false, KeyCode::Esc, Action::Cancel, "close"),
+    bar(false, KeyCode::Char(' '), Action::Toggle, "toggle"),
+    bar(false, KeyCode::Char('a'), Action::SelectSafe, "all safe"),
+    bar(false, KeyCode::Up, Action::MoveUp, "move"),
+    bar(false, KeyCode::Down, Action::MoveDown, "move"),
+    bar(false, KeyCode::Enter, Action::Confirm, "prune"),
+    bar(false, KeyCode::Esc, Action::Cancel, "close"),
 ];
 
 /// Overlay bindings, per SPEC §3.4. Unprefixed throughout — the picker, diff
 /// and end-session screens are not ptys, so they take keys directly.
 const PICKER: &[Binding] = &[
-    b(false, KeyCode::Up, Action::MoveUp, "move"),
-    b(false, KeyCode::Down, Action::MoveDown, "move"),
-    b(false, KeyCode::Enter, Action::Confirm, "resume"),
-    b(false, KeyCode::Char('d'), Action::Detach, "detach"),
-    b(false, KeyCode::Char('c'), Action::Close, "close"),
-    b(false, KeyCode::Char('X'), Action::EndSession, "end"),
-    b(false, KeyCode::Esc, Action::Cancel, "back"),
+    bar(false, KeyCode::Up, Action::MoveUp, "session"),
+    bar(false, KeyCode::Down, Action::MoveDown, "session"),
+    bar(false, KeyCode::Enter, Action::Confirm, "resume"),
+    bar(false, KeyCode::Char('d'), Action::Detach, "detach"),
+    bar(false, KeyCode::Char('c'), Action::Close, "close"),
+    bar(false, KeyCode::Char('X'), Action::EndSession, "end"),
+    bar(false, KeyCode::Esc, Action::Cancel, "back"),
 ];
 
 const DIFF: &[Binding] = &[
-    b(false, KeyCode::Up, Action::MoveUp, "file"),
-    b(false, KeyCode::Down, Action::MoveDown, "file"),
-    b(false, KeyCode::Esc, Action::Cancel, "close"),
+    bar(false, KeyCode::Up, Action::MoveUp, "file"),
+    bar(false, KeyCode::Down, Action::MoveDown, "file"),
+    bar(false, KeyCode::Esc, Action::Cancel, "close"),
 ];
 
 const END: &[Binding] = &[
-    b(false, KeyCode::Enter, Action::Confirm, "remove everything"),
-    b(false, KeyCode::Esc, Action::Cancel, "cancel"),
+    bar(false, KeyCode::Enter, Action::Confirm, "remove everything"),
+    bar(false, KeyCode::Esc, Action::Cancel, "cancel"),
 ];
 
 /// The scratch shell is a pty, so it has no unprefixed bindings at all — `esc`
@@ -323,8 +344,26 @@ const PALETTE: &[Binding] = &[
 ];
 
 /// Every binding live on a screen, globals last so a screen may shadow one.
+/// The bindings the status bar carries for a screen.
+///
+/// A screen's own, and on the dash the global ones too. Everywhere else the
+/// bar is an overlay's footer and is about the overlay: `^g s` still opens the
+/// session picker from inside the diff, but a footer that says so is teaching
+/// a key the reader is not there to learn. The mock draws it the same way.
+pub fn bar_bindings(screen: Screen) -> impl Iterator<Item = &'static Binding> {
+    let global: &[Binding] = if screen == Screen::Dash { GLOBAL } else { &[] };
+    local_bindings(screen)
+        .iter()
+        .chain(global.iter())
+        .filter(|b| b.on_bar)
+}
+
 pub fn bindings(screen: Screen) -> impl Iterator<Item = &'static Binding> {
-    let local = match screen {
+    local_bindings(screen).iter().chain(GLOBAL.iter())
+}
+
+fn local_bindings(screen: Screen) -> &'static [Binding] {
+    match screen {
         Screen::Dash => DASH,
         Screen::Palette => PALETTE,
         Screen::Picker => PICKER,
@@ -332,8 +371,7 @@ pub fn bindings(screen: Screen) -> impl Iterator<Item = &'static Binding> {
         Screen::Diff => DIFF,
         Screen::Shell => SHELL,
         Screen::EndSession => END,
-    };
-    local.iter().chain(GLOBAL.iter())
+    }
 }
 
 /// What the router decided to do with a key.

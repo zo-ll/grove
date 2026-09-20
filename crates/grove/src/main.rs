@@ -1853,12 +1853,18 @@ fn connect(workspace: &Path, inputs: &Inputs) -> State {
 }
 
 fn draw(f: &mut ratatui::Frame, state: &State, ui: &Ui) {
-    // One row reserved at the bottom for the status bar, per SPEC §4.1.
+    // Two rows at the bottom: the status bar, and a blank one above it. The
+    // mock sets the bar off from the panes with `margin-top:12px` rather than
+    // butting it against them, and a row is what that is here.
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .constraints([
+            Constraint::Min(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
         .split(f.area());
-    let (body_area, bar_area) = (chunks[0], chunks[1]);
+    let (body_area, bar_area) = (chunks[0], chunks[2]);
 
     // Help comes before every screen's own branch: it explains whichever one
     // is underneath, so it has to win the draw whatever that screen is.
@@ -2083,6 +2089,20 @@ impl Ui {
     ///
     /// The same string the status bar puts on its right, because they are
     /// answering the same question and two ways of phrasing it would drift.
+    /// The open session, as the mock's bar names it.
+    ///
+    /// The id is the fallback rather than the answer: it is what the daemon
+    /// told us we are in, and a session usually has a name the user chose.
+    fn session_name(&self) -> String {
+        let Some(open) = self.session.as_ref() else {
+            return "no session".to_string();
+        };
+        match self.sessions.by_id(open) {
+            Some(row) => format!("session: {}", row.name),
+            None => format!("session: {}", open.0),
+        }
+    }
+
     fn selection(&self) -> String {
         match (self.repos.selected(), self.worktrees.selected()) {
             (Some(repo), Some(worktree)) => format!("{} · {}", repo.name, worktree.worktree.branch),
@@ -2095,10 +2115,13 @@ impl Ui {
 }
 
 fn status_bar(f: &mut ratatui::Frame, area: Rect, ui: &Ui) {
+    // A pending prefix outranks the selection: it is about the key just
+    // pressed and it disappears on the next one, while the selection is still
+    // there in the pane header above.
     let context = if ui.router.prefix_pending() {
         "^g …".to_string()
     } else {
-        String::new()
+        ui.selection()
     };
     // A refusal outranks the config note: it is about the key just pressed,
     // and the config note has been true since startup.
@@ -2106,9 +2129,8 @@ fn status_bar(f: &mut ratatui::Frame, area: Rect, ui: &Ui) {
     f.render_widget(
         Paragraph::new(statusbar::render(
             ui.screen,
-            ui.focus,
             &context,
-            "no session",
+            &ui.session_name(),
             area.width,
             &ui.theme,
             note,
