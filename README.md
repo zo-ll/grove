@@ -13,8 +13,35 @@ each worktree.
  ^g tab pane  ^g 1-3 hide  ^g s sessions  ^g d diff  ^g / palette   session: invoice split
 ```
 
-> **Status: specification only.** There is no code yet. This repository currently holds
-> the v1 spec and a design brief. See [SPEC.md](SPEC.md).
+> **Status: v1 is built and has barely been used.** Every screen the spec
+> describes is implemented and tested, the daemon serves the whole protocol,
+> and Lua can add keys, commands and columns. What it has *not* had is hands:
+> it has been run end to end once, by the install script's author, on a
+> throwaway repository. Expect to be the first person to find whatever that
+> missed. See [SPEC.md](SPEC.md) for what it is supposed to do.
+
+## Install
+
+```sh
+scripts/install.sh                 # builds release, installs to ~/.local/bin
+scripts/install.sh --sample-config # and writes a starter config.lua
+```
+
+`--prefix DIR` installs elsewhere, `--debug` skips optimisation for a faster
+loop, and `--uninstall` removes the binaries while leaving your config alone.
+
+grove is **two programs**. `groved` owns the ptys and outlives the terminal;
+`grove` is the TUI that attaches to it. Start the daemon on a directory that
+holds your clones, then open the TUI on the same directory:
+
+```sh
+groved ~/code &
+grove ~/code
+```
+
+The daemon keeps running when the TUI exits — that is the point of it. `^g ?`
+lists the keys for whichever screen you are on, and `^g q` leaves the TUI
+without stopping your terminals.
 
 ## Why
 

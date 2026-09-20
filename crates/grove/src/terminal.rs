@@ -60,6 +60,16 @@ pub struct Guard;
 impl Guard {
     /// Enter raw mode and install the panic hook and signal handlers.
     pub fn new() -> io::Result<(Self, Terminal<CrosstermBackend<Stdout>>)> {
+        // Checked before raw mode rather than after: `enable_raw_mode` on a
+        // pipe fails with ENXIO, and "No such device or address (os error 6)"
+        // tells someone who ran `grove | less` nothing about what went wrong.
+        if !std::io::IsTerminal::is_terminal(&io::stdout()) {
+            return Err(io::Error::other(
+                "grove needs a terminal: stdout is not a tty. \
+                 The daemon runs headless — `groved <workspace>` — but the TUI \
+                 has to be attached to one.",
+            ));
+        }
         enable_raw_mode()?;
         RAW.store(true, Ordering::SeqCst);
 
@@ -139,6 +149,18 @@ fn install_signal_handlers() {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn without_a_terminal_it_says_so_rather_than_reporting_errno() {
+        // Tests do not run on a tty, which is exactly the situation being
+        // described — so this asserts the message a user in a pipe gets.
+        let said = match Guard::new() {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("there is no terminal in a test run"),
+        };
+        assert!(said.contains("needs a terminal"), "{said}");
+        assert!(said.contains("groved"), "and says what does work: {said}");
+    }
 
     #[test]
     fn restore_is_idempotent() {
