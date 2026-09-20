@@ -39,8 +39,8 @@ pub struct Repos {
     /// Every repository the daemon found, members or not. The pane lists only
     /// members, but the difference between "no repositories anywhere" and
     /// "none of them in this session" is two different pieces of advice — see
-    /// `empty`.
-    workspace: usize,
+    /// `empty` — and the palette's pickers need the ones this pane hides.
+    all: Vec<RepoRow>,
 }
 
 impl Repos {
@@ -54,8 +54,8 @@ impl Repos {
         let previous = self.selected().map(|row| row.repo.clone());
         // Only members: §4.1 is explicit that this pane is the session's, not
         // the workspace's, and the workspace list belongs to the palette.
-        self.workspace = rows.len();
-        self.rows = rows.into_iter().filter(|row| row.member).collect();
+        self.all = rows;
+        self.rows = self.all.iter().filter(|row| row.member).cloned().collect();
         self.cursor = previous
             .and_then(|repo| self.rows.iter().position(|row| row.repo == repo))
             .unwrap_or(0)
@@ -73,9 +73,17 @@ impl Repos {
         &self.rows
     }
 
+    /// Every repository the daemon sent, members or not.
+    ///
+    /// The palette's pickers are built from this: `add` needs the ones the
+    /// session does not hold, which the pane itself never lists.
+    pub fn all(&self) -> &[RepoRow] {
+        &self.all
+    }
+
     /// How many repositories exist under the workspace, whoever holds them.
     pub fn workspace_count(&self) -> usize {
-        self.workspace
+        self.all.len()
     }
 
     /// How many this session holds.
@@ -125,7 +133,7 @@ impl Repos {
             // The guidance itself lives in the WORKTREES pane (§4.1); this
             // pane says only why it is empty, so the two do not repeat each
             // other in the narrowest column on screen.
-            if let Some(empty) = Empty::of(self.workspace, 0) {
+            if let Some(empty) = Empty::of(self.all.len(), 0) {
                 Paragraph::new(Line::styled(empty.repos_note(), theme.style(Role::Muted)))
                     .render(area, buf);
             }

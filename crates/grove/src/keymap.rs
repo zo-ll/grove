@@ -122,6 +122,8 @@ pub enum Action {
     /// Erase the last character typed. Only where there is text to erase; a
     /// list has nothing to backspace.
     Erase,
+    /// Check or uncheck the row under the cursor, in a multi-select.
+    Toggle,
     /// Open a terminal for the selected worktree, for the worktrees that have
     /// none — an adopted one, or any of them after the daemon restarted.
     SpawnTerminal,
@@ -250,6 +252,7 @@ const END: &[Binding] = &[
 const SHELL: &[Binding] = &[];
 
 const PALETTE: &[Binding] = &[
+    b(false, KeyCode::Char(' '), Action::Toggle, "toggle"),
     b(false, KeyCode::Backspace, Action::Erase, "erase"),
     b(false, KeyCode::Up, Action::MoveUp, "move"),
     b(false, KeyCode::Down, Action::MoveDown, "move"),
