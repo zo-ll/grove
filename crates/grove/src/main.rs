@@ -529,7 +529,7 @@ fn confirm_argument(state: &mut State, ui: &mut Ui) -> bool {
     // typed and gets out of the way.
     if let Some(index) = command.user {
         let argument = ui.palette.argument().unwrap_or_default().to_string();
-        return run_user_command(index, &argument, ui);
+        return run_user_command(index, &argument, state, ui);
     }
     let argument = ui.palette.argument().unwrap_or_default().to_string();
     let Some(session) = ui.session.clone() else {
@@ -720,11 +720,14 @@ fn refresh_user_columns(ui: &mut Ui) {
 ///
 /// Same containment as a keymap's: bounded in time, and a throw takes the
 /// command out of the palette rather than failing again next time it is run.
-fn run_user_command(index: usize, argument: &str, ui: &mut Ui) -> bool {
+fn run_user_command(index: usize, argument: &str, state: &mut State, ui: &mut Ui) -> bool {
     let Some(runtime) = ui.lua.as_ref() else {
         return false;
     };
-    match runtime.call_command(index, argument, USER_CALLBACK_BUDGET) {
+    runtime.set_context(lua_context(ui));
+    let outcome = runtime.call_command(index, argument, USER_CALLBACK_BUDGET);
+    perform_asks(state, ui);
+    match outcome {
         Ok(()) => {
             ui.screen = Screen::Dash;
             ui.note = None;
@@ -741,12 +744,86 @@ fn run_user_command(index: usize, argument: &str, ui: &mut Ui) -> bool {
     }
 }
 
+/// Perform what a callback asked for (§10.4's stateful helpers).
+///
+/// The helpers record rather than act, because `grove-lua` is shared and may
+/// not reach the protocol — so this is where intent becomes requests. Asks are
+/// performed in the order they were made, because a script that creates a
+/// worktree and then opens the palette meant that order.
+fn perform_asks(state: &mut State, ui: &mut Ui) {
+    let Some(runtime) = ui.lua.as_ref() else {
+        return;
+    };
+    for ask in runtime.take_asks() {
+        match ask {
+            grove_lua::Ask::NewWorktree { repo, branch } => {
+                let Some(session) = ui.session.clone() else {
+                    ui.note = Some("no open session to create a worktree in".into());
+                    continue;
+                };
+                let request = Request::NewWorktrees {
+                    session,
+                    branch,
+                    repos: vec![grove_domain::RepoId(repo)],
+                };
+                if let Err(e) = send(state, &request) {
+                    ui.note = Some(format!("could not reach the daemon: {e}"));
+                }
+            }
+            grove_lua::Ask::OpenSession { name } => {
+                // By name, because that is what a script knows; the id is
+                // grove's business and the picker already holds the mapping.
+                match ui
+                    .sessions
+                    .by_name(&name)
+                    .map(|row| Request::OpenSession(row.id.clone()))
+                {
+                    Some(request) => {
+                        if let Err(e) = send(state, &request) {
+                            ui.note = Some(format!("could not reach the daemon: {e}"));
+                        }
+                    }
+                    None => ui.note = Some(format!("no session called {name:?}")),
+                }
+            }
+            grove_lua::Ask::Send { text } => match ui.terminals.input(text.into_bytes()) {
+                Some(request) => {
+                    if let Err(e) = send(state, &request) {
+                        ui.note = Some(format!("could not reach the daemon: {e}"));
+                    }
+                }
+                None => ui.note = Some("no terminal to send to".into()),
+            },
+            grove_lua::Ask::Palette { prefill } => {
+                // Purely local: the palette is grove's own screen.
+                ui.screen = Screen::Palette;
+                ui.palette.open();
+                for c in prefill.chars() {
+                    ui.palette.push(c);
+                }
+            }
+        }
+    }
+}
+
+/// What the VM should know about where the user is, before a callback runs.
+fn lua_context(ui: &Ui) -> grove_lua::Context {
+    grove_lua::Context {
+        current_repo: ui.repos.selected().map(|row| row.name.clone()),
+    }
+}
+
 /// Run a user keymap's callback, containing whatever it does.
-fn run_user_key(index: usize, ui: &mut Ui) -> Flow {
+fn run_user_key(index: usize, state: &mut State, ui: &mut Ui) -> Flow {
     let Some(runtime) = ui.lua.as_ref() else {
         return Flow::Continue { redraw: false };
     };
-    match runtime.call_keymap(index, USER_CALLBACK_BUDGET) {
+    runtime.set_context(lua_context(ui));
+    let outcome = runtime.call_keymap(index, USER_CALLBACK_BUDGET);
+    // Whatever it managed to record before it finished — or was stopped —
+    // still happened as far as the script is concerned.
+    perform_asks(state, ui);
+    match outcome {
         Ok(()) => Flow::Continue { redraw: true },
         Err(grove_lua::CallError::Timeout) => {
             // Reported, but not disabled: a timeout may be a slow command
@@ -839,7 +916,7 @@ fn handle(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
                     ui.keys
                         .bound(matches!(routed, Routed::Unbound), key.code, key.modifiers)
             {
-                return run_user_key(index, ui);
+                return run_user_key(index, state, ui);
             }
             match routed {
                 Routed::Act(Action::Quit) => Flow::Quit,
@@ -3569,6 +3646,90 @@ mod tests {
             sent(&mut theirs).is_empty(),
             "a user command is its own implementation"
         );
+    }
+
+    #[test]
+    fn a_user_command_creates_a_worktree_end_to_end() {
+        // #33's first acceptance, and what #88 existed to make possible: the
+        // callback computes, records, and grove performs — one request on the
+        // wire, from a command grove knows nothing about.
+        let (mut s, mut theirs) = wired();
+        let mut ui = with_lua(
+            "local grove = require('grove')\n             grove.command('start', function(branch)\n               grove.new_worktree({ repo = grove.current_repo(), branch = branch })\n             end)\n",
+        );
+        handle(
+            Input::Daemon(DaemonEvent::Repos(vec![repo_row("billing", 1)])),
+            &mut s,
+            &mut ui,
+        );
+        handle(
+            Input::Daemon(DaemonEvent::Sessions(vec![grove_proto::SessionRow {
+                id: grove_domain::SessionId("open".into()),
+                name: "current".into(),
+                members: vec![],
+                state: grove_domain::SessionState::Attached,
+                terminals: 0,
+                since: 0,
+                size: 0,
+            }])),
+            &mut s,
+            &mut ui,
+        );
+        let _ = sent(&mut theirs);
+
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('/')), &mut s, &mut ui);
+        for c in "start".chars() {
+            handle(key(KeyCode::Char(c)), &mut s, &mut ui);
+        }
+        handle(key(KeyCode::Enter), &mut s, &mut ui);
+        for c in "feat/from-lua".chars() {
+            handle(key(KeyCode::Char(c)), &mut s, &mut ui);
+        }
+        handle(key(KeyCode::Enter), &mut s, &mut ui);
+
+        match sent(&mut theirs).as_slice() {
+            [Request::NewWorktrees { branch, repos, .. }] => {
+                assert_eq!(branch, "feat/from-lua");
+                assert_eq!(repos, &[grove_domain::RepoId("billing".into())]);
+            }
+            other => panic!("expected one NewWorktrees, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_keymap_can_open_the_palette_prefilled() {
+        // §10.3's own example. Purely local — the palette is grove's screen,
+        // so this one is not a request at all.
+        let (mut s, mut theirs) = wired();
+        let mut ui = with_lua(
+            "local grove = require('grove')\n             grove.keymap('^g w', function() grove.palette('new ') end)\n",
+        );
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('w')), &mut s, &mut ui);
+
+        assert_eq!(ui.screen, Screen::Palette);
+        assert_eq!(ui.palette.input(), "new ");
+        assert!(sent(&mut theirs).is_empty(), "nothing asked of the daemon");
+    }
+
+    #[test]
+    fn an_ask_that_cannot_be_performed_says_why() {
+        // The helpers record whatever the script asked for, including things
+        // grove cannot do right now. Silence would leave the user thinking it
+        // worked.
+        let (mut s, mut theirs) = wired();
+        let mut ui = with_lua(
+            "local grove = require('grove')\n             grove.keymap('^g w', function() grove.open_session('nowhere') end)\n",
+        );
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('w')), &mut s, &mut ui);
+        assert!(
+            ui.note.clone().is_some_and(|n| n.contains("nowhere")),
+            "{:?}",
+            ui.note
+        );
+        assert!(sent(&mut theirs).is_empty());
     }
 
     #[test]

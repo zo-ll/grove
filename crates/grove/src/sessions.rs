@@ -65,6 +65,11 @@ impl Sessions {
             .min(self.rows.len().saturating_sub(1));
     }
 
+    /// A session by the name a script would know it as.
+    pub fn by_name(&self, name: &str) -> Option<&SessionRow> {
+        self.rows.iter().find(|row| row.name == name)
+    }
+
     pub fn selected(&self) -> Option<&SessionRow> {
         self.rows.get(self.cursor)
     }
