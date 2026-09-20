@@ -270,6 +270,10 @@ const END: &[Binding] = &[
 
 /// The scratch shell is a pty, so it has no unprefixed bindings at all — `esc`
 /// belongs to the shell running inside it, not to grove.
+/// The scratch shell has no bindings of its own, and that is the point: it is
+/// a pty, so every unprefixed key belongs to the program inside it — `esc`
+/// included, which is why leaving is `^g i` again rather than `esc`. The
+/// global table still applies, because those are all prefixed.
 const SHELL: &[Binding] = &[];
 
 const PALETTE: &[Binding] = &[

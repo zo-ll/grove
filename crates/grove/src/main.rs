@@ -78,6 +78,9 @@ struct Ui {
     prune: Prune,
     /// Stored sessions, for the picker.
     sessions: Sessions,
+    /// The scratch shell's pty, once one exists. Kept so `^g i` re-attaches
+    /// rather than spawning a second shell every time it is pressed.
+    scratch: Option<grove_proto::TerminalId>,
     /// The end-session confirm, while it is open.
     ending: EndSession,
     /// A `new` that hit a branch already checked out somewhere else, and the
@@ -179,6 +182,7 @@ impl Ui {
             palette: Palette::default(),
             prune: Prune::default(),
             sessions: Sessions::default(),
+            scratch: None,
             ending: EndSession::default(),
             conflict: None,
             session: None,
@@ -788,6 +792,45 @@ fn handle(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
                     ui.screen = Screen::Dash;
                     Flow::Continue { redraw: true }
                 }
+                Routed::Act(Action::OpenShell) => {
+                    if ui.screen == Screen::Shell {
+                        // `^g i` is the way out as well as the way in: `esc`
+                        // belongs to the program inside the pty.
+                        ui.screen = Screen::Dash;
+                        // Back to whatever the dash was showing.
+                        follow_selection(state, ui);
+                        return Flow::Continue { redraw: true };
+                    }
+                    ui.screen = Screen::Shell;
+                    match ui.scratch {
+                        // It survives closing and reopening: the daemon kept
+                        // the pty, so grove re-attaches rather than spawning
+                        // a second shell in the same place.
+                        Some(terminal) => {
+                            let (rows, cols) = ui.terminal_pane_size();
+                            for request in ui.terminals.show(Some(terminal), rows, cols) {
+                                if let Err(e) = send(state, &request) {
+                                    ui.note = Some(format!("could not reach the daemon: {e}"));
+                                    break;
+                                }
+                            }
+                        }
+                        None => {
+                            // `cwd: None` means the daemon's own
+                            // `config.scratch_cwd`, which is where this shell
+                            // is supposed to open — not the worktree root, and
+                            // not wherever grove was started.
+                            let request =
+                                Request::SpawnTerminal(grove_proto::TerminalTarget::Scratch {
+                                    cwd: None,
+                                });
+                            if let Err(e) = send(state, &request) {
+                                ui.note = Some(format!("could not reach the daemon: {e}"));
+                            }
+                        }
+                    }
+                    Flow::Continue { redraw: true }
+                }
                 Routed::Act(Action::OpenPicker) => {
                     // Ask before showing: a list of sessions that fills in
                     // underneath someone already pressing `X` is the worst
@@ -1068,6 +1111,23 @@ fn handle(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
             Flow::Continue { redraw: true }
         }
 
+        // The scratch shell grove asked for. Remembered so reopening the
+        // overlay re-attaches rather than spawning another shell beside it.
+        Input::Daemon(DaemonEvent::TerminalSpawned {
+            target: grove_proto::TerminalTarget::Scratch { .. },
+            terminal,
+        }) => {
+            ui.scratch = Some(terminal);
+            let (rows, cols) = ui.terminal_pane_size();
+            for request in ui.terminals.show(Some(terminal), rows, cols) {
+                if let Err(e) = send(state, &request) {
+                    ui.note = Some(format!("could not reach the daemon: {e}"));
+                    break;
+                }
+            }
+            Flow::Continue { redraw: true }
+        }
+
         Input::Daemon(DaemonEvent::TerminalSpawned { terminal, .. }) => {
             let (rows, cols) = ui.terminal_pane_size();
             for request in ui.terminals.show(Some(terminal), rows, cols) {
@@ -1326,6 +1386,22 @@ fn draw(f: &mut ratatui::Frame, state: &State, ui: &Ui) {
             ui.terminals
                 .render(f.buffer_mut(), area, &ui.theme, has_terminal);
         }
+        status_bar(f, bar_area, ui);
+        return;
+    }
+
+    if matches!(state, State::Connected { .. }) && ui.screen == Screen::Shell {
+        // The whole body: it is a terminal, not a pane, and §4.5 gives it the
+        // screen rather than a corner of one.
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(ui.theme.border())
+            .border_style(ui.theme.style(Role::Muted))
+            .title(Span::styled(" scratch ", ui.theme.style(Role::Accent)));
+        let inner = block.inner(body_area);
+        f.render_widget(block, body_area);
+        ui.terminals
+            .render(f.buffer_mut(), inner, &ui.theme, ui.scratch.is_some());
         status_bar(f, bar_area, ui);
         return;
     }
@@ -2996,6 +3072,93 @@ mod tests {
             1,
             "only the one this session owns"
         );
+    }
+
+    #[test]
+    fn the_scratch_shell_opens_at_the_daemons_own_cwd() {
+        // Acceptance: the configured `scratch_cwd`, not `~/grove` and not
+        // wherever grove was started. `cwd: None` is how the protocol says
+        // "your configured one" — sending a path here would be the client
+        // deciding something that belongs to the daemon VM (§10.4).
+        let (mut s, mut theirs) = wired();
+        let mut ui = Ui::new();
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('i')), &mut s, &mut ui);
+
+        assert_eq!(ui.screen, Screen::Shell);
+        match sent(&mut theirs).as_slice() {
+            [Request::SpawnTerminal(grove_proto::TerminalTarget::Scratch { cwd })] => {
+                assert!(cwd.is_none(), "the daemon's configured cwd, not ours");
+            }
+            other => panic!("expected a scratch spawn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reopening_the_shell_reattaches_rather_than_spawning_another() {
+        // Acceptance: it survives closing and reopening. A second spawn would
+        // leave two shells running in the same place, one of them invisible.
+        let (mut s, mut theirs) = wired();
+        let mut ui = Ui::new();
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('i')), &mut s, &mut ui);
+        handle(
+            Input::Daemon(DaemonEvent::TerminalSpawned {
+                target: grove_proto::TerminalTarget::Scratch { cwd: None },
+                terminal: grove_proto::TerminalId(5),
+            }),
+            &mut s,
+            &mut ui,
+        );
+        assert_eq!(ui.scratch, Some(grove_proto::TerminalId(5)));
+        let _ = sent(&mut theirs);
+
+        // Leave and come back.
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('i')), &mut s, &mut ui);
+        assert_eq!(ui.screen, Screen::Dash, "^g i is the way out too");
+        let _ = sent(&mut theirs);
+
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('i')), &mut s, &mut ui);
+        let asked = sent(&mut theirs);
+        assert!(
+            !asked.iter().any(|r| matches!(r, Request::SpawnTerminal(_))),
+            "a second shell must not be spawned: {asked:?}"
+        );
+        assert!(
+            asked.iter().any(|r| matches!(
+                r,
+                Request::AttachTerminal(a) if a.terminal == grove_proto::TerminalId(5)
+            )),
+            "it re-attaches to the one that exists: {asked:?}"
+        );
+    }
+
+    #[test]
+    fn esc_reaches_the_shell_rather_than_closing_it() {
+        // Acceptance, and §4.5's point: it is a pty, so `esc` belongs to the
+        // program inside. Leaving is `^g i` again.
+        let (mut s, mut theirs) = wired();
+        let mut ui = Ui::new();
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('i')), &mut s, &mut ui);
+        handle(
+            Input::Daemon(DaemonEvent::TerminalSpawned {
+                target: grove_proto::TerminalTarget::Scratch { cwd: None },
+                terminal: grove_proto::TerminalId(5),
+            }),
+            &mut s,
+            &mut ui,
+        );
+        let _ = sent(&mut theirs);
+
+        handle(key(KeyCode::Esc), &mut s, &mut ui);
+        assert_eq!(ui.screen, Screen::Shell, "esc must not close the overlay");
+        match sent(&mut theirs).as_slice() {
+            [Request::Input { bytes, .. }] => assert_eq!(bytes, &[0x1b]),
+            other => panic!("esc must reach the shell, got {other:?}"),
+        }
     }
 
     #[test]
