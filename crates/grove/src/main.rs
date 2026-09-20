@@ -515,7 +515,10 @@ fn workspace_of(state: &State) -> PathBuf {
 
 fn describe(ev: &DaemonEvent) -> String {
     match ev {
-        DaemonEvent::Welcome { version } => format!("connected, protocol v{version}"),
+        DaemonEvent::Welcome {
+            version,
+            ownership_movable,
+        } => format!("connected, protocol v{version}, movable {ownership_movable}"),
         DaemonEvent::Sessions(s) => format!("{} session(s)", s.len()),
         DaemonEvent::Failed { context, message } => format!("{context} failed: {message}"),
         other => format!("{other:?}"),
@@ -565,7 +568,11 @@ fn connect(workspace: &Path, inputs: &Inputs) -> State {
     let mut reader = read_half;
     match grove_proto::read_frame::<_, DaemonEvent>(&mut reader) {
         Ok(ev) => match accept_welcome(&ev) {
-            Handshake::Agreed => {
+            Handshake::Agreed {
+                ownership_movable: _,
+            } => {
+                // The capability reaches the pane in #20; the connection
+                // carries it and nothing here consumes it yet.
                 events::spawn_daemon_reader(reader, inputs.sender());
                 // The daemon answers questions; it does not volunteer the
                 // dash. Without these two the panes stay empty forever, which

@@ -197,7 +197,7 @@ pub fn connect_path(path: &Path) -> Result<UnixStream, LifecycleError> {
     )?;
     let event: Event = read_frame(&mut stream)?;
     match accept_welcome(&event) {
-        Handshake::Agreed => Ok(stream),
+        Handshake::Agreed { .. } => Ok(stream),
         Handshake::Mismatch { daemon, client } => {
             Err(LifecycleError::VersionMismatch { daemon, client })
         }
@@ -281,11 +281,22 @@ fn serve_client_with(
     stream.set_read_timeout(Some(IO_TIMEOUT))?;
     stream.set_write_timeout(Some(IO_TIMEOUT))?;
     let hello: Request = read_frame(&mut stream)?;
+    // The capability is a workspace fact, decided by the service the socket
+    // serves: when a session-scoped path template makes worktree location
+    // depend on the owning session, adopt and release are refused, and the
+    // client should withhold the affordance rather than offer a key that only
+    // fails (§2.4). The daemon's refusal stays; this is the affordance, not
+    // the enforcement.
+    let ownership_movable = service
+        .as_ref()
+        .and_then(|service| service.lock().ok().map(|s| s.ownership_movable()))
+        .unwrap_or(true);
     match accept_hello(&hello) {
-        Handshake::Agreed => write_frame(
+        Handshake::Agreed { .. } => write_frame(
             &mut stream,
             &Event::Welcome {
                 version: PROTOCOL_VERSION,
+                ownership_movable,
             },
         )?,
         Handshake::Mismatch { daemon, client } => {
@@ -573,7 +584,12 @@ mod tests {
         )
         .unwrap();
         let event: Event = read_frame(&mut client).unwrap();
-        assert_eq!(accept_welcome(&event), Handshake::Agreed);
+        assert_eq!(
+            accept_welcome(&event),
+            Handshake::Agreed {
+                ownership_movable: true
+            }
+        );
         drop(client);
         worker.join().unwrap();
     }
@@ -607,7 +623,18 @@ mod tests {
             },
         )
         .unwrap();
-        let _: Event = read_frame(&mut client).unwrap();
+        // The handshake carries the workspace capability: this service's
+        // store was built without a session-scoped template, so the pane may
+        // offer adopt and release.
+        let Event::Welcome {
+            version,
+            ownership_movable,
+        } = read_frame(&mut client).unwrap()
+        else {
+            panic!("expected Welcome")
+        };
+        assert_eq!(version, PROTOCOL_VERSION);
+        assert!(ownership_movable);
 
         // Spawn over the socket; the id comes back and the attach follows it.
         write_frame(

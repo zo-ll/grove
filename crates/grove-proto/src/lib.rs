@@ -77,7 +77,7 @@ use serde::{Deserialize, Serialize};
 /// order is irrelevant and *any* addition breaks an older peer. The failure is
 /// clean rather than silent: framing is length-delimited, so an unknown variant
 /// is a decode error on one frame and the stream stays aligned.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Largest frame the reader will accept, to bound memory on a hostile or
 /// confused peer. Terminal output is chunked well below this.
@@ -494,8 +494,17 @@ pub struct Screen {
 /// Daemon to client.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Event {
+    /// Greets a version-matched peer. `ownership_movable` carries a
+    /// workspace capability, not a row fact: when the workspace's
+    /// `worktree_path` template contains `{session}`, a worktree's location
+    /// depends on the session that made it, so adopt and release are
+    /// refused — and the client can withhold the affordance instead of
+    /// offering a key that only fails (§2.4). The daemon's own refusal
+    /// stays; the client's knowledge is an affordance, not the
+    /// enforcement.
     Welcome {
         version: u32,
+        ownership_movable: bool,
     },
     /// Sent instead of `Welcome` when the versions differ; the daemon closes
     /// the connection immediately afterwards. Carries both numbers so the
@@ -704,13 +713,13 @@ pub fn workspace_hash(path: &Path) -> String {
 /// Outcome of the opening handshake.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Handshake {
-    Agreed,
+    /// Versions match. `ownership_movable` carries the daemon's workspace
+    /// capability through the handshake, so a client knows before its first
+    /// request whether adopt and release can ever succeed.
+    Agreed { ownership_movable: bool },
     /// Versions differ. The caller reports which side is stale and stops; it
     /// does not attempt to speak the other version.
-    Mismatch {
-        daemon: u32,
-        client: u32,
-    },
+    Mismatch { daemon: u32, client: u32 },
     /// The peer sent something before greeting. Distinct from [`Self::Mismatch`]
     /// so the daemon can say "you did not greet me" rather than reporting a
     /// fabricated version 0, which is indistinguishable from a genuinely
@@ -725,8 +734,13 @@ pub enum Handshake {
 /// easy thing to do.
 pub fn accept_welcome(event: &Event) -> Handshake {
     match event {
-        Event::Welcome { version } if *version == PROTOCOL_VERSION => Handshake::Agreed,
-        Event::Welcome { version } => Handshake::Mismatch {
+        Event::Welcome {
+            version,
+            ownership_movable,
+        } if *version == PROTOCOL_VERSION => Handshake::Agreed {
+            ownership_movable: *ownership_movable,
+        },
+        Event::Welcome { version, .. } => Handshake::Mismatch {
             daemon: *version,
             client: PROTOCOL_VERSION,
         },
@@ -739,9 +753,15 @@ pub fn accept_welcome(event: &Event) -> Handshake {
 }
 
 /// Daemon side of the handshake: read the client's `Hello` and decide.
+///
+/// The workspace capability is not decided here — the caller carries it into
+/// the `Welcome` it writes — so a hello that matches names the agreement
+/// without pretending to know the workspace.
 pub fn accept_hello(request: &Request) -> Handshake {
     match request {
-        Request::Hello { version } if *version == PROTOCOL_VERSION => Handshake::Agreed,
+        Request::Hello { version } if *version == PROTOCOL_VERSION => Handshake::Agreed {
+            ownership_movable: true,
+        },
         Request::Hello { version } => Handshake::Mismatch {
             daemon: PROTOCOL_VERSION,
             client: *version,
@@ -966,6 +986,7 @@ mod tests {
         let all = [
             Event::Welcome {
                 version: PROTOCOL_VERSION,
+                ownership_movable: true,
             },
             Event::VersionMismatch {
                 daemon: 1,
@@ -1203,7 +1224,9 @@ mod tests {
             accept_hello(&Request::Hello {
                 version: PROTOCOL_VERSION
             }),
-            Handshake::Agreed
+            Handshake::Agreed {
+                ownership_movable: true
+            }
         );
         assert_eq!(
             accept_hello(&Request::Hello {

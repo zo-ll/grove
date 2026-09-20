@@ -148,6 +148,7 @@ mod tests {
             &mut buf,
             &DaemonEvent::Welcome {
                 version: PROTOCOL_VERSION,
+                ownership_movable: true,
             },
         )
         .unwrap();
