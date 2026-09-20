@@ -657,7 +657,12 @@ impl SessionOrchestrator {
                     (0, 0)
                 }
             };
-            let terminal = self.live_worktree_terminal(&repository.id, checkout.branch.as_deref());
+            // Asked of the terminal manager, which knows every live pty by
+            // its path, rather than of `self.live`, which knows only the ones
+            // a session owns. §2 hangs a terminal off a worktree, not off an
+            // owned worktree: `^g enter` on an unowned one spawned a shell
+            // that the dash then said did not exist.
+            let terminal = self.live_terminal_at(&checkout.path);
             let foreground =
                 terminal.and_then(|id| self.terminals.foreground_process(id).ok().flatten());
             let dirty_files = match grove_git::dirty_file_count(&checkout.path) {
@@ -1632,14 +1637,20 @@ impl SessionOrchestrator {
     }
 
     /// The live terminal of a checkout, whichever session runs it.
-    fn live_worktree_terminal(&self, repo: &RepoId, branch: Option<&str>) -> Option<TerminalId> {
-        let branch = branch?;
-        self.live.values().flatten().find_map(|terminal| {
-            (terminal.worktree.repo == *repo
-                && terminal.worktree.branch == branch
-                && self.terminals.is_alive(terminal.id).unwrap_or(false))
-            .then_some(terminal.id)
-        })
+    /// The live pty running in this checkout, whoever owns it.
+    ///
+    /// `self.live` is a session's bookkeeping — which terminals end when that
+    /// session ends — and it was standing in for "does this worktree have a
+    /// terminal". It cannot: a worktree no session owns can still have one,
+    /// which is most of them on a fresh dash. The manager is the authority on
+    /// what is running.
+    fn live_terminal_at(&self, path: &Path) -> Option<TerminalId> {
+        self.terminals
+            .list()
+            .into_iter()
+            .find_map(|(id, key, alive)| {
+                (alive && matches!(&key, TerminalKey::Worktree(at) if at == path)).then_some(id)
+            })
     }
 
     fn fire_observed_terminal_exits(&mut self) {
@@ -2389,6 +2400,104 @@ mod tests {
         assert_eq!(
             first, second,
             "rescanning an unchanged workspace must produce the same rows"
+        );
+    }
+
+    #[test]
+    fn a_terminal_on_an_unowned_worktree_is_reported_on_its_row() {
+        // §2 hangs a pty off a worktree, not off an *owned* worktree, and
+        // §3.3 binds `^g enter` to "the selected worktree" with no condition.
+        // The pty was spawned either way — the dash just went on saying "no
+        // terminal here — ^g enter opens one", because the lookup asked the
+        // session's own bookkeeping, which knows nothing about a worktree no
+        // session owns. Pressing the key again spawned another.
+        let temp = TempDir::new();
+        let clone = temp.0.join("repo");
+        let theirs_path = temp.0.join("theirs");
+        fs::create_dir_all(&clone).unwrap();
+        git(&clone, &["init", "-q", "-b", "main"]);
+        git(&clone, &["config", "user.name", "Grove Test"]);
+        git(&clone, &["config", "user.email", "grove@example.test"]);
+        fs::write(clone.join("tracked"), "base\n").unwrap();
+        git(&clone, &["add", "tracked"]);
+        git(&clone, &["commit", "-qm", "base"]);
+        git(
+            &clone,
+            &[
+                "worktree",
+                "add",
+                "-qb",
+                "theirs",
+                theirs_path.to_str().unwrap(),
+            ],
+        );
+
+        // A session that is a member of the repo but owns nothing in it —
+        // exactly what `add <repo>` leaves behind.
+        let template = temp.0.join("trees/{repo}/{branch_slug}");
+        let template = template.to_string_lossy().into_owned();
+        let mut store = Store::load_at(&temp.0.join("state"), &temp.0, &template);
+        store.create(sid("one"), "one".to_string()).unwrap();
+        store
+            .add_member(&sid("one"), RepoId("repo".into()))
+            .unwrap();
+        let repository = Repository {
+            id: RepoId("repo".into()),
+            name: "repo".into(),
+            path: clone.clone(),
+            base_branch: Some("main".into()),
+        };
+        let terminals = TerminalManager::new(PathBuf::from("/bin/sh"), temp.0.clone(), 200);
+        let fetch = FetchPolicy::new(2, Duration::from_secs(60));
+        let runtime = DaemonRuntime::load_source("", "unowned-terminal").runtime;
+        let mut daemon = SessionOrchestrator::new(
+            store,
+            vec![repository],
+            temp.0.clone(),
+            terminals,
+            fetch,
+            runtime,
+        );
+
+        let events = daemon.handle_request(Request::SpawnTerminal(TerminalTarget::Worktree(
+            WorktreeRef {
+                repo: RepoId("repo".into()),
+                branch: "theirs".into(),
+            },
+        )));
+        let Some(Event::TerminalSpawned { terminal, .. }) = events.first() else {
+            panic!("expected TerminalSpawned, got {events:?}")
+        };
+        let spawned = *terminal;
+
+        let events = daemon.handle_request(Request::ListWorktrees(RepoId("repo".into())));
+        let Some(Event::Worktrees { rows, .. }) = events.first() else {
+            panic!("expected Worktrees, got {events:?}")
+        };
+        let row = rows
+            .iter()
+            .find(|row| row.worktree.branch == "theirs")
+            .expect("the unowned worktree is still listed");
+        assert_eq!(
+            row.terminal,
+            Some(spawned),
+            "the row must carry the terminal that is running in it"
+        );
+
+        // And the key does not spawn a second shell into the same checkout,
+        // which is what "no terminal here" invited.
+        let again = daemon.handle_request(Request::SpawnTerminal(TerminalTarget::Worktree(
+            WorktreeRef {
+                repo: RepoId("repo".into()),
+                branch: "theirs".into(),
+            },
+        )));
+        assert!(
+            again.iter().any(|event| matches!(
+                event,
+                Event::Failed { message, .. } if message.contains("already exists")
+            )),
+            "a second spawn must be refused: {again:?}"
         );
     }
 
