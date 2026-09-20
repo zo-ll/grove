@@ -3,6 +3,14 @@
 A terminal UI for managing git worktrees across many repos, with a terminal attached to
 each worktree.
 
+```sh
+curl -fsSL https://raw.githubusercontent.com/zo-ll/grove/main/scripts/install.sh | bash
+```
+
+That builds from source into `~/.local/bin`, so you need [Rust](https://rustup.rs)
+1.88+ and git. Add `-s -- --sample-config` for a starter config, and see
+[Install](#install) for the rest.
+
 ```
 ┌─ REPOS ────────┬─ WORKTREES ────────────────┬─ billing-service · feat/ABC-4471 ─┐
 │ ● billing-svc 2│ ▣ feat/ABC-4471   ↑4 ↓2  2h│ $ pnpm test billing/invoice       │
@@ -22,13 +30,25 @@ each worktree.
 
 ## Install
 
+The one-liner above clones grove to `~/.cache/grove/src`, builds it and installs
+both binaries. From a checkout, the same script skips the clone:
+
 ```sh
 scripts/install.sh                 # builds release, installs to ~/.local/bin
 scripts/install.sh --sample-config # and writes a starter config.lua
 ```
 
-`--prefix DIR` installs elsewhere, `--debug` skips optimisation for a faster
-loop, and `--uninstall` removes the binaries while leaving your config alone.
+Either form takes the same options. `--prefix DIR` installs elsewhere, `--debug`
+skips optimisation for a faster loop, and `--uninstall` removes the binaries
+while leaving your config alone. Piped through `bash`, options go after `-s --`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/zo-ll/grove/main/scripts/install.sh \
+  | bash -s -- --prefix /usr/local/bin
+```
+
+`GROVE_REF` builds a branch other than `main` and `GROVE_SRC` moves the checkout
+it keeps.
 
 grove is **two programs**. `groved` owns the ptys and outlives the terminal;
 `grove` is the TUI that attaches to it. Start the daemon on a directory that
