@@ -384,16 +384,29 @@ impl Palette {
     /// verb carries the live count for the same reason §5's does: `enter
     /// create 3` is a promise, not a guess.
     pub fn footer(&self) -> Vec<crate::statusbar::Hint> {
-        let arguing = matches!(self.mode, Mode::Arguing { .. });
         let mut hints = crate::statusbar::hints(crate::keymap::Screen::Palette);
-        hints.retain(|hint| arguing || hint.label != "toggle");
+        // `space` is only ever a toggle while there is something to tick:
+        // nothing on the command list, where it types a space, and nothing on
+        // a command that takes a name.
+        let picking = matches!(
+            &self.mode,
+            Mode::Arguing { command, .. } if picker_for(&command.name).is_some()
+        );
+        hints.retain(|hint| picking || hint.label != "toggle");
         if let Mode::Arguing {
             command, select, ..
         } = &self.mode
         {
             for hint in &mut hints {
                 if hint.label == "run" {
-                    hint.label = format!("{} {}", command.name, select.count());
+                    // The count is a promise about how many things the key
+                    // will act on, so it belongs to the commands that act on
+                    // a number of them. `enter session new 0` promised
+                    // nothing about a session with a name.
+                    hint.label = match picker_for(&command.name) {
+                        Some(_) => format!("{} {}", command.name, select.count()),
+                        None => command.name.clone(),
+                    };
                 }
             }
         }
@@ -405,7 +418,16 @@ impl Palette {
         let rows = match &self.mode {
             // The argument view spends two lines on the base branch and the
             // rule under it before the repositories start.
-            Mode::Arguing { select, .. } => select.rows().len() + 3,
+            Mode::Arguing {
+                command, select, ..
+            } => match picker_for(&command.name) {
+                // `new` spends two lines on the base branch and the rule
+                // under it before the repositories start.
+                Some(_) if command.name == "new" => select.rows().len() + 2,
+                Some(_) => select.rows().len().max(1),
+                // A typed argument is one line saying what to type.
+                None => 1,
+            },
             _ => self.matches().len().max(1),
         };
         u16::try_from(rows).unwrap_or(u16::MAX)
@@ -430,16 +452,42 @@ impl Palette {
             };
             crate::overlay::header("❯", &typed, "", header.width, theme).render(header, buf);
 
-            let mut lines = vec![
-                Line::from(vec![
+            // A command that takes a name takes a name: no repositories to
+            // tick, no base branch, and no count on the verb. `session new`
+            // used to draw the repo picker, announce "no repos to choose
+            // from", and offer `enter session new 0` — three lies about one
+            // command, on the screen a first run is now sent to first.
+            if picker_for(&command.name).is_none() {
+                let Takes::Argument(what) = command.takes else {
+                    return;
+                };
+                Paragraph::new(Line::styled(
+                    format!(
+                        "type a {} and press enter",
+                        what.trim_matches(['<', '>', '[', ']', '…'])
+                    ),
+                    theme.ink_style(Ink::Faint),
+                ))
+                .render(body, buf);
+                return;
+            }
+
+            let mut lines = Vec::new();
+            // The base is `new`'s alone: it is the branch the worktrees are
+            // cut from, and nothing else here cuts one.
+            if command.name == "new" {
+                lines.push(Line::from(vec![
                     Span::styled(
                         format!("{:<24}", "base: origin/main"),
                         theme.ink_style(Ink::Subtext),
                     ),
                     Span::styled("from origin/HEAD", theme.ink_style(Ink::Faint)),
-                ]),
-                Line::styled("─".repeat(body.width as usize), theme.ink_style(Ink::Frame)),
-            ];
+                ]));
+                lines.push(Line::styled(
+                    "─".repeat(body.width as usize),
+                    theme.ink_style(Ink::Frame),
+                ));
+            }
             if select.is_empty() {
                 lines.push(Line::styled(
                     "no repos to choose from",
@@ -766,6 +814,64 @@ mod tests {
         let mut palette = Palette::default();
         palette.argue(chosen, repos);
         palette
+    }
+
+    #[test]
+    fn a_command_that_takes_a_name_does_not_draw_a_repo_picker() {
+        // `session new` asks for a name. It used to draw the repo picker, say
+        // "no repos to choose from", show a base branch it does not have, and
+        // offer `enter session new 0` — three untruths about one command, on
+        // the screen a first run is sent to first.
+        let palette = arguing("session new", &[repo("a", true), repo("b", false)]);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 12,
+        };
+        let mut buf = Buffer::empty(area);
+        palette.render(&mut buf, crate::overlay::Parts::of(area), &theme());
+        let painted: String = (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !painted.contains("no repos to choose from"),
+            "it is not choosing repos: {painted}"
+        );
+        assert!(
+            !painted.contains("base:"),
+            "and it cuts no branch: {painted}"
+        );
+        assert!(painted.contains("type a name"), "{painted}");
+
+        let verb = palette
+            .footer()
+            .into_iter()
+            .find(|hint| hint.keys == "enter")
+            .expect("enter is bound");
+        assert_eq!(verb.label, "session new", "no count on a name");
+        assert!(
+            !palette.footer().iter().any(|hint| hint.label == "toggle"),
+            "and nothing to toggle"
+        );
+    }
+
+    #[test]
+    fn a_command_that_picks_repos_still_does() {
+        // The other half of the same rule, so the fix cannot be "draw nothing".
+        let palette = arguing("add", &[repo("a", false), repo("b", false)]);
+        let verb = palette
+            .footer()
+            .into_iter()
+            .find(|hint| hint.keys == "enter")
+            .expect("enter is bound");
+        assert_eq!(verb.label, "add 0");
+        assert!(palette.footer().iter().any(|hint| hint.label == "toggle"));
     }
 
     #[test]
