@@ -195,6 +195,19 @@ pub fn label_of(binding: &Binding) -> String {
 /// Derived rather than written out, so guidance cannot name a key that has
 /// moved: a user who presses what the screen told them and gets nothing now
 /// distrusts everything else on it.
+/// What a chord already does, if anything, across every screen's table.
+///
+/// Used to report a user keymap taking a key grove uses. Asking every table
+/// rather than one screen's is deliberate: a config binds a key everywhere,
+/// so a collision anywhere is a collision the user should hear about.
+pub fn what_uses(prefixed: bool, key: KeyCode) -> Option<&'static str> {
+    [GLOBAL, DASH, PALETTE, PICKER, PRUNE, DIFF, SHELL, END]
+        .into_iter()
+        .flatten()
+        .find(|binding| binding.prefixed == prefixed && binding.key == key)
+        .map(|binding| binding.label)
+}
+
 pub fn key_label(action: Action) -> String {
     let binding = GLOBAL
         .iter()
