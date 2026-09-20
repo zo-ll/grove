@@ -10,6 +10,7 @@
 //! into. Screens themselves are #18 through #30.
 
 mod dash;
+mod empty;
 mod events;
 mod keymap;
 mod repos;
@@ -803,18 +804,37 @@ fn draw(f: &mut ratatui::Frame, state: &State, ui: &Ui) {
     // are not screens and #22's empty state is about a workspace with nothing
     // in it, not about a daemon grove cannot reach.
     if matches!(state, State::Connected { .. }) && ui.screen == Screen::Dash {
-        let inner = dash::render(f.buffer_mut(), body_area, ui.panes, ui.focus, &ui.theme);
+        let empty = empty::Empty::of(ui.repos.workspace_count(), ui.repos.member_count());
+        // §4.1's empty state draws two panes, not three: nothing is selected,
+        // so there is no terminal to show, and the guidance needs the width
+        // more than an empty box does. The user's own toggles are untouched —
+        // this is what is drawn, not what they asked for.
+        let panes = match empty {
+            Some(_) => ui.panes.for_guidance(),
+            None => ui.panes,
+        };
+        let inner = dash::render(f.buffer_mut(), body_area, panes, ui.focus, &ui.theme);
         if let Some(area) = inner.repos {
             ui.repos
                 .render(f.buffer_mut(), area, &ui.theme, ui.focus == Focus::Repos);
         }
         if let Some(area) = inner.worktrees {
-            ui.worktrees.render(
-                f.buffer_mut(),
-                area,
-                &ui.theme,
-                ui.focus == Focus::Worktrees,
-            );
+            // A dash with nothing in it re-homes §4.1's numbered guidance
+            // here, rather than rendering three blank boxes and leaving the
+            // user to guess which key starts anything.
+            match empty {
+                Some(state) => {
+                    f.render_widget(Paragraph::new(state.lines(&ui.theme)), area);
+                }
+                None => {
+                    ui.worktrees.render(
+                        f.buffer_mut(),
+                        area,
+                        &ui.theme,
+                        ui.focus == Focus::Worktrees,
+                    );
+                }
+            }
         }
         if let Some(area) = inner.terminal {
             let has_terminal = ui
@@ -1777,6 +1797,118 @@ mod tests {
             asked.contains(&Request::ListWorktrees(grove_domain::RepoId("repo".into()))),
             "the row still says it has no terminal, which is the daemon's to correct: {asked:?}"
         );
+    }
+
+    /// What the dash paints, row by row, at a given size.
+    fn painted_dash(state: &State, ui: &Ui, width: u16, height: u16) -> Vec<String> {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+                .expect("a test terminal");
+        terminal
+            .draw(|f| draw(f, state, ui))
+            .expect("the dash draws");
+        let buffer = terminal.backend().buffer().clone();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_empty_workspace_draws_guidance_rather_than_blank_boxes() {
+        // Acceptance: both empty cases produce copy, and the keys shown are
+        // live from that state.
+        let mut s = connected();
+        let mut ui = Ui::new();
+        handle(Input::Daemon(DaemonEvent::Repos(vec![])), &mut s, &mut ui);
+
+        let screen = painted_dash(&s, &ui, 100, 20).join("\n");
+        assert!(screen.contains("grove is empty"), "{screen}");
+        assert!(screen.contains("scan"), "{screen}");
+        assert!(
+            screen.contains(&keymap::key_label(Action::OpenPalette)),
+            "the key must be the one the keymap binds: {screen}"
+        );
+        assert!(screen.contains("no repos found"), "{screen}");
+        // At 80 columns the guidance only fits because the empty state drops
+        // the terminal pane; three panes clip it mid-sentence.
+        assert!(
+            screen.contains("point grove at your clones"),
+            "the guidance must not be cut off: {screen}"
+        );
+    }
+
+    #[test]
+    fn a_workspace_with_repos_but_no_members_gets_different_copy() {
+        // Telling this user to scan sends them looking for a fault that is
+        // not there — the repos are already found.
+        let mut s = connected();
+        let mut ui = Ui::new();
+        let mut outsider = repo_row("elsewhere", 3);
+        outsider.member = false;
+        handle(
+            Input::Daemon(DaemonEvent::Repos(vec![outsider])),
+            &mut s,
+            &mut ui,
+        );
+
+        let screen = painted_dash(&s, &ui, 100, 20).join("\n");
+        assert!(screen.contains("this session has no repos"), "{screen}");
+        assert!(screen.contains("add <repo>"), "{screen}");
+        assert!(
+            !screen.contains("point grove at your clones"),
+            "step one is behind this user: {screen}"
+        );
+    }
+
+    #[test]
+    fn the_empty_dash_still_draws_after_two_legal_hides() {
+        // End to end through the keys, because the bug was in what the draw
+        // path derived rather than in what the toggles allowed: both presses
+        // are legal — the terminal stays visible — and the empty state hid it,
+        // leaving a screen with nothing on it.
+        let mut s = connected();
+        let mut ui = Ui::new();
+        handle(Input::Daemon(DaemonEvent::Repos(vec![])), &mut s, &mut ui);
+
+        for pane in ['1', '2'] {
+            handle(prefix(), &mut s, &mut ui);
+            handle(key(KeyCode::Char(pane)), &mut s, &mut ui);
+        }
+
+        let screen = painted_dash(&s, &ui, 100, 20).join("\n");
+        assert!(
+            screen.contains("grove is empty"),
+            "the guidance is the only thing left to read here: {screen}"
+        );
+    }
+
+    #[test]
+    fn the_dash_stops_being_empty_the_moment_a_member_arrives() {
+        // Acceptance: the transition to the populated dash. The guidance has
+        // to go in the same frame the rows arrive, or it lingers over them.
+        let mut s = connected();
+        let mut ui = Ui::new();
+        handle(Input::Daemon(DaemonEvent::Repos(vec![])), &mut s, &mut ui);
+        assert!(
+            painted_dash(&s, &ui, 100, 20)
+                .join("\n")
+                .contains("grove is empty")
+        );
+
+        handle(
+            Input::Daemon(DaemonEvent::Repos(vec![repo_row("now-a-member", 1)])),
+            &mut s,
+            &mut ui,
+        );
+        let screen = painted_dash(&s, &ui, 100, 20).join("\n");
+        assert!(!screen.contains("grove is empty"), "{screen}");
+        assert!(screen.contains("now-a-member"), "{screen}");
     }
 
     #[test]
