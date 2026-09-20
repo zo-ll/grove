@@ -10,6 +10,7 @@
 //! into. Screens themselves are #18 through #30.
 
 mod dash;
+mod diff;
 mod empty;
 mod endsession;
 mod events;
@@ -33,6 +34,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use dash::Panes;
+use diff::Diff;
 use endsession::EndSession;
 use events::{Input, Inputs};
 use grove_lua::{TuiConfig, TuiRuntime};
@@ -80,6 +82,8 @@ struct Ui {
     prune: Prune,
     /// Stored sessions, for the picker.
     sessions: Sessions,
+    /// The diff screen, while it is open.
+    diff: Diff,
     /// The help overlay's scroll, while it is open, and the screen it is
     /// explaining — kept so closing it returns you where you were.
     help: Help,
@@ -197,6 +201,7 @@ impl Ui {
             palette: Palette::default(),
             prune: Prune::default(),
             sessions: Sessions::default(),
+            diff: Diff::default(),
             help: Help::default(),
             helping: None,
             scratch: None,
@@ -632,6 +637,27 @@ fn follow_selection(state: &mut State, ui: &mut Ui) {
     }
 }
 
+/// Ask the daemon for one file's patch, after the diff cursor moved.
+///
+/// `None` means the cursor did not move, so there is nothing to fetch and no
+/// frame to spend.
+fn ask_for_file(file: Option<String>, state: &mut State, ui: &mut Ui) -> Flow {
+    let Some(file) = file else {
+        return Flow::Continue { redraw: false };
+    };
+    let Some(worktree) = ui.worktrees.selected().map(|row| row.worktree.clone()) else {
+        return Flow::Continue { redraw: true };
+    };
+    let request = Request::DiffWorktree {
+        worktree,
+        file: Some(file),
+    };
+    if let Err(e) = send(state, &request) {
+        ui.note = Some(format!("could not reach the daemon: {e}"));
+    }
+    Flow::Continue { redraw: true }
+}
+
 /// Ask for the selected repo's worktrees.
 ///
 /// Called whenever the selection changes, because the daemon sends worktrees
@@ -845,6 +871,41 @@ fn handle(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
                         redraw: ui.help.scroll(3, total, room),
                     }
                 }
+                Routed::Act(Action::OpenDiff) => {
+                    // The selected worktree's, against its base. Nothing is
+                    // shown until the daemon answers: an empty diff that fills
+                    // in looks like a clean tree.
+                    match ui.worktrees.selected().map(|row| row.worktree.clone()) {
+                        Some(worktree) => {
+                            let request = Request::DiffWorktree {
+                                worktree,
+                                file: None,
+                            };
+                            if let Err(e) = send(state, &request) {
+                                ui.note = Some(format!("could not reach the daemon: {e}"));
+                            }
+                            ui.screen = Screen::Diff;
+                        }
+                        None => ui.note = Some("no worktree selected".into()),
+                    }
+                    Flow::Continue { redraw: true }
+                }
+                Routed::Act(Action::Cancel) if ui.screen == Screen::Diff => {
+                    ui.screen = Screen::Dash;
+                    Flow::Continue { redraw: true }
+                }
+                Routed::Act(Action::MoveDown) if ui.screen == Screen::Diff => {
+                    ask_for_file(ui.diff.move_down(), state, ui)
+                }
+                Routed::Act(Action::MoveUp) if ui.screen == Screen::Diff => {
+                    ask_for_file(ui.diff.move_up(), state, ui)
+                }
+                Routed::Act(Action::ScrollDown) if ui.screen == Screen::Diff => Flow::Continue {
+                    redraw: ui.diff.scroll(3, usize::from(ui.height).max(1)),
+                },
+                Routed::Act(Action::ScrollUp) if ui.screen == Screen::Diff => Flow::Continue {
+                    redraw: ui.diff.scroll(-3, usize::from(ui.height).max(1)),
+                },
                 Routed::Act(Action::OpenShell) => {
                     if ui.screen == Screen::Shell {
                         // `^g i` is the way out as well as the way in: `esc`
@@ -1232,6 +1293,28 @@ fn handle(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
             Flow::Continue { redraw: true }
         }
 
+        Input::Daemon(DaemonEvent::Diff {
+            worktree,
+            base,
+            files,
+            selected,
+            hunks,
+            added,
+            removed,
+        }) => {
+            ui.diff.set(diff::Incoming {
+                repo: worktree.repo.0.clone(),
+                branch: worktree.branch.clone(),
+                base,
+                files,
+                selected,
+                hunks,
+                added,
+                removed,
+            });
+            Flow::Continue { redraw: true }
+        }
+
         Input::Daemon(DaemonEvent::Repos(rows)) => {
             ui.repos.set(rows);
             // The WORKTREES pane follows this selection, and the daemon sends
@@ -1456,6 +1539,12 @@ fn draw(f: &mut ratatui::Frame, state: &State, ui: &Ui) {
             ui.terminals
                 .render(f.buffer_mut(), area, &ui.theme, has_terminal);
         }
+        status_bar(f, bar_area, ui);
+        return;
+    }
+
+    if matches!(state, State::Connected { .. }) && ui.screen == Screen::Diff {
+        ui.diff.render(f.buffer_mut(), body_area, &ui.theme);
         status_bar(f, bar_area, ui);
         return;
     }
@@ -3181,6 +3270,92 @@ mod tests {
         handle(key(KeyCode::Down), &mut s, &mut ui);
         let scrolled = painted_dash(&s, &ui, 90, 8).join("\n");
         assert_ne!(top, scrolled, "^g ↓ must move the help");
+    }
+
+    #[test]
+    fn the_diff_asks_for_the_selected_worktree_then_one_file_at_a_time() {
+        // §4.4: hunks come per file, so opening the screen does not pay for
+        // every file's patch — and moving the cursor is what asks for the
+        // next one.
+        let (mut s, mut theirs) = wired();
+        let mut ui = Ui::new();
+        handle(
+            Input::Daemon(DaemonEvent::Repos(vec![repo_row("repo", 1)])),
+            &mut s,
+            &mut ui,
+        );
+        handle(
+            Input::Daemon(DaemonEvent::Worktrees {
+                repo: grove_domain::RepoId("repo".into()),
+                rows: vec![worktree_row("feat/x", grove_domain::Ownership::Ours)],
+            }),
+            &mut s,
+            &mut ui,
+        );
+        let _ = sent(&mut theirs);
+
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('d')), &mut s, &mut ui);
+        assert_eq!(ui.screen, Screen::Diff);
+        match sent(&mut theirs).as_slice() {
+            [Request::DiffWorktree { file, .. }] => {
+                assert!(file.is_none(), "the whole list first, no file named");
+            }
+            other => panic!("expected a diff request, got {other:?}"),
+        }
+
+        handle(
+            Input::Daemon(DaemonEvent::Diff {
+                worktree: grove_proto::WorktreeRef {
+                    repo: grove_domain::RepoId("repo".into()),
+                    branch: "feat/x".into(),
+                },
+                base: "origin/main".into(),
+                files: vec![
+                    grove_proto::DiffFile {
+                        path: "a.ts".into(),
+                        status: 'M',
+                        added: 1,
+                        removed: 0,
+                    },
+                    grove_proto::DiffFile {
+                        path: "b.ts".into(),
+                        status: 'A',
+                        added: 2,
+                        removed: 0,
+                    },
+                ],
+                selected: Some("a.ts".into()),
+                hunks: vec![grove_proto::DiffLine::Added("one".into())],
+                added: 3,
+                removed: 0,
+            }),
+            &mut s,
+            &mut ui,
+        );
+        let _ = sent(&mut theirs);
+
+        handle(key(KeyCode::Down), &mut s, &mut ui);
+        match sent(&mut theirs).as_slice() {
+            [Request::DiffWorktree { file, .. }] => {
+                assert_eq!(
+                    file.as_deref(),
+                    Some("b.ts"),
+                    "the file now under the cursor"
+                );
+            }
+            other => panic!("moving the cursor must ask for that file, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_diff_needs_a_worktree_and_says_so() {
+        let (mut s, mut theirs) = wired();
+        let mut ui = Ui::new();
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('d')), &mut s, &mut ui);
+        assert!(ui.note.is_some(), "it says why nothing opened");
+        assert!(sent(&mut theirs).is_empty());
     }
 
     #[test]
