@@ -107,6 +107,20 @@ impl Pty {
     }
 }
 
+impl Pty {
+    /// Stop waiting for a join that cannot happen.
+    ///
+    /// The parser already holds the snapshot and every live byte since, so the
+    /// pane keeps drawing correctly; what is lost is the history from before
+    /// the attach, which a gap has made unorderable anyway.
+    fn abandon_backfill(&mut self) {
+        self.joined = true;
+        self.backfill = Vec::new();
+        self.snapshot = None;
+        self.live = Vec::new();
+    }
+}
+
 /// How much history grove keeps per terminal.
 const SCROLLBACK_LINES: usize = 10_000;
 
@@ -196,7 +210,17 @@ impl Terminals {
         let Some(pty) = self.ptys.get_mut(&terminal) else {
             return;
         };
-        if pty.joined || seq != pty.next_seq {
+        if pty.joined {
+            return;
+        }
+        if seq != pty.next_seq {
+            // A gap. The join can never happen now, so everything staged for
+            // it is waste — and `live` would go on growing for as long as the
+            // terminal produces output, which on a nonconforming daemon is
+            // forever. Give up the history rather than the memory: the grid is
+            // already correct, it just cannot be scrolled back past the
+            // attach.
+            pty.abandon_backfill();
             return;
         }
         pty.backfill.extend(lines.iter().cloned());
@@ -738,6 +762,35 @@ mod tests {
         assert!(
             !history.iter().any(|line| line.contains("skipped ahead")),
             "a chunk after a gap must not reach the grid: {history:?}"
+        );
+    }
+
+    #[test]
+    fn a_gap_stops_the_staging_rather_than_waiting_forever() {
+        // A daemon that skips a chunk leaves the join unreachable, and the
+        // live buffer staged for it would grow for as long as the terminal
+        // produces output. The grid stays correct; only the history from
+        // before the attach is lost, which the gap had already made
+        // unorderable.
+        let mut terminals = Terminals::default();
+        terminals.show(Some(id(1)), 4, 20);
+        terminals.screen(id(1), &screen_of(4, 20, "grid"));
+        terminals.scrollback(id(1), 0, &["first".into()], false);
+        terminals.scrollback(id(1), 2, &["after a gap".into()], false);
+
+        terminals.output(id(1), b" more");
+        let pty = terminals.ptys.get(&id(1)).expect("a pty");
+        assert!(pty.joined, "there is nothing left to wait for");
+        assert!(
+            pty.live.is_empty(),
+            "nothing may accumulate for a join that cannot happen"
+        );
+        assert!(pty.backfill.is_empty());
+        assert!(pty.snapshot.is_none());
+        assert!(
+            grid(&terminals, id(1)).contains("grid more"),
+            "the pane still draws: {:?}",
+            grid(&terminals, id(1))
         );
     }
 
