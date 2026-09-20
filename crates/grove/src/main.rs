@@ -13,6 +13,7 @@ mod dash;
 mod empty;
 mod endsession;
 mod events;
+mod help;
 mod keymap;
 mod palette;
 mod prune;
@@ -38,6 +39,7 @@ use grove_lua::{TuiConfig, TuiRuntime};
 use grove_proto::{
     Event as DaemonEvent, Handshake, PROTOCOL_VERSION, Request, accept_welcome, socket_path,
 };
+use help::Help;
 use keymap::{Action, Focus, Routed, Router, Screen};
 use palette::{Palette, Takes};
 use prune::Prune;
@@ -78,6 +80,10 @@ struct Ui {
     prune: Prune,
     /// Stored sessions, for the picker.
     sessions: Sessions,
+    /// The help overlay's scroll, while it is open, and the screen it is
+    /// explaining — kept so closing it returns you where you were.
+    help: Help,
+    helping: Option<Screen>,
     /// The scratch shell's pty, once one exists. Kept so `^g i` re-attaches
     /// rather than spawning a second shell every time it is pressed.
     scratch: Option<grove_proto::TerminalId>,
@@ -136,6 +142,15 @@ impl Ui {
         }
     }
 
+    /// How many lines the help has and how many fit, for the scroll.
+    fn help_extent(&self) -> (usize, usize) {
+        let screen = self.helping.unwrap_or(self.screen);
+        (
+            help::Help::lines(screen, &self.theme).len(),
+            usize::from(self.height.saturating_sub(1)).max(1),
+        )
+    }
+
     /// Record the terminal pane's size while it is on screen, for the times
     /// it is not.
     fn remember_pane_size(&mut self) {
@@ -182,6 +197,8 @@ impl Ui {
             palette: Palette::default(),
             prune: Prune::default(),
             sessions: Sessions::default(),
+            help: Help::default(),
+            helping: None,
             scratch: None,
             ending: EndSession::default(),
             conflict: None,
@@ -719,12 +736,23 @@ fn handle(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
                 }
                 // grove's own scrolling, prefixed because the pty has the
                 // unprefixed arrows.
-                Routed::Act(Action::ScrollUp) if ui.screen == Screen::Dash => Flow::Continue {
-                    redraw: ui.terminals.scroll(terminals::SCROLL_STEP),
-                },
-                Routed::Act(Action::ScrollDown) if ui.screen == Screen::Dash => Flow::Continue {
-                    redraw: ui.terminals.scroll(-terminals::SCROLL_STEP),
-                },
+                // Help is drawn over whatever screen is underneath, so it
+                // takes the scroll keys while it is open — the pane behind is
+                // not the thing being read.
+                Routed::Act(Action::ScrollUp)
+                    if ui.screen == Screen::Dash && ui.helping.is_none() =>
+                {
+                    Flow::Continue {
+                        redraw: ui.terminals.scroll(terminals::SCROLL_STEP),
+                    }
+                }
+                Routed::Act(Action::ScrollDown)
+                    if ui.screen == Screen::Dash && ui.helping.is_none() =>
+                {
+                    Flow::Continue {
+                        redraw: ui.terminals.scroll(-terminals::SCROLL_STEP),
+                    }
+                }
                 Routed::Act(Action::SpawnTerminal) if ui.screen == Screen::Dash => {
                     let target = ui
                         .worktrees
@@ -791,6 +819,31 @@ fn handle(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
                     ui.ending.cancel();
                     ui.screen = Screen::Dash;
                     Flow::Continue { redraw: true }
+                }
+                Routed::Act(Action::Help) => {
+                    // It explains the screen you were on, not itself, and
+                    // returns you there — `^g ?` is a glance, not a
+                    // destination.
+                    match ui.helping.take() {
+                        Some(previous) => ui.screen = previous,
+                        None => {
+                            ui.helping = Some(ui.screen);
+                            ui.help.open();
+                        }
+                    }
+                    Flow::Continue { redraw: true }
+                }
+                Routed::Act(Action::ScrollUp) if ui.helping.is_some() => {
+                    let (total, room) = ui.help_extent();
+                    Flow::Continue {
+                        redraw: ui.help.scroll(-3, total, room),
+                    }
+                }
+                Routed::Act(Action::ScrollDown) if ui.helping.is_some() => {
+                    let (total, room) = ui.help_extent();
+                    Flow::Continue {
+                        redraw: ui.help.scroll(3, total, room),
+                    }
                 }
                 Routed::Act(Action::OpenShell) => {
                     if ui.screen == Screen::Shell {
@@ -1345,6 +1398,17 @@ fn draw(f: &mut ratatui::Frame, state: &State, ui: &Ui) {
         .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(f.area());
     let (body_area, bar_area) = (chunks[0], chunks[1]);
+
+    // Help comes before every screen's own branch: it explains whichever one
+    // is underneath, so it has to win the draw whatever that screen is.
+    if let Some(explaining) = ui.helping
+        && matches!(state, State::Connected { .. })
+    {
+        ui.help
+            .render(f.buffer_mut(), body_area, explaining, &ui.theme);
+        status_bar(f, bar_area, ui);
+        return;
+    }
 
     // The dash is a frame of panes rather than a paragraph, so it takes the
     // body whole. Everything the shell says about its own state — no daemon,
@@ -3078,6 +3142,45 @@ mod tests {
             1,
             "only the one this session owns"
         );
+    }
+
+    #[test]
+    fn help_explains_the_screen_you_were_on_and_gives_it_back() {
+        // `^g ?` is a glance, not a destination — and it must describe the
+        // palette when opened from the palette, not itself.
+        let (mut s, mut theirs) = wired();
+        let mut ui = Ui::new();
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('/')), &mut s, &mut ui);
+        assert_eq!(ui.screen, Screen::Palette);
+
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('?')), &mut s, &mut ui);
+        assert_eq!(ui.helping, Some(Screen::Palette));
+        let screen = painted_dash(&s, &ui, 90, 18).join("\n");
+        assert!(screen.contains("keys · palette"), "{screen}");
+        assert!(screen.contains("keys reach it directly"), "{screen}");
+
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('?')), &mut s, &mut ui);
+        assert!(ui.helping.is_none());
+        assert_eq!(ui.screen, Screen::Palette, "back where it came from");
+        assert!(sent(&mut theirs).is_empty(), "help sends nothing");
+    }
+
+    #[test]
+    fn help_scrolls_when_the_terminal_is_short() {
+        let mut s = connected();
+        let mut ui = Ui::new();
+        handle(Input::Terminal(TermEvent::Resize(90, 8)), &mut s, &mut ui);
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('?')), &mut s, &mut ui);
+
+        let top = painted_dash(&s, &ui, 90, 8).join("\n");
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Down), &mut s, &mut ui);
+        let scrolled = painted_dash(&s, &ui, 90, 8).join("\n");
+        assert_ne!(top, scrolled, "^g ↓ must move the help");
     }
 
     #[test]
