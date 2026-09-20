@@ -723,6 +723,7 @@ mod tests {
         ("prune.rs", include_str!("prune.rs")),
         ("repos.rs", include_str!("repos.rs")),
         ("select.rs", include_str!("select.rs")),
+        ("sessions.rs", include_str!("sessions.rs")),
         ("statusbar.rs", include_str!("statusbar.rs")),
         ("terminal.rs", include_str!("terminal.rs")),
         ("terminals.rs", include_str!("terminals.rs")),
