@@ -17,6 +17,7 @@ mod endsession;
 mod events;
 mod help;
 mod keymap;
+mod overlay;
 mod palette;
 mod prune;
 mod repos;
@@ -1884,56 +1885,7 @@ fn draw(f: &mut ratatui::Frame, state: &State, ui: &Ui) {
     // are not screens and #22's empty state is about a workspace with nothing
     // in it, not about a daemon grove cannot reach.
     if matches!(state, State::Connected { .. }) && ui.screen == Screen::Dash {
-        let empty = empty::Empty::of(ui.repos.workspace_count(), ui.repos.member_count());
-        // §4.1's empty state draws two panes, not three: nothing is selected,
-        // so there is no terminal to show, and the guidance needs the width
-        // more than an empty box does. The user's own toggles are untouched —
-        // this is what is drawn, not what they asked for.
-        let panes = match empty {
-            Some(_) => ui.panes.for_guidance(),
-            None => ui.panes,
-        };
-        let selection = ui.selection();
-        let inner = dash::render(
-            f.buffer_mut(),
-            body_area,
-            panes,
-            ui.focus,
-            &ui.theme,
-            &selection,
-        );
-        if let Some(area) = inner.repos {
-            ui.repos
-                .render(f.buffer_mut(), area, &ui.theme, ui.focus == Focus::Repos);
-        }
-        if let Some(area) = inner.worktrees {
-            // A dash with nothing in it re-homes §4.1's numbered guidance
-            // here, rather than rendering three blank boxes and leaving the
-            // user to guess which key starts anything.
-            match empty {
-                Some(state) => {
-                    f.render_widget(Paragraph::new(state.lines(&ui.theme)), area);
-                }
-                None => {
-                    let user = ui.columns.live();
-                    ui.worktrees.render(
-                        f.buffer_mut(),
-                        area,
-                        &ui.theme,
-                        ui.focus == Focus::Worktrees,
-                        &user,
-                    );
-                }
-            }
-        }
-        if let Some(area) = inner.terminal {
-            let has_terminal = ui
-                .worktrees
-                .selected()
-                .is_some_and(|row| row.terminal.is_some());
-            ui.terminals
-                .render(f.buffer_mut(), area, &ui.theme, has_terminal);
-        }
+        draw_dash(f, body_area, ui);
         status_bar(f, bar_area, ui);
         return;
     }
@@ -1961,32 +1913,67 @@ fn draw(f: &mut ratatui::Frame, state: &State, ui: &Ui) {
     }
 
     if matches!(state, State::Connected { .. }) && ui.screen == Screen::EndSession {
-        let area = overlay(f, body_area, " end session ", ui);
-        ui.ending.render(f.buffer_mut(), area, &ui.theme);
+        draw_dash(f, body_area, ui);
+        // The one overlay that is not accent-bordered: it is about to remove
+        // work, and the mock gives it the error colour for exactly that
+        // reason — the border is the warning, before a word is read.
+        let parts = overlay(
+            f,
+            body_area,
+            ui,
+            ui.theme.style(Role::Error),
+            ui.ending.height(),
+            ui.ending.footer(),
+        );
+        ui.ending.render(f.buffer_mut(), parts, &ui.theme);
         status_bar(f, bar_area, ui);
         return;
     }
 
     if matches!(state, State::Connected { .. }) && ui.screen == Screen::Picker {
-        let area = overlay(f, body_area, " sessions ", ui);
-        ui.sessions.render(f.buffer_mut(), area, &ui.theme);
+        draw_dash(f, body_area, ui);
+        let parts = overlay(
+            f,
+            body_area,
+            ui,
+            ui.theme.style(Role::Accent),
+            ui.sessions.height(),
+            ui.sessions.footer(),
+        );
+        ui.sessions.render(f.buffer_mut(), parts, &ui.theme);
         status_bar(f, bar_area, ui);
         return;
     }
 
     if matches!(state, State::Connected { .. }) && ui.screen == Screen::Prune {
-        let area = overlay(f, body_area, " prune ", ui);
-        ui.prune.render(f.buffer_mut(), area, &ui.theme);
+        draw_dash(f, body_area, ui);
+        let parts = overlay(
+            f,
+            body_area,
+            ui,
+            ui.theme.style(Role::Accent),
+            ui.prune.height(),
+            ui.prune.footer(),
+        );
+        ui.prune.render(f.buffer_mut(), parts, &ui.theme);
         status_bar(f, bar_area, ui);
         return;
     }
 
     if matches!(state, State::Connected { .. }) && ui.screen == Screen::Palette {
+        draw_dash(f, body_area, ui);
         // Over the dash rather than beside it: §4.2 calls it grove's command
         // line, and a command line that moves the screen under it makes the
         // thing you were looking at harder to act on.
-        let area = overlay(f, body_area, " palette ", ui);
-        ui.palette.render(f.buffer_mut(), area, &ui.theme);
+        let parts = overlay(
+            f,
+            body_area,
+            ui,
+            ui.theme.style(Role::Accent),
+            ui.palette.height(),
+            ui.palette.footer(),
+        );
+        ui.palette.render(f.buffer_mut(), parts, &ui.theme);
         status_bar(f, bar_area, ui);
         return;
     }
@@ -2072,23 +2059,76 @@ fn bytes(n: u64) -> String {
 /// drawing them into the WORKTREES pane fitted them into twenty-odd columns
 /// and truncated every summary, which is how the palette shipped until a test
 /// painted it at a real size.
-fn overlay(f: &mut ratatui::Frame, area: Rect, title: &'static str, ui: &Ui) -> Rect {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(ui.theme.border())
-        .border_style(ui.theme.style(Role::Muted))
-        .title(Span::styled(title, ui.theme.style(Role::Accent)));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-    inner
+/// Draw the three panes and their contents.
+///
+/// Separate from `draw` because the overlays sit *over* it: the mock washes
+/// the dash out behind a palette rather than replacing it, so the dash has to
+/// be painted first and then dimmed.
+fn draw_dash(f: &mut ratatui::Frame, body_area: Rect, ui: &Ui) {
+    let empty = empty::Empty::of(ui.repos.workspace_count(), ui.repos.member_count());
+    // §4.1's empty state draws two panes, not three: nothing is selected,
+    // so there is no terminal to show, and the guidance needs the width
+    // more than an empty box does. The user's own toggles are untouched —
+    // this is what is drawn, not what they asked for.
+    let panes = match empty {
+        Some(_) => ui.panes.for_guidance(),
+        None => ui.panes,
+    };
+    let selection = ui.selection();
+    let inner = dash::render(
+        f.buffer_mut(),
+        body_area,
+        panes,
+        ui.focus,
+        &ui.theme,
+        &selection,
+    );
+    if let Some(area) = inner.repos {
+        ui.repos
+            .render(f.buffer_mut(), area, &ui.theme, ui.focus == Focus::Repos);
+    }
+    if let Some(area) = inner.worktrees {
+        // A dash with nothing in it re-homes §4.1's numbered guidance
+        // here, rather than rendering three blank boxes and leaving the
+        // user to guess which key starts anything.
+        match empty {
+            Some(state) => {
+                f.render_widget(Paragraph::new(state.lines(&ui.theme)), area);
+            }
+            None => {
+                let user = ui.columns.live();
+                ui.worktrees.render(
+                    f.buffer_mut(),
+                    area,
+                    &ui.theme,
+                    ui.focus == Focus::Worktrees,
+                    &user,
+                );
+            }
+        }
+    }
+    if let Some(area) = inner.terminal {
+        let has_terminal = ui
+            .worktrees
+            .selected()
+            .is_some_and(|row| row.terminal.is_some());
+        ui.terminals
+            .render(f.buffer_mut(), area, &ui.theme, has_terminal);
+    }
 }
 
-/// The one row along the bottom, drawn the same way whatever is above it.
+fn overlay(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    ui: &Ui,
+    border: ratatui::style::Style,
+    rows: u16,
+    hints: Vec<statusbar::Hint>,
+) -> overlay::Parts {
+    overlay::render(f.buffer_mut(), area, border, rows, hints, &ui.theme)
+}
+
 impl Ui {
-    /// What the terminal pane is showing, as the mock heads it: `repo · branch`.
-    ///
-    /// The same string the status bar puts on its right, because they are
-    /// answering the same question and two ways of phrasing it would drift.
     /// The open session, as the mock's bar names it.
     ///
     /// The id is the fallback rather than the answer: it is what the daemon
@@ -2103,6 +2143,10 @@ impl Ui {
         }
     }
 
+    /// What the terminal pane is showing, as the mock heads it: `repo · branch`.
+    ///
+    /// The same string the status bar puts on its right, because they are
+    /// answering the same question and two ways of phrasing it would drift.
     fn selection(&self) -> String {
         match (self.repos.selected(), self.worktrees.selected()) {
             (Some(repo), Some(worktree)) => format!("{} · {}", repo.name, worktree.worktree.branch),
@@ -2114,6 +2158,7 @@ impl Ui {
     }
 }
 
+/// The one row along the bottom, drawn the same way whatever is above it.
 fn status_bar(f: &mut ratatui::Frame, area: Rect, ui: &Ui) {
     // A pending prefix outranks the selection: it is about the key just
     // pressed and it disappears on the next one, while the selection is still
@@ -3825,7 +3870,10 @@ mod tests {
         handle(prefix(), &mut s, &mut ui);
         handle(key(KeyCode::Char('/')), &mut s, &mut ui);
 
-        let screen = painted_dash(&s, &ui, 100, 20).join("\n");
+        // Tall enough for every command plus the user's: the palette is
+        // `height:fit-content`, so a short screen cuts the last rows and this
+        // test would be about the screen rather than the listing.
+        let screen = painted_dash(&s, &ui, 100, 26).join("\n");
         assert!(screen.contains("review"), "{screen}");
         assert!(
             screen.contains("from your config"),
@@ -4407,16 +4455,16 @@ mod tests {
         handle(prefix(), &mut s, &mut ui);
         handle(key(KeyCode::Char('/')), &mut s, &mut ui);
 
-        let screen = painted_dash(&s, &ui, 100, 20).join("\n");
+        let screen = painted_dash(&s, &ui, 100, 26).join("\n");
         assert!(screen.contains("scan"), "{screen}");
         assert!(
             screen.contains("re-walk the workspace for repos"),
             "the summary is not truncated: {screen}"
         );
-        assert!(
-            screen.contains("palette"),
-            "and it says what it is: {screen}"
-        );
+        // And it is the command line the mock draws: a prompt, and a count of
+        // what is being chosen from.
+        assert!(screen.contains("❯"), "{screen}");
+        assert!(screen.contains("commands"), "{screen}");
     }
 
     #[test]

@@ -335,12 +335,15 @@ const END: &[Binding] = &[
 const SHELL: &[Binding] = &[];
 
 const PALETTE: &[Binding] = &[
-    b(false, KeyCode::Char(' '), Action::Toggle, "toggle"),
+    // On the bar only while an argument is being collected — the palette
+    // drops it from its own footer otherwise, because a space typed into a
+    // command name is a space, not a toggle.
+    bar(false, KeyCode::Char(' '), Action::Toggle, "toggle"),
     b(false, KeyCode::Backspace, Action::Erase, "erase"),
     b(false, KeyCode::Up, Action::MoveUp, "move"),
     b(false, KeyCode::Down, Action::MoveDown, "move"),
-    b(false, KeyCode::Enter, Action::Confirm, "run"),
-    b(false, KeyCode::Esc, Action::Cancel, "close"),
+    bar(false, KeyCode::Enter, Action::Confirm, "run"),
+    bar(false, KeyCode::Esc, Action::Cancel, "close"),
 ];
 
 /// Every binding live on a screen, globals last so a screen may shadow one.

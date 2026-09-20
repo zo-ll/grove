@@ -20,13 +20,12 @@
 use grove_domain::{Ownership, RepoId, SessionId};
 use grove_proto::WorktreeRow;
 use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 
 use crate::text::truncate;
-use crate::theme::{Role, Theme};
+use crate::theme::{Ink, Role, Theme};
 
 /// What the confirm is about, while it is open.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -110,39 +109,66 @@ impl EndSession {
     }
 
     /// Draw the confirm.
-    pub fn render(&self, buf: &mut Buffer, area: Rect, theme: &Theme) {
-        if area.width == 0 || area.height == 0 {
+    /// The keys this screen offers, as the overlay's footer shows them.
+    ///
+    /// Straight from the keymap: `enter remove everything` and `esc cancel`
+    /// are what END binds, and nothing here rewords them.
+    pub fn footer(&self) -> Vec<crate::statusbar::Hint> {
+        crate::statusbar::hints(crate::keymap::Screen::EndSession)
+    }
+
+    /// Rows of content, so the overlay can be that tall.
+    pub fn height(&self) -> u16 {
+        if !self.ready() {
+            return 1;
+        }
+        // The per-repo rows, a blank, the summary, and the warning when there
+        // is one — the mock's `endRows` block and the two lines under it.
+        let warning = usize::from(self.totals().dirty_files > 0);
+        u16::try_from(self.rows.len() + 2 + warning).unwrap_or(u16::MAX)
+    }
+
+    /// Draw the confirm into the overlay's parts.
+    pub fn render(&self, buf: &mut Buffer, parts: crate::overlay::Parts, theme: &Theme) {
+        let (header, body) = (parts.header, parts.body);
+        if body.width == 0 || body.height == 0 {
             return;
         }
         let totals = self.totals();
-        let mut lines = vec![Line::from(vec![
-            Span::styled(" end session   ", theme.style(Role::Error)),
+        // The header is the error colour throughout, as the mock has it: this
+        // is the one screen that destroys work, and it says so before the
+        // first row is read.
+        let counts = format!(
+            "{} · {} · {}",
+            plural(totals.terminals, "terminal"),
+            plural(totals.worktrees, "worktree"),
+            bytes(totals.bytes)
+        );
+        let spent = "end session ".len() + self.name.chars().count().min(20);
+        let room = usize::from(header.width).saturating_sub(spent + counts.chars().count());
+        Line::from(vec![
+            Span::styled("end session ", theme.style(Role::Error)),
             Span::styled(
-                format!("{:<20}", truncate(&self.name, 20)),
-                theme.style(Role::Accent).add_modifier(Modifier::BOLD),
+                truncate(&self.name, 20),
+                theme.ink_style(Ink::Text).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(
-                format!(
-                    "{} · {} · {}",
-                    plural(totals.terminals, "terminal"),
-                    plural(totals.worktrees, "worktree"),
-                    bytes(totals.bytes)
-                ),
-                theme.style(Role::Muted),
-            ),
-        ])];
+            Span::raw(" ".repeat(room)),
+            Span::styled(counts, theme.ink_style(Ink::Subtext)),
+        ])
+        .render(header, buf);
 
         if !self.ready() {
-            lines.push(Line::styled(
-                "  counting what would be removed…",
-                theme.style(Role::Muted),
-            ));
-            Paragraph::new(lines).render(area, buf);
+            Line::styled(
+                "counting what would be removed…",
+                theme.ink_style(Ink::Subtext),
+            )
+            .render(body, buf);
             return;
         }
 
+        let mut lines = Vec::new();
         // Per repo first: what is about to happen to each, in its own words.
-        let room = usize::from(area.height).saturating_sub(5);
+        let room = usize::from(body.height).saturating_sub(3);
         for row in self.rows.iter().take(room) {
             let (glyph, role) = if row.dirty_files > 0 {
                 ("◆", Role::Dirty)
@@ -172,33 +198,37 @@ impl EndSession {
             } else {
                 ""
             };
+            let detail_room = usize::from(body.width).saturating_sub(20 + 4 + warning.len() + 2);
             lines.push(Line::from(vec![
-                Span::styled(format!(" {glyph} "), theme.style(role)),
+                Span::styled(format!("{glyph} "), theme.style(role)),
                 Span::styled(
-                    format!("{:<18}", truncate(&row.worktree.repo.0, 18)),
-                    theme.style(Role::Clean),
+                    format!("{:<20}", truncate(&row.worktree.repo.0, 20)),
+                    theme.ink_style(Ink::Text),
                 ),
-                Span::styled(format!("{detail:<46}"), theme.style(Role::Muted)),
-                Span::styled(warning, theme.style(Role::Error)),
+                Span::styled(
+                    format!("{:<detail_room$}", truncate(&detail, detail_room)),
+                    theme.ink_style(Ink::Subtext),
+                ),
+                Span::styled(warning, theme.style(role)),
             ]));
         }
 
-        lines.push(Line::from(""));
+        lines.push(Line::raw(""));
         // Then the aggregate, in one sentence.
         lines.push(Line::styled(
             format!(
-                " closes {} and removes all {} · {} reclaimed",
+                "closes {} and removes all {} · {} reclaimed",
                 plural(totals.terminals, "terminal"),
                 plural(totals.worktrees, "worktree"),
                 bytes(totals.bytes)
             ),
-            theme.style(Role::Muted),
+            theme.ink_style(Ink::Subtext),
         ));
         // Then the loss, last, and only when there is some.
         if totals.dirty_files > 0 {
             lines.push(Line::styled(
                 format!(
-                    " {} uncommitted in {} will be lost",
+                    "{} uncommitted in {} will be lost",
                     plural(
                         usize::try_from(totals.dirty_files).unwrap_or(usize::MAX),
                         "file"
@@ -208,13 +238,7 @@ impl EndSession {
                 theme.style(Role::Error).add_modifier(Modifier::BOLD),
             ));
         }
-        lines.push(Line::from(""));
-        lines.push(Line::from(vec![
-            Span::styled(" enter remove everything", theme.style(Role::Error)),
-            Span::raw("                    "),
-            Span::styled("esc cancel", theme.style(Role::Clean)),
-        ]));
-        Paragraph::new(lines).render(area, buf);
+        Paragraph::new(lines).render(body, buf);
     }
 
     /// The repos with uncommitted work, named so the warning is specific.
@@ -272,6 +296,7 @@ fn bytes(n: u64) -> String {
 mod tests {
     use super::*;
     use grove_proto::{TerminalId, WorktreeRef};
+    use ratatui::layout::Rect;
 
     fn row(repo: &str, ownership: Ownership) -> WorktreeRow {
         WorktreeRow {
@@ -308,7 +333,7 @@ mod tests {
             height: 12,
         };
         let mut buf = Buffer::empty(area);
-        end.render(&mut buf, area, &theme());
+        end.render(&mut buf, crate::overlay::Parts::of(area), &theme());
         (0..area.height)
             .map(|y| {
                 (0..area.width)
@@ -502,18 +527,14 @@ mod tests {
         let per_repo = screen.find("9 files uncommitted").expect("per repo");
         let aggregate = screen.find("removes all").expect("aggregate");
         let loss = screen.rfind("will be lost").expect("loss");
-        let confirm = screen.find("enter remove everything").expect("confirm");
         assert!(per_repo < aggregate, "{screen}");
         assert!(aggregate < loss, "{screen}");
-        assert!(loss < confirm, "{screen}");
-    }
-
-    #[test]
-    fn esc_is_offered_beside_the_confirm() {
-        let mut end = EndSession::default();
-        end.begin(ours(), "x".into(), vec![]);
-        let screen = painted(&end);
-        assert!(screen.contains("esc cancel"), "{screen}");
+        // The key itself is the last thing on the screen, below all of this,
+        // in the footer the overlay draws from END's bindings.
+        assert_eq!(
+            end.footer().first().map(|hint| hint.label.clone()),
+            Some("remove everything".to_string())
+        );
     }
 
     #[test]

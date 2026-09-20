@@ -19,13 +19,11 @@
 use grove_domain::{SessionId, SessionState};
 use grove_proto::SessionRow;
 use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
-use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 
 use crate::text::truncate;
-use crate::theme::{Role, Theme};
+use crate::theme::{Ink, Role, Theme};
 
 /// Open here and now.
 const GLYPH_ATTACHED: &str = "●";
@@ -139,58 +137,87 @@ impl Sessions {
         Some(Intent::ConfirmEnd(row.id.clone()))
     }
 
-    /// Draw the picker into `area`.
-    pub fn render(&self, buf: &mut Buffer, area: Rect, theme: &Theme) {
-        if area.width == 0 || area.height == 0 {
+    /// The keys this screen offers, as the overlay's footer shows them.
+    pub fn footer(&self) -> Vec<crate::statusbar::Hint> {
+        crate::statusbar::hints(crate::keymap::Screen::Picker)
+    }
+
+    /// Rows of content, so the overlay can be that tall.
+    pub fn height(&self) -> u16 {
+        // One line under the list for §4.3's warning, which is the reason the
+        // picker is a confirm and not a menu.
+        u16::try_from(self.rows.len().max(1) + 2).unwrap_or(u16::MAX)
+    }
+
+    /// Draw the picker into the overlay's parts.
+    pub fn render(&self, buf: &mut Buffer, parts: crate::overlay::Parts, theme: &Theme) {
+        let (header, body) = (parts.header, parts.body);
+        if body.width == 0 || body.height == 0 {
             return;
         }
-        let mut lines = vec![Line::from(vec![
-            Span::styled(" session ❯", theme.style(Role::Accent)),
-            Span::raw("   "),
-            Span::styled(
-                format!("{} sessions", self.rows.len()),
-                theme.style(Role::Muted),
-            ),
-        ])];
+        let open = self
+            .rows
+            .iter()
+            .filter(|row| row.state == SessionState::Attached)
+            .count();
+        crate::overlay::header(
+            "session ❯",
+            "",
+            &format!("{} sessions · {open} open", self.rows.len()),
+            header.width,
+            theme,
+        )
+        .render(header, buf);
 
+        let mut lines = Vec::new();
         if self.rows.is_empty() {
             lines.push(Line::styled(
-                "  no stored sessions",
-                theme.style(Role::Muted),
+                "no stored sessions",
+                theme.ink_style(Ink::Subtext),
             ));
         }
 
-        let room = usize::from(area.height).saturating_sub(2);
+        let room = usize::from(body.height).saturating_sub(2);
         for (index, row) in self.rows.iter().take(room).enumerate() {
             let here = index == self.cursor;
-            let (glyph, glyph_role) = match row.state {
-                SessionState::Attached => (GLYPH_ATTACHED, Role::Clean),
-                SessionState::Detached => (GLYPH_DETACHED, Role::Dirty),
-                SessionState::Closed => (GLYPH_CLOSED, Role::Muted),
+            let (glyph, glyph_style) = match row.state {
+                SessionState::Attached => (GLYPH_ATTACHED, theme.style(Role::Clean)),
+                // Detached is the mock's blue: not live, not gone, and the
+                // only state where the difference is the whole question.
+                SessionState::Detached => (GLYPH_DETACHED, theme.ink_style(Ink::Other)),
+                SessionState::Closed => (GLYPH_CLOSED, theme.ink_style(Ink::Faint)),
             };
-            let name_style = if here {
-                theme.style(Role::Accent).add_modifier(Modifier::BOLD)
-            } else {
-                theme.style(Role::Clean)
-            };
-            lines.push(Line::from(vec![
-                Span::styled(if here { "❯" } else { " " }, theme.style(Role::Accent)),
-                Span::styled(glyph, theme.style(glyph_role)),
-                Span::raw(" "),
-                Span::styled(format!("{:<18}", truncate(&row.name, 18)), name_style),
-                Span::styled(
-                    format!("{:<34}", truncate(&members(row), 34)),
-                    theme.style(Role::Muted),
-                ),
-                Span::styled(status(row), theme.style(Role::Muted)),
-            ]));
+            let mut spans = crate::overlay::row(
+                here,
+                vec![
+                    (glyph.to_string(), Ink::Text),
+                    (format!("{:<20}", truncate(&row.name, 20)), Ink::Text),
+                    (
+                        format!(
+                            "{:<38}",
+                            truncate(&members(row), body.width.saturating_sub(34) as usize)
+                        ),
+                        Ink::Subtext,
+                    ),
+                    (status(row), Ink::Subtext),
+                ],
+                theme,
+            );
+            // The glyph keeps its own colour — it is the state, and the state
+            // is what the picker is for — except on the selected row, where
+            // the fill owns every cell.
+            if !here {
+                spans[0] = Span::styled(glyph, glyph_style);
+            }
+            lines.push(Line::from(spans));
         }
 
+        lines.push(Line::raw(""));
         lines.push(Line::styled(
-            " enter resume   d detach   c close   X end                esc close",
-            theme.style(Role::Muted),
+            "resuming replaces the open session — only one is open at a time",
+            theme.ink_style(Ink::Faint),
         ));
-        Paragraph::new(lines).render(area, buf);
+        Paragraph::new(lines).render(body, buf);
     }
 }
 
@@ -247,6 +274,7 @@ fn bytes(n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::layout::Rect;
 
     fn session(name: &str, state: SessionState) -> SessionRow {
         SessionRow {
@@ -283,7 +311,7 @@ mod tests {
             height: 8,
         };
         let mut buf = Buffer::empty(area);
-        sessions.render(&mut buf, area, &theme());
+        sessions.render(&mut buf, crate::overlay::Parts::of(area), &theme());
         (0..area.height)
             .map(|y| {
                 (0..area.width)
@@ -437,15 +465,5 @@ mod tests {
         assert!(sessions.resume().is_none());
         assert!(sessions.end().is_none());
         assert!(painted(&sessions).contains("no stored sessions"));
-    }
-
-    #[test]
-    fn the_footer_names_every_verb() {
-        let mut sessions = Sessions::default();
-        sessions.set(listing());
-        let screen = painted(&sessions);
-        for verb in ["enter resume", "d detach", "c close", "X end", "esc"] {
-            assert!(screen.contains(verb), "{verb} missing from:\n{screen}");
-        }
     }
 }
