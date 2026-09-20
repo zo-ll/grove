@@ -716,6 +716,7 @@ mod tests {
     const SCANNED: &[(&str, &str)] = &[
         ("dash.rs", include_str!("dash.rs")),
         ("empty.rs", include_str!("empty.rs")),
+        ("endsession.rs", include_str!("endsession.rs")),
         ("events.rs", include_str!("events.rs")),
         ("keymap.rs", include_str!("keymap.rs")),
         ("main.rs", include_str!("main.rs")),

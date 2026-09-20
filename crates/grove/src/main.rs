@@ -11,6 +11,7 @@
 
 mod dash;
 mod empty;
+mod endsession;
 mod events;
 mod keymap;
 mod palette;
@@ -31,6 +32,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use dash::Panes;
+use endsession::EndSession;
 use events::{Input, Inputs};
 use grove_lua::{TuiConfig, TuiRuntime};
 use grove_proto::{
@@ -76,8 +78,8 @@ struct Ui {
     prune: Prune,
     /// Stored sessions, for the picker.
     sessions: Sessions,
-    /// The session `X` asked about, waiting on #29's confirm.
-    ending: Option<grove_domain::SessionId>,
+    /// The end-session confirm, while it is open.
+    ending: EndSession,
     /// A `new` that hit a branch already checked out somewhere else, and the
     /// worktree it collided with. §7 says the flow offers to adopt that
     /// worktree rather than refusing and leaving the user to find it.
@@ -177,7 +179,7 @@ impl Ui {
             palette: Palette::default(),
             prune: Prune::default(),
             sessions: Sessions::default(),
-            ending: None,
+            ending: EndSession::default(),
             conflict: None,
             session: None,
             note: None,
@@ -358,6 +360,47 @@ fn run_command(chosen: Option<&'static palette::Command>, state: &mut State, ui:
     }
 }
 
+/// Open the end-session confirm for `session`.
+///
+/// The figures come from the daemon, one repo at a time, because that is how
+/// the protocol answers — so the confirm asks for every member repo and shows
+/// nothing until they are all back. A screen that counts up while someone
+/// reads it is the wrong screen to hurry.
+fn begin_end_session(session: grove_domain::SessionId, state: &mut State, ui: &mut Ui) -> bool {
+    let name = ui
+        .sessions
+        .selected()
+        .filter(|row| row.id == session)
+        .map(|row| row.name.clone())
+        .unwrap_or_else(|| session.0.clone());
+    // Its members, not the workspace's: ending a session touches only what it
+    // owns, and asking about the rest would be asking about worktrees that can
+    // never be listed here.
+    let repos: Vec<grove_domain::RepoId> = ui
+        .sessions
+        .selected()
+        .filter(|row| row.id == session)
+        .map(|row| {
+            ui.repos
+                .all()
+                .iter()
+                .filter(|repo| row.members.contains(&repo.name))
+                .map(|repo| repo.repo.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let wanted = ui.ending.begin(session, name, repos);
+    for repo in wanted {
+        if let Err(e) = send(state, &Request::ListWorktrees(repo)) {
+            ui.note = Some(format!("could not reach the daemon: {e}"));
+            break;
+        }
+    }
+    ui.screen = Screen::EndSession;
+    true
+}
+
 /// Carry out what the session picker decided a key means.
 ///
 /// `X` is the exception that shapes the rest: it never sends anything, it
@@ -374,9 +417,7 @@ fn act_on_session(intent: Option<sessions::Intent>, state: &mut State, ui: &mut 
             return true;
         }
         sessions::Intent::ConfirmEnd(session) => {
-            ui.ending = Some(session);
-            ui.screen = Screen::EndSession;
-            return true;
+            return begin_end_session(session, state, ui);
         }
         sessions::Intent::Resume(session) => Request::OpenSession(session),
         sessions::Intent::Detach(session) => Request::DetachSession(session),
@@ -721,6 +762,32 @@ fn handle(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
                         redraw: act_on_worktree(intent, state, ui),
                     }
                 }
+                Routed::Act(Action::Cancel) if ui.screen == Screen::EndSession => {
+                    // The safe default. Nothing has been sent, so there is
+                    // nothing to undo.
+                    ui.ending.cancel();
+                    ui.screen = Screen::Picker;
+                    Flow::Continue { redraw: true }
+                }
+                Routed::Act(Action::Confirm) if ui.screen == Screen::EndSession => {
+                    if !ui.ending.ready() {
+                        // Still counting. Confirming a total that is not
+                        // finished is confirming something nobody has read.
+                        ui.note = Some("still counting what would be removed".into());
+                        return Flow::Continue { redraw: true };
+                    }
+                    let Some(session) = ui.ending.session().cloned() else {
+                        return Flow::Continue { redraw: false };
+                    };
+                    if let Err(e) = send(state, &Request::EndSession(session)) {
+                        ui.note = Some(format!("could not reach the daemon: {e}"));
+                        return Flow::Continue { redraw: true };
+                    }
+                    let _ = send(state, &Request::ListSessions);
+                    ui.ending.cancel();
+                    ui.screen = Screen::Dash;
+                    Flow::Continue { redraw: true }
+                }
                 Routed::Act(Action::OpenPicker) => {
                     // Ask before showing: a list of sessions that fills in
                     // underneath someone already pressing `X` is the worst
@@ -1058,6 +1125,13 @@ fn handle(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
         // out, so rows for a repo we are no longer showing are dropped rather
         // than painted under the wrong heading.
         Input::Daemon(DaemonEvent::Worktrees { repo, rows }) => {
+            // While the confirm is counting, these rows are its answer rather
+            // than the dash's — and it wants every member repo, not only the
+            // one the cursor is on.
+            if ui.screen == Screen::EndSession {
+                ui.ending.take(&repo, &rows, ui.session.as_ref());
+                return Flow::Continue { redraw: true };
+            }
             let showing = ui.repos.selected().map(|row| row.repo.clone());
             if showing.as_ref() != Some(&repo) {
                 return Flow::Continue { redraw: false };
@@ -1251,6 +1325,15 @@ fn draw(f: &mut ratatui::Frame, state: &State, ui: &Ui) {
                 .is_some_and(|row| row.terminal.is_some());
             ui.terminals
                 .render(f.buffer_mut(), area, &ui.theme, has_terminal);
+        }
+        status_bar(f, bar_area, ui);
+        return;
+    }
+
+    if matches!(state, State::Connected { .. }) && ui.screen == Screen::EndSession {
+        let inner = dash::render(f.buffer_mut(), body_area, ui.panes, ui.focus, &ui.theme);
+        if let Some(area) = inner.worktrees.or(inner.repos).or(inner.terminal) {
+            ui.ending.render(f.buffer_mut(), area, &ui.theme);
         }
         status_bar(f, bar_area, ui);
         return;
@@ -2684,7 +2767,10 @@ mod tests {
 
         handle(key(KeyCode::Char('X')), &mut s, &mut ui);
         assert_eq!(ui.screen, Screen::EndSession, "the confirm, not the act");
-        assert_eq!(ui.ending.as_ref().map(|id| id.0.as_str()), Some("open one"));
+        assert_eq!(
+            ui.ending.session().map(|id| id.0.as_str()),
+            Some("open one")
+        );
         assert!(
             sent(&mut theirs).is_empty(),
             "nothing may be sent before the confirm"
@@ -2747,6 +2833,168 @@ mod tests {
             sent(&mut theirs)
                 .iter()
                 .any(|r| matches!(r, Request::CloseSession(_)))
+        );
+    }
+
+    #[test]
+    fn the_confirm_asks_every_member_repo_before_it_shows_a_total() {
+        // Acceptance: the figures match what the daemon removes. They are the
+        // daemon's rows, one repo at a time, and the screen says it is
+        // counting until they are all back.
+        let (mut s, mut theirs) = wired();
+        let mut ui = Ui::new();
+        handle(
+            Input::Daemon(DaemonEvent::Repos(vec![
+                repo_row("billing", 1),
+                repo_row("web", 1),
+            ])),
+            &mut s,
+            &mut ui,
+        );
+        let mut row = session_row("invoice split", grove_domain::SessionState::Attached);
+        row.members = vec!["billing".into(), "web".into()];
+        handle(
+            Input::Daemon(DaemonEvent::Sessions(vec![row])),
+            &mut s,
+            &mut ui,
+        );
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('s')), &mut s, &mut ui);
+        let _ = sent(&mut theirs);
+
+        handle(key(KeyCode::Char('X')), &mut s, &mut ui);
+        assert_eq!(ui.screen, Screen::EndSession);
+        let asked = sent(&mut theirs);
+        for repo in ["billing", "web"] {
+            assert!(
+                asked.contains(&Request::ListWorktrees(grove_domain::RepoId(repo.into()))),
+                "{repo} was not asked about: {asked:?}"
+            );
+        }
+        assert!(!ui.ending.ready(), "nothing has answered yet");
+
+        // Confirming while it is still counting must not send anything.
+        handle(key(KeyCode::Enter), &mut s, &mut ui);
+        assert!(
+            sent(&mut theirs).is_empty(),
+            "a total nobody has read is not a confirmation"
+        );
+        assert_eq!(ui.screen, Screen::EndSession);
+    }
+
+    #[test]
+    fn the_confirm_removes_only_after_both_repos_answer() {
+        let (mut s, mut theirs) = wired();
+        let mut ui = Ui::new();
+        handle(
+            Input::Daemon(DaemonEvent::Repos(vec![repo_row("billing", 1)])),
+            &mut s,
+            &mut ui,
+        );
+        let mut row = session_row("invoice split", grove_domain::SessionState::Attached);
+        row.members = vec!["billing".into()];
+        handle(
+            Input::Daemon(DaemonEvent::Sessions(vec![row])),
+            &mut s,
+            &mut ui,
+        );
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('s')), &mut s, &mut ui);
+        handle(key(KeyCode::Char('X')), &mut s, &mut ui);
+        let _ = sent(&mut theirs);
+
+        handle(
+            Input::Daemon(DaemonEvent::Worktrees {
+                repo: grove_domain::RepoId("billing".into()),
+                rows: vec![worktree_row("feat/x", grove_domain::Ownership::Ours)],
+            }),
+            &mut s,
+            &mut ui,
+        );
+        assert!(ui.ending.ready());
+        assert_eq!(ui.ending.totals().worktrees, 1);
+
+        handle(key(KeyCode::Enter), &mut s, &mut ui);
+        let asked = sent(&mut theirs);
+        assert!(
+            asked
+                .iter()
+                .any(|r| matches!(r, Request::EndSession(id) if id.0 == "invoice split")),
+            "{asked:?}"
+        );
+        assert_eq!(ui.screen, Screen::Dash);
+    }
+
+    #[test]
+    fn esc_leaves_the_confirm_without_removing_anything() {
+        // The safe default, and the reason `X` routes here at all.
+        let (mut s, mut theirs) = wired();
+        let mut ui = Ui::new();
+        handle(
+            Input::Daemon(DaemonEvent::Sessions(vec![session_row(
+                "invoice split",
+                grove_domain::SessionState::Attached,
+            )])),
+            &mut s,
+            &mut ui,
+        );
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('s')), &mut s, &mut ui);
+        handle(key(KeyCode::Char('X')), &mut s, &mut ui);
+        let _ = sent(&mut theirs);
+
+        handle(key(KeyCode::Esc), &mut s, &mut ui);
+        assert_eq!(ui.screen, Screen::Picker, "back where it came from");
+        assert!(ui.ending.session().is_none());
+        assert!(
+            sent(&mut theirs).is_empty(),
+            "nothing may be sent by cancelling"
+        );
+    }
+
+    #[test]
+    fn the_confirm_never_counts_another_sessions_worktree() {
+        // The rule this screen exists for. Another session's are read-only
+        // and the clone is the repository itself.
+        let (mut s, mut theirs) = wired();
+        let mut ui = Ui::new();
+        handle(
+            Input::Daemon(DaemonEvent::Repos(vec![repo_row("billing", 1)])),
+            &mut s,
+            &mut ui,
+        );
+        let mut row = session_row("invoice split", grove_domain::SessionState::Attached);
+        row.members = vec!["billing".into()];
+        handle(
+            Input::Daemon(DaemonEvent::Sessions(vec![row])),
+            &mut s,
+            &mut ui,
+        );
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('s')), &mut s, &mut ui);
+        handle(key(KeyCode::Char('X')), &mut s, &mut ui);
+        let _ = sent(&mut theirs);
+
+        handle(
+            Input::Daemon(DaemonEvent::Worktrees {
+                repo: grove_domain::RepoId("billing".into()),
+                rows: vec![
+                    worktree_row("ours", grove_domain::Ownership::Ours),
+                    worktree_row(
+                        "theirs",
+                        grove_domain::Ownership::Other(grove_domain::SessionId("other".into())),
+                    ),
+                    worktree_row("clone", grove_domain::Ownership::Clone),
+                    worktree_row("free", grove_domain::Ownership::Unowned),
+                ],
+            }),
+            &mut s,
+            &mut ui,
+        );
+        assert_eq!(
+            ui.ending.totals().worktrees,
+            1,
+            "only the one this session owns"
         );
     }
 
