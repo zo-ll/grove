@@ -35,6 +35,19 @@ const REPOS_MIN: u16 = 14;
 const WORKTREES_MIN: u16 = 26;
 const TERMINAL_MIN: u16 = 24;
 
+/// The narrowest a pane can be and still be a pane: two borders and a column
+/// of content.
+const DRAWABLE_MIN: u16 = 3;
+
+/// The width below which a pane is not worth drawing at all.
+fn floor(pane: Pane) -> u16 {
+    match pane {
+        Focus::Repos => REPOS_MIN,
+        Focus::Worktrees => WORKTREES_MIN,
+        Focus::Terminal => TERMINAL_MIN,
+    }
+}
+
 /// Which panes the user can see.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Panes {
@@ -134,6 +147,37 @@ impl Panes {
         from
     }
 
+    /// The panes that actually fit, which is not always the panes the user
+    /// asked for.
+    ///
+    /// A terminal can be narrower than three panes need. The first version
+    /// handed the shortfall to the rightmost pane and let it reach zero width:
+    /// the pane was still "visible", still focusable, and painted nothing — the
+    /// arrows-drive-an-invisible-list bug this module exists to prevent,
+    /// arrived at from the other end. Panes are dropped from the right instead,
+    /// because the terminal is the pane whose absence costs least, and the
+    /// leftmost always survives so something is always on screen.
+    pub fn drawable(self, width: u16) -> Self {
+        let mut panes = self;
+        loop {
+            let showing: Vec<Pane> = [Focus::Repos, Focus::Worktrees, Focus::Terminal]
+                .into_iter()
+                .filter(|pane| panes.visible(*pane))
+                .collect();
+            let Some(last) = showing.last().copied() else {
+                return panes;
+            };
+            if showing.len() == 1 {
+                return panes;
+            }
+            let needed: u16 = showing.iter().map(|pane| floor(*pane)).sum();
+            if needed <= width {
+                return panes;
+            }
+            panes.set(last, false);
+        }
+    }
+
     /// Where focus belongs once `focus` may have become invisible.
     ///
     /// Hiding the pane you are in has to move you somewhere you can see, or
@@ -184,6 +228,9 @@ pub fn split(area: Rect, panes: Panes) -> Areas {
         return areas;
     }
 
+    // What fits, not what was asked for — a pane too narrow to draw is not on
+    // screen, and `Areas` is what the rest of the UI trusts for that.
+    let panes = panes.drawable(area.width);
     let showing: Vec<Pane> = [Focus::Repos, Focus::Worktrees, Focus::Terminal]
         .into_iter()
         .filter(|pane| panes.visible(*pane))
@@ -220,12 +267,6 @@ fn widths_for(total: u16, showing: &[Pane]) -> Vec<u16> {
         Focus::Worktrees => WORKTREES_MIN,
         Focus::Terminal => TERMINAL_MIN,
     };
-    let floor = |pane: &Pane| match pane {
-        Focus::Repos => REPOS_MIN,
-        Focus::Worktrees => WORKTREES_MIN,
-        Focus::Terminal => TERMINAL_MIN,
-    };
-
     let mut widths: Vec<u16> = showing.iter().map(ideal).collect();
     let claimed: u16 = widths.iter().copied().sum();
 
@@ -256,14 +297,21 @@ fn widths_for(total: u16, showing: &[Pane]) -> Vec<u16> {
         let Some(index) = showing.iter().position(|p| *p == pane) else {
             continue;
         };
-        let give = widths[index].saturating_sub(floor(&pane)).min(shortfall);
+        let give = widths[index].saturating_sub(floor(pane)).min(shortfall);
         widths[index] -= give;
         shortfall -= give;
     }
     if shortfall > 0 {
+        // Only reachable with a single pane left, since `drawable` has already
+        // dropped any pane whose floor does not fit. It takes the area it has
+        // rather than the floor it wants: one cramped pane beats none.
         let last = widths.len() - 1;
         widths[last] = widths[last].saturating_sub(shortfall);
     }
+    debug_assert!(
+        widths.iter().copied().sum::<u16>() <= total,
+        "the panes must never claim more columns than the dash has"
+    );
     widths
 }
 
@@ -482,30 +530,84 @@ mod tests {
     }
 
     #[test]
-    fn a_terminal_too_narrow_for_everything_still_produces_a_sane_layout() {
-        // Below the acceptance floor grove must not panic, overlap panes or
-        // run off the right edge — it degrades. 40 columns cannot hold three
-        // panes at their floors; the arithmetic still has to close.
+    fn a_terminal_too_narrow_for_three_panes_drops_one_rather_than_starving_it() {
+        // The review's finding, and it was worse than reported: the shortfall
+        // used to come off the rightmost pane until it hit zero width, so the
+        // terminal was "visible", focusable, zero columns wide — and the
+        // panes together still overflowed the area.
         let tiny = Rect {
             width: 40,
             height: 10,
             ..NARROW
         };
         let areas = split(tiny, Panes::default());
+        assert!(
+            areas.terminal.is_none(),
+            "a pane that cannot be drawn is not on screen"
+        );
         let repos = areas.repos.expect("visible");
         let worktrees = areas.worktrees.expect("visible");
-        let terminal = areas.terminal.expect("visible");
         assert_eq!(repos.x, 0);
         assert_eq!(worktrees.x, repos.x + repos.width);
-        assert_eq!(terminal.x, worktrees.x + worktrees.width);
-        assert!(
-            terminal.x + terminal.width <= tiny.width,
-            "the layout must not run past the terminal's right edge"
-        );
         assert_eq!(
-            repos.width, REPOS_MIN,
-            "REPOS gives up its columns last, so it should be at its floor"
+            worktrees.x + worktrees.width,
+            tiny.width,
+            "the survivors tile the width exactly"
         );
+    }
+
+    #[test]
+    fn no_pane_is_ever_zero_width() {
+        // Across every width from degenerate to wide, and every combination of
+        // toggles: a zero-width pane is the arrows-drive-an-invisible-list bug
+        // arrived at from the layout rather than from the toggle.
+        for width in 0..=120u16 {
+            for hidden in [
+                vec![],
+                vec![Focus::Repos],
+                vec![Focus::Worktrees],
+                vec![Focus::Terminal],
+                vec![Focus::Repos, Focus::Terminal],
+            ] {
+                let mut panes = Panes::default();
+                for pane in hidden {
+                    let _ = panes.toggle(pane);
+                }
+                let area = Rect {
+                    width,
+                    height: 10,
+                    ..NARROW
+                };
+                let areas = split(area, panes);
+                let mut covered = 0u16;
+                for pane in [Focus::Repos, Focus::Worktrees, Focus::Terminal] {
+                    if let Some(rect) = areas.of(pane) {
+                        assert!(rect.width > 0, "{pane:?} is zero columns at width {width}");
+                        covered = covered.saturating_add(rect.width);
+                    }
+                }
+                assert!(
+                    covered <= width,
+                    "the panes claim {covered} columns of {width}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_narrowest_useful_terminal_keeps_one_pane() {
+        // Something is always on screen, however little room there is, because
+        // the alternative is a blank frame with no way back.
+        let sliver = Rect {
+            width: 12,
+            height: 8,
+            ..NARROW
+        };
+        let areas = split(sliver, Panes::default());
+        assert!(areas.repos.is_some(), "the leftmost pane survives");
+        assert!(areas.worktrees.is_none());
+        assert!(areas.terminal.is_none());
+        assert_eq!(areas.repos.expect("visible").width, sliver.width);
     }
 
     #[test]

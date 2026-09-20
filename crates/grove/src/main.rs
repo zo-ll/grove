@@ -48,6 +48,10 @@ struct Ui {
     /// Which dash panes are on screen. Focus is kept consistent with this:
     /// see `Panes::refocus`.
     panes: Panes,
+    /// The terminal's current width, because whether a pane is on screen
+    /// depends on it: below a certain width the dash drops panes it cannot
+    /// draw, and focus must not cycle onto one of those.
+    width: u16,
     theme: Theme,
     /// What the config could not give us, shown once rather than swallowed.
     /// SPEC §9: a broken config reports and keeps running.
@@ -78,6 +82,7 @@ impl Ui {
             focus: Focus::Worktrees,
             router: Router::new(),
             panes: Panes::default(),
+            width: 80,
             theme,
             config_note: (!notes.is_empty()).then(|| notes.join("; ")),
         }
@@ -150,6 +155,12 @@ fn run(workspace: PathBuf) -> std::io::Result<()> {
     let mut state = connect(&workspace, &inputs);
 
     let (_guard, mut term) = terminal::Guard::new()?;
+    // Whether a pane fits depends on the width, so start from the real one
+    // rather than assuming the default until the first resize.
+    if let Ok(size) = term.size() {
+        ui.width = size.width;
+        ui.focus = ui.panes.drawable(size.width).refocus(ui.focus);
+    }
 
     // Redraw only on change. A dashboard of idle terminals must not spin, so
     // nothing here loops on a timer: the loop blocks until a source produces.
@@ -206,11 +217,11 @@ fn handle(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
                 // order: focus on a hidden pane means the arrows drive a list
                 // that is not on screen.
                 Routed::Act(Action::CycleFocus) => {
-                    ui.focus = ui.panes.next_visible(ui.focus);
+                    ui.focus = ui.panes.drawable(ui.width).next_visible(ui.focus);
                     Flow::Continue { redraw: true }
                 }
                 Routed::Act(Action::CycleFocusBack) => {
-                    ui.focus = ui.panes.previous_visible(ui.focus);
+                    ui.focus = ui.panes.drawable(ui.width).previous_visible(ui.focus);
                     Flow::Continue { redraw: true }
                 }
                 Routed::Act(Action::TogglePane(index)) => {
@@ -221,7 +232,7 @@ fn handle(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
                     // nothing, so it must not cost a frame either.
                     let changed = ui.panes.toggle(pane);
                     if changed {
-                        ui.focus = ui.panes.refocus(ui.focus);
+                        ui.focus = ui.panes.drawable(ui.width).refocus(ui.focus);
                     }
                     Flow::Continue { redraw: changed }
                 }
@@ -240,7 +251,13 @@ fn handle(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
             }
         }
 
-        Input::Terminal(TermEvent::Resize(..)) => Flow::Continue { redraw: true },
+        Input::Terminal(TermEvent::Resize(width, _)) => {
+            ui.width = width;
+            // A resize can take a pane off screen, so focus is rechecked here
+            // rather than only when the user presses something.
+            ui.focus = ui.panes.drawable(width).refocus(ui.focus);
+            Flow::Continue { redraw: true }
+        }
 
         // Focus events arrive as keepalives from the reader and mean nothing to
         // the user; redrawing on them would defeat the redraw-on-change rule.
@@ -595,6 +612,42 @@ mod tests {
             ui.focus,
             Focus::Terminal,
             "^g tab must pass over the hidden WORKTREES pane"
+        );
+    }
+
+    #[test]
+    fn focus_never_cycles_onto_a_pane_too_narrow_to_draw() {
+        // The review's finding, wired end to end: at 40 columns the dash drops
+        // the terminal pane, so `^g tab` must pass over it exactly as it
+        // passes over one the user hid.
+        let mut s = connected();
+        let mut ui = Ui::new();
+        handle(Input::Terminal(TermEvent::Resize(40, 24)), &mut s, &mut ui);
+        ui.focus = Focus::Worktrees;
+
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Tab), &mut s, &mut ui);
+        assert_eq!(
+            ui.focus,
+            Focus::Repos,
+            "the terminal pane does not fit at 40 columns, so focus must skip it"
+        );
+    }
+
+    #[test]
+    fn shrinking_the_terminal_moves_focus_off_a_pane_that_no_longer_fits() {
+        // Focus can be left behind by a resize as easily as by a toggle, and
+        // the resize path is the one nobody presses a key for.
+        let mut s = connected();
+        let mut ui = Ui::new();
+        handle(Input::Terminal(TermEvent::Resize(200, 40)), &mut s, &mut ui);
+        ui.focus = Focus::Terminal;
+
+        handle(Input::Terminal(TermEvent::Resize(40, 24)), &mut s, &mut ui);
+        assert_ne!(ui.focus, Focus::Terminal, "that pane is no longer drawn");
+        assert!(
+            ui.panes.drawable(ui.width).visible(ui.focus),
+            "focus must land somewhere that fits"
         );
     }
 
