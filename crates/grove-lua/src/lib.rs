@@ -313,6 +313,61 @@ impl TuiRuntime {
         }
     }
 
+    /// Run a column's callback for one worktree, bounded in time.
+    ///
+    /// The worktree is passed as the table §10.3's example reads — `wt.repo`,
+    /// `wt.branch` — and the answer is whatever string the user returned. A
+    /// non-string is not an error: it is a column that has nothing to say for
+    /// this row, which is different from one that failed.
+    pub fn call_column(
+        &self,
+        index: usize,
+        repo: &str,
+        branch: &str,
+        budget: Duration,
+    ) -> Result<String, CallError> {
+        let callback = self
+            .column_callback(index)
+            .map_err(|error| CallError::Failed(error.to_string()))?;
+        let worktree = self
+            .lua
+            .create_table()
+            .map_err(|error| CallError::Failed(error.to_string()))?;
+        for (key, value) in [("repo", repo), ("branch", branch)] {
+            worktree
+                .set(key, value)
+                .map_err(|error| CallError::Failed(error.to_string()))?;
+        }
+
+        let deadline = Instant::now() + budget;
+        let triggers = mlua::HookTriggers::new().every_nth_instruction(10_000);
+        self.lua
+            .set_hook(triggers, move |_, _| {
+                if Instant::now() >= deadline {
+                    return Err(mlua::Error::runtime("grove: callback timed out"));
+                }
+                Ok(mlua::VmState::Continue)
+            })
+            .map_err(|error| CallError::Failed(error.to_string()))?;
+
+        let outcome = callback.call::<mlua::Value>(worktree);
+        self.lua.remove_hook();
+
+        match outcome {
+            Ok(mlua::Value::String(text)) => Ok(text.to_string_lossy()),
+            // Nothing to say for this row is not a failure.
+            Ok(_) => Ok(String::new()),
+            Err(error) => {
+                let text = error.to_string();
+                if text.contains("timed out") {
+                    Err(CallError::Timeout)
+                } else {
+                    Err(CallError::Failed(text))
+                }
+            }
+        }
+    }
+
     /// Retrieves a keymap callback from this runtime's VM.
     pub fn keymap_callback(&self, index: usize) -> mlua::Result<Function> {
         self.lua
@@ -1472,6 +1527,38 @@ fn parse_event(value: &str) -> mlua::Result<LifecycleEvent> {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn a_column_is_given_the_worktree_and_returns_a_string() {
+        let source = "local grove = require('grove')\n\
+                      grove.column('pr', function(wt) return wt.repo .. '/' .. wt.branch end)\n";
+        let runtime = TuiRuntime::load_source(source, "column").runtime;
+        assert_eq!(
+            runtime.call_column(0, "billing", "feat/x", Duration::from_secs(1)),
+            Ok("billing/feat/x".into())
+        );
+    }
+
+    #[test]
+    fn a_column_that_hangs_is_stopped_and_a_non_string_is_simply_empty() {
+        // §10.5: on expiry the column renders empty and the error surfaces
+        // once. Returning nothing is not the same as failing, so nil is an
+        // empty cell rather than a report.
+        let source = "local grove = require('grove')\n\
+                      grove.column('slow', function() while true do end end)\n\
+                      grove.column('quiet', function() return nil end)\n";
+        let runtime = TuiRuntime::load_source(source, "columns").runtime;
+        let started = Instant::now();
+        assert_eq!(
+            runtime.call_column(0, "r", "b", Duration::from_millis(150)),
+            Err(CallError::Timeout)
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(
+            runtime.call_column(1, "r", "b", Duration::from_secs(1)),
+            Ok(String::new())
+        );
+    }
 
     #[test]
     fn a_runaway_callback_is_stopped_rather_than_freezing_the_caller() {
