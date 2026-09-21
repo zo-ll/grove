@@ -67,6 +67,14 @@ impl Hint {
 /// hide`, and `↑↓ file` rather than an arrow each. The mock folds them the
 /// same way, and it is the only reason the dash's bar fits in a line.
 pub fn hints(screen: Screen) -> Vec<Hint> {
+    fold(bar_bindings(screen))
+}
+
+/// Fold consecutive bindings that share a label into one entry: `^g 1-3
+/// hide`, `↑↓ file`. Public because help lists every binding the same way the
+/// bar lists its shortlist — it used to keep the first of each label and drop
+/// the rest, so `^g 2` and `^g 3` were in neither.
+pub fn fold(bindings: impl IntoIterator<Item = &'static Binding>) -> Vec<Hint> {
     let mut out: Vec<Hint> = Vec::new();
     let mut run: Vec<&'static Binding> = Vec::new();
 
@@ -101,7 +109,7 @@ pub fn hints(screen: Screen) -> Vec<Hint> {
         run.clear();
     };
 
-    for binding in bar_bindings(screen) {
+    for binding in bindings {
         if let Some(last) = run.last()
             && (last.label != binding.label || last.prefixed != binding.prefixed)
         {

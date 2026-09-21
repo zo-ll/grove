@@ -17,7 +17,7 @@ use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 
-use crate::keymap::{Screen, bindings, label_of};
+use crate::keymap::{Screen, bindings};
 use crate::theme::{Role, Theme};
 
 /// The overlay's own state: which screen it is explaining, and how far down.
@@ -76,18 +76,28 @@ impl Help {
         }
         lines.push(Line::from(""));
 
-        let mut seen: Vec<&str> = Vec::new();
-        for binding in bindings(screen) {
-            if seen.contains(&binding.label) {
-                continue;
+        // Folded as the bar folds them, so `^g 1-3 hide` rather than `^g 1`
+        // alone with 2 and 3 dropped — and exact repeats (a key two tables
+        // both bind) shown once.
+        let mut entries: Vec<crate::statusbar::Hint> = Vec::new();
+        for hint in crate::statusbar::fold(bindings(screen)) {
+            if !entries.contains(&hint) {
+                entries.push(hint);
             }
-            seen.push(binding.label);
+        }
+        // As wide as the widest key and then some, so no key runs into its
+        // label — `^g shift-tab` did, at a fixed twelve.
+        let width = entries
+            .iter()
+            .map(|hint| hint.keys.chars().count())
+            .chain(user.iter().map(|spelling| spelling.chars().count()))
+            .max()
+            .unwrap_or(0)
+            + 2;
+        for hint in entries {
             lines.push(Line::from(vec![
-                Span::styled(
-                    format!(" {:<12}", label_of(binding)),
-                    theme.style(Role::Accent),
-                ),
-                Span::styled(binding.label, theme.style(Role::Clean)),
+                Span::styled(format!(" {:<width$}", hint.keys), theme.style(Role::Accent)),
+                Span::styled(hint.label, theme.style(Role::Clean)),
             ]));
         }
         if !user.is_empty() {
@@ -98,7 +108,7 @@ impl Help {
             ));
             for spelling in user {
                 lines.push(Line::from(vec![
-                    Span::styled(format!(" {spelling:<12}"), theme.style(Role::Accent)),
+                    Span::styled(format!(" {spelling:<width$}"), theme.style(Role::Accent)),
                     Span::styled("yours", theme.style(Role::Clean)),
                 ]));
             }
@@ -175,6 +185,37 @@ mod tests {
             .join("\n")
     }
 
+    fn help_text(screen: Screen) -> String {
+        Help::lines_with(screen, &[], &theme())
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|s| s.content.to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn keys_that_share_a_label_are_folded_not_dropped() {
+        // Help listed `^g 1 hide` and `^g ↑ scroll` and nothing for 2, 3 or
+        // ↓: it kept the first binding with a label and dropped the rest.
+        // The bar folds them; help now says the same thing the bar does.
+        let text = help_text(Screen::Dash);
+        assert!(text.contains("^g 1-3"), "{text}");
+        assert!(text.contains("^g ↑↓"), "{text}");
+    }
+
+    #[test]
+    fn a_long_key_does_not_run_into_its_label() {
+        // "^g shift-tabpane back": the key column was twelve wide and the key
+        // eleven, so there was no gap at all.
+        let text = help_text(Screen::Dash);
+        assert!(!text.contains("shift-tabpane"), "{text}");
+        assert!(text.contains("^g shift-tab  pane back"), "{text}");
+    }
     #[test]
     fn every_binding_of_the_screen_appears() {
         // Acceptance: derived from the keymap, never a hardcoded list. Asserted
