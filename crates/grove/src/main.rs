@@ -9,6 +9,7 @@
 //! See `SPEC.md` §3 and §4. This is issue #14: the shell every screen mounts
 //! into. Screens themselves are #18 through #30.
 
+mod clipboard;
 mod columns;
 mod dash;
 mod diff;
@@ -23,6 +24,7 @@ mod palette;
 mod prune;
 mod repos;
 mod select;
+mod selection;
 mod sessions;
 mod statusbar;
 mod terminal;
@@ -118,6 +120,11 @@ struct Ui {
     /// The last size the terminal pane actually had, kept so hiding the pane
     /// does not reflow the program inside its pty.
     last_pane_size: (u16, u16),
+    /// Text being selected with the mouse, or selected and still shown.
+    selection: Option<selection::Selection>,
+    /// Text waiting to be put on the clipboard. The loop owns the terminal,
+    /// so it is the loop that writes the request; the handler only says what.
+    clipboard: Option<String>,
     /// Something to say about the last thing the user pressed — a refusal, or
     /// a failure to reach the daemon. Cleared by the next successful action.
     note: Option<String>,
@@ -309,6 +316,8 @@ impl Ui {
             width: 80,
             height: 24,
             last_pane_size: (22, 34),
+            selection: None,
+            clipboard: None,
             theme,
             config_note: (!notes.is_empty()).then(|| notes.join("; ")),
         }
@@ -429,6 +438,14 @@ fn run(workspace: PathBuf) -> std::io::Result<()> {
                 // after the guard has restored the terminal.
                 Flow::Quit => return finish(&state),
             }
+        }
+        // Between frames, never inside one: an escape sequence written while
+        // ratatui is mid-draw would land in the middle of its output.
+        if let Some(text) = ui.clipboard.take() {
+            use std::io::Write;
+            let backend = term.backend_mut();
+            let _ = backend.write_all(clipboard::osc52(&text).as_bytes());
+            let _ = backend.flush();
         }
     }
 }
@@ -592,6 +609,95 @@ fn on_mouse(event: MouseEvent, state: &mut State, ui: &mut Ui) -> Flow {
     if !matches!(state, State::Connected { .. }) || ui.helping.is_some() {
         return Flow::Continue { redraw: false };
     }
+    let at = ratatui::layout::Position {
+        x: event.column,
+        y: event.row,
+    };
+
+    // A drag that started a selection belongs to it, wherever the pointer
+    // goes next — over the list beside it, over a program that wants the
+    // mouse. Otherwise the selection would stop the moment the pointer
+    // crossed into vim's pane.
+    if let Some(selection) = ui.selection.as_mut() {
+        match event.kind {
+            MouseEventKind::Drag(MouseButton::Left) => {
+                return Flow::Continue {
+                    redraw: selection.drag_to(at),
+                };
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                let finished = *selection;
+                if finished.is_empty() {
+                    // It was a click. The click has already done its work.
+                    ui.selection = None;
+                } else {
+                    let text = selected_text(state, ui, &finished);
+                    if let Some(shown) = ui.selection.as_mut() {
+                        shown.dragging = true;
+                    }
+                    if !text.is_empty() {
+                        ui.clipboard = Some(text);
+                    }
+                }
+                return Flow::Continue { redraw: true };
+            }
+            _ => {}
+        }
+    }
+
+    let starts = matches!(event.kind, MouseEventKind::Down(MouseButton::Left));
+    // Decided before the click is handled: the click may close an overlay,
+    // and the selection belongs to the screen that was pressed on.
+    let area = if starts {
+        selectable_area(ui, at)
+    } else {
+        None
+    };
+    let had = ui.selection.take().is_some() && starts;
+    let screen = ui.screen;
+    let flow = on_mouse_action(event, state, ui);
+    if let Some(area) = area
+        && ui.screen == screen
+    {
+        ui.selection = Some(selection::Selection::start(area, at));
+    }
+    match flow {
+        Flow::Continue { redraw } => Flow::Continue {
+            redraw: redraw || had,
+        },
+        Flow::Quit => Flow::Quit,
+    }
+}
+
+/// Where a drag starting at `at` would select, if anywhere.
+///
+/// The dash's panes, the scratch shell and the diff — the places with text a
+/// person might want to copy. Not over a program that took the mouse (that
+/// drag is the program's), and not over the pick lists, whose rows act on a
+/// press.
+fn selectable_area(ui: &Ui, at: ratatui::layout::Position) -> Option<Rect> {
+    let body = ui.body_area();
+    let pty_took_it = ui.terminals.wants_mouse().is_some();
+    if ui.screen == Screen::Dash {
+        let (_, rows) = dash::layout(body, ui.drawn_panes(), &ui.theme);
+        let terminal = rows.terminal.filter(|_| !pty_took_it);
+        return [rows.repos, rows.worktrees, terminal]
+            .into_iter()
+            .flatten()
+            .find(|area| area.contains(at));
+    }
+    let (count, hints) = ui.overlay_shape(body)?;
+    let laid = overlay::layout(body, count, hints);
+    let area = match ui.screen {
+        Screen::Shell if !pty_took_it => shell_pty_area(laid.parts.body),
+        Screen::Diff => laid.parts.body,
+        _ => return None,
+    };
+    area.contains(at).then_some(area)
+}
+
+/// What a mouse event does, selection aside.
+fn on_mouse_action(event: MouseEvent, state: &mut State, ui: &mut Ui) -> Flow {
     if ui.screen != Screen::Dash {
         return on_overlay_mouse(event, state, ui);
     }
@@ -1382,6 +1488,21 @@ enum Flow {
 }
 
 fn handle(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
+    // A key or a resize ends a selection: the key is the user moving on, and
+    // after a resize the highlighted cells are no longer the same text.
+    let cleared = matches!(
+        input,
+        Input::Terminal(TermEvent::Key(_) | TermEvent::Resize(..))
+    ) && ui.selection.take().is_some();
+    match handle_input(input, state, ui) {
+        Flow::Continue { redraw } => Flow::Continue {
+            redraw: redraw || cleared,
+        },
+        Flow::Quit => Flow::Quit,
+    }
+}
+
+fn handle_input(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
     match input {
         Input::Terminal(TermEvent::Key(key)) => {
             let routed = ui.router.route(ui.screen, ui.focus, key);
@@ -2324,6 +2445,25 @@ fn connect(workspace: &Path, inputs: &Inputs) -> State {
 }
 
 fn draw(f: &mut ratatui::Frame, state: &State, ui: &Ui) {
+    draw_screen(f, state, ui);
+    if let Some(selection) = &ui.selection {
+        selection.highlight(f.buffer_mut());
+    }
+}
+
+/// What a selection is read from: the frame, drawn again off screen exactly
+/// as it was drawn on it, so what is copied is what was highlighted.
+fn selected_text(state: &State, ui: &Ui, selection: &selection::Selection) -> String {
+    // A test backend cannot fail to start: its error type is uninhabited.
+    let Ok(mut offscreen) =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(ui.width, ui.height));
+    if offscreen.draw(|f| draw_screen(f, state, ui)).is_err() {
+        return String::new();
+    }
+    selection.text(offscreen.backend().buffer())
+}
+
+fn draw_screen(f: &mut ratatui::Frame, state: &State, ui: &Ui) {
     // Two rows at the bottom: the status bar, and a blank one above it. The
     // mock sets the bar off from the panes with `margin-top:12px` rather than
     // butting it against them, and a row is what that is here.
@@ -4017,6 +4157,139 @@ mod tests {
             Some("b"),
             "the list took the click"
         );
+    }
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> Input {
+        Input::Terminal(TermEvent::Mouse(MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }))
+    }
+
+    /// Press at `from`, drag to `to`, let go.
+    fn drag(s: &mut State, ui: &mut Ui, from: (u16, u16), to: (u16, u16)) {
+        handle(
+            mouse(MouseEventKind::Down(MouseButton::Left), from.0, from.1),
+            s,
+            ui,
+        );
+        handle(
+            mouse(MouseEventKind::Drag(MouseButton::Left), to.0, to.1),
+            s,
+            ui,
+        );
+        handle(
+            mouse(MouseEventKind::Up(MouseButton::Left), to.0, to.1),
+            s,
+            ui,
+        );
+    }
+
+    #[test]
+    fn dragging_across_a_branch_copies_it() {
+        // The acceptance: drag over text in a pane, let go, and it is on the
+        // clipboard — exactly the characters that were highlighted.
+        let (mut s, _theirs, mut ui) = a_dash_to_click();
+        let (column, row) = where_painted(&s, &ui, "feat/second");
+        let end = column + u16::try_from("feat/second".len()).unwrap() - 1;
+        drag(&mut s, &mut ui, (column, row), (end, row));
+        assert_eq!(ui.clipboard.as_deref(), Some("feat/second"));
+    }
+
+    #[test]
+    fn a_click_is_still_a_click_and_copies_nothing() {
+        let (mut s, _theirs, mut ui) = a_dash_to_click();
+        let (column, row) = where_painted(&s, &ui, "feat/third");
+        handle(click(column, row), &mut s, &mut ui);
+        handle(
+            mouse(MouseEventKind::Up(MouseButton::Left), column, row),
+            &mut s,
+            &mut ui,
+        );
+        assert_eq!(ui.clipboard, None, "no drag, no copy");
+        assert!(ui.selection.is_none(), "and nothing left highlighted");
+        assert_eq!(
+            ui.worktrees
+                .selected()
+                .map(|row| row.worktree.branch.as_str()),
+            Some("feat/third"),
+            "the click did what a click does"
+        );
+    }
+
+    #[test]
+    fn a_selection_never_leaves_the_pane_it_started_in() {
+        // Dragging from the list out over the terminal pane selects to the
+        // list's edge, not into the terminal beside it.
+        let (mut s, _theirs, mut ui) = a_dash_to_click();
+        let (column, row) = where_painted(&s, &ui, "feat/third");
+        let far_right = ui.width - 2;
+        drag(&mut s, &mut ui, (column, row), (far_right, row));
+        let copied = ui.clipboard.clone().expect("something was selected");
+        assert!(copied.starts_with("feat/third"), "{copied:?}");
+        // Past the list's edge there is its border, the gap, and the next
+        // pane's border before anything of the terminal's — so a selection
+        // that leaked would carry a `│` whatever the terminal is showing.
+        assert!(
+            !copied.contains('│'),
+            "nothing past the pane's edge may be in it: {copied:?}"
+        );
+    }
+
+    #[test]
+    fn the_selection_is_highlighted_until_a_key_is_pressed() {
+        let (mut s, _theirs, mut ui) = a_dash_to_click();
+        let (column, row) = where_painted(&s, &ui, "feat/second");
+        drag(&mut s, &mut ui, (column, row), (column + 4, row));
+        let reversed = |ui: &Ui, s: &State| {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 40)).unwrap();
+            terminal.draw(|f| draw(f, s, ui)).unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            (0..5)
+                .filter(|dx| {
+                    buffer[(column + dx, row)]
+                        .style()
+                        .add_modifier
+                        .contains(ratatui::style::Modifier::REVERSED)
+                })
+                .count()
+        };
+        assert_eq!(reversed(&ui, &s), 5, "the dragged cells are shown selected");
+        handle(key(KeyCode::Down), &mut s, &mut ui);
+        assert_eq!(reversed(&ui, &s), 0, "a key ends the selection");
+    }
+
+    #[test]
+    fn a_drag_over_a_program_that_took_the_mouse_is_the_programs() {
+        // vim with mouse=a selects in its own way; grove must not also
+        // start one on top of it.
+        let (mut s, mut theirs, mut ui) = a_terminal_to_click(true);
+        let pty = terminal_rows(&ui);
+        drag(
+            &mut s,
+            &mut ui,
+            (pty.x + 1, pty.y + 1),
+            (pty.x + 6, pty.y + 1),
+        );
+        assert!(ui.selection.is_none());
+        assert_eq!(ui.clipboard, None);
+        // The program asked for mode 1000 — presses and releases, no motion
+        // — so that is what it gets: the gesture's ends, and grove keeps out.
+        let asked = sent(&mut theirs);
+        let reached = |prefix: &[u8], end: u8| {
+            asked.iter().any(|request| matches!(
+                request,
+                Request::Input { bytes, .. } if bytes.starts_with(prefix) && bytes.last() == Some(&end)
+            ))
+        };
+        assert!(
+            reached(b"\x1b[<0;", b'M'),
+            "the press reached it: {asked:?}"
+        );
+        assert!(reached(b"\x1b[<0;", b'm'), "and the release: {asked:?}");
     }
 
     #[test]
