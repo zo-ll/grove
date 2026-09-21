@@ -499,10 +499,7 @@ pub fn render(
         } else {
             theme.frame_style()
         };
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(theme.border())
-            .border_style(border);
+        let block = pane_block(theme).border_style(border);
         let within = block.inner(rect);
         block.render(rect, buf);
         inner.set(
@@ -545,7 +542,21 @@ fn header(
         height: 1,
     };
     Paragraph::new(line).render(at, buf);
+    contents(within, theme)
+}
 
+/// Where a pane's rows go, given the area inside its border.
+///
+/// Pure, and the only place this arithmetic lives: drawing uses it to place
+/// the rows, and the mouse uses it to find which row was clicked. Two copies
+/// would agree until the day one was edited, and then a click would select
+/// the row above the one under the pointer.
+fn contents(within: Rect, theme: &Theme) -> Option<Rect> {
+    if within.width == 0 || within.height == 0 {
+        return None;
+    }
+    let pad = theme.padding();
+    let room = within.width.saturating_sub(pad * 2);
     // The mock puts space under the header before the first row — 8px of
     // padding, which is a blank line here. Compact spends neither that line
     // nor the side columns.
@@ -561,6 +572,33 @@ fn header(
         width: room,
         height,
     })
+}
+
+/// The frame of each pane and the area its rows occupy, without drawing.
+///
+/// What [`render`] would produce for the same arguments, for a caller that
+/// needs to know where things are rather than to put them there — the mouse.
+pub fn layout(area: Rect, panes: Panes, theme: &Theme) -> (Areas, Areas) {
+    let frames = split(area, panes);
+    let mut rows = Areas {
+        repos: None,
+        worktrees: None,
+        terminal: None,
+    };
+    for pane in [Focus::Repos, Focus::Worktrees, Focus::Terminal] {
+        if let Some(rect) = frames.of(pane) {
+            rows.set(pane, contents(pane_block(theme).inner(rect), theme));
+        }
+    }
+    (frames, rows)
+}
+
+/// A pane's border, as drawn. Only its shape matters to [`layout`]; the
+/// colours are [`render`]'s business.
+fn pane_block(theme: &Theme) -> Block<'static> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(theme.border())
 }
 
 #[cfg(test)]

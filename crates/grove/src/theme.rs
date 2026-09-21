@@ -801,6 +801,7 @@ mod tests {
         ("help.rs", include_str!("help.rs")),
         ("keymap.rs", include_str!("keymap.rs")),
         ("main.rs", include_str!("main.rs")),
+        ("mouse.rs", include_str!("mouse.rs")),
         ("overlay.rs", include_str!("overlay.rs")),
         ("palette.rs", include_str!("palette.rs")),
         ("prune.rs", include_str!("prune.rs")),
