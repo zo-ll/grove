@@ -82,6 +82,12 @@ impl Repos {
     }
 
     /// How many repositories exist under the workspace, whoever holds them.
+    /// Branched worktrees across the session's member repos, the clones
+    /// excluded — the number the session shell's header gives.
+    pub fn member_worktrees(&self) -> u32 {
+        self.rows.iter().map(|row| row.worktrees).sum()
+    }
+
     pub fn workspace_count(&self) -> usize {
         self.all.len()
     }
