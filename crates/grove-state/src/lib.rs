@@ -12,6 +12,8 @@ use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 const FORMAT_VERSION: u32 = 1;
@@ -30,6 +32,8 @@ pub struct StoredSession {
     pub members: Vec<RepoId>,
     pub owned: Vec<OwnedWorktree>,
     pub state: SessionState,
+    #[serde(default)]
+    pub state_changed_at: u64,
 }
 
 /// Metadata needed to recreate a terminal shell after the daemon has stopped.
@@ -132,6 +136,7 @@ pub struct Store {
     path: PathBuf,
     session_paths: bool,
     state: StateFile,
+    clock: Arc<dyn Fn() -> u64 + Send + Sync>,
 }
 
 impl Store {
@@ -146,6 +151,20 @@ impl Store {
     }
 
     pub fn load_at(state_home: &Path, workspace: &Path, worktree_template: &str) -> Self {
+        Self::load_at_with_clock(
+            state_home,
+            workspace,
+            worktree_template,
+            Arc::new(unix_time_seconds),
+        )
+    }
+
+    pub fn load_at_with_clock(
+        state_home: &Path,
+        workspace: &Path,
+        worktree_template: &str,
+        clock: Arc<dyn Fn() -> u64 + Send + Sync>,
+    ) -> Self {
         let path = state_home
             .join("grove")
             .join(workspace_hash(workspace))
@@ -157,15 +176,32 @@ impl Store {
             .unwrap_or_default();
 
         // Loading happens when a daemon starts. No PTY survives that boundary.
+        let now = clock();
+        let mut changed = state.open.take().is_some();
         for session in &mut state.sessions {
-            session.state = SessionState::Closed;
+            if session.state != SessionState::Closed {
+                session.state = SessionState::Closed;
+                session.state_changed_at = now;
+                changed = true;
+            } else if session.state_changed_at == 0 {
+                // Version 1 state written before this field existed.
+                session.state_changed_at = now;
+                changed = true;
+            }
         }
-        state.open = None;
-        Self {
+        let store = Self {
             path,
             session_paths: worktree_template.contains("{session}"),
             state,
+            clock,
+        };
+        if changed {
+            // Loading remains best-effort, as it is for unreadable and corrupt
+            // state, but persist the restart's transition to Closed so another
+            // restart does not reset its age again.
+            let _ = store.persist();
         }
+        store
     }
 
     pub fn path(&self) -> &Path {
@@ -178,6 +214,11 @@ impl Store {
 
     pub fn open_session(&self) -> Option<&SessionId> {
         self.state.open.as_ref()
+    }
+
+    pub fn seconds_in_state(&self, session: &SessionId) -> Result<u64, Error> {
+        let changed_at = self.session(session)?.state_changed_at;
+        Ok((self.clock)().saturating_sub(changed_at))
     }
 
     pub fn create(&mut self, id: SessionId, name: String) -> Result<(), Error> {
@@ -200,6 +241,7 @@ impl Store {
             members: Vec::new(),
             owned: Vec::new(),
             state: SessionState::Closed,
+            state_changed_at: (self.clock)(),
         });
         self.persist()
     }
@@ -237,19 +279,21 @@ impl Store {
 
     pub fn open(&mut self, id: &SessionId) -> Result<(), Error> {
         self.session(id)?;
+        let now = (self.clock)();
         if let Some(previous) = self.state.open.take()
             && previous != *id
             && let Ok(session) = self.session_mut(&previous)
         {
-            session.state = SessionState::Detached;
+            set_state(session, SessionState::Detached, now);
         }
-        self.session_mut(id)?.state = SessionState::Attached;
+        set_state(self.session_mut(id)?, SessionState::Attached, now);
         self.state.open = Some(id.clone());
         self.persist()
     }
 
     pub fn detach(&mut self, id: &SessionId) -> Result<(), Error> {
-        self.session_mut(id)?.state = SessionState::Detached;
+        let now = (self.clock)();
+        set_state(self.session_mut(id)?, SessionState::Detached, now);
         if self.state.open.as_ref() == Some(id) {
             self.state.open = None;
         }
@@ -257,7 +301,8 @@ impl Store {
     }
 
     pub fn close(&mut self, id: &SessionId) -> Result<(), Error> {
-        self.session_mut(id)?.state = SessionState::Closed;
+        let now = (self.clock)();
+        set_state(self.session_mut(id)?, SessionState::Closed, now);
         if self.state.open.as_ref() == Some(id) {
             self.state.open = None;
         }
@@ -486,6 +531,20 @@ impl Store {
         let bytes = serde_json::to_vec_pretty(&self.state)?;
         write_atomic(&self.path, &bytes)
     }
+}
+
+fn set_state(session: &mut StoredSession, state: SessionState, now: u64) {
+    if session.state != state {
+        session.state = state;
+        session.state_changed_at = now;
+    }
+}
+
+fn unix_time_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 fn normalize_session_name(name: String) -> String {

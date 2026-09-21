@@ -377,6 +377,7 @@ mod tests {
                 members: vec![RepoId("repo".into())],
                 owned: vec![worktree.clone()],
                 state,
+                state_changed_at: 0,
             }];
             assert_eq!(live_owner(&sessions, &worktree).is_some(), expected);
         }

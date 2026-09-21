@@ -1321,7 +1321,7 @@ impl SessionOrchestrator {
             members,
             state: stored.state,
             terminals: u32::try_from(terminals).unwrap_or(u32::MAX),
-            since: 0,
+            since: self.store.seconds_in_state(session)?,
             size: 0,
         })
     }
@@ -1987,6 +1987,7 @@ mod tests {
     use std::env;
     use std::fs;
     use std::process::Command;
+    use std::sync::Arc;
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -2298,6 +2299,56 @@ mod tests {
                 .iter()
                 .all(|session| session.name == "duplicate")
         );
+    }
+
+    #[test]
+    fn session_since_uses_an_injected_clock_and_survives_restart() {
+        let temp = TempDir::new();
+        let state_home = temp.0.join("state");
+        let now = Arc::new(AtomicU64::new(1_000));
+        let clock = {
+            let now = Arc::clone(&now);
+            Arc::new(move || now.load(Ordering::SeqCst))
+        };
+        let mut store = Store::load_at_with_clock(&state_home, &temp.0, "", clock);
+        store.create(sid("one"), "one".into()).unwrap();
+        store.open(&sid("one")).unwrap();
+        let terminals = TerminalManager::new(PathBuf::from("/bin/sh"), temp.0.clone(), 100);
+        let fetch = FetchPolicy::new(2, Duration::from_secs(60));
+        let runtime = DaemonRuntime::load_source("", "session-since").runtime;
+        let mut daemon =
+            SessionOrchestrator::new(store, Vec::new(), temp.0.clone(), terminals, fetch, runtime);
+
+        daemon.detach(&sid("one")).unwrap();
+        now.store(1_061, Ordering::SeqCst);
+        let events = daemon.handle_request(Request::ListSessions);
+        let Some(Event::Sessions(rows)) = events.first() else {
+            panic!("expected Sessions, got {events:?}")
+        };
+        let row = rows.iter().find(|row| row.id == sid("one")).unwrap();
+        assert_eq!(row.state, SessionState::Detached);
+        assert_eq!(row.since, 61);
+
+        daemon.close(&sid("one")).unwrap();
+        drop(daemon);
+        now.store(1_122, Ordering::SeqCst);
+        let clock = {
+            let now = Arc::clone(&now);
+            Arc::new(move || now.load(Ordering::SeqCst))
+        };
+        let store = Store::load_at_with_clock(&state_home, &temp.0, "", clock);
+        let terminals = TerminalManager::new(PathBuf::from("/bin/sh"), temp.0.clone(), 100);
+        let fetch = FetchPolicy::new(2, Duration::from_secs(60));
+        let runtime = DaemonRuntime::load_source("", "session-since-restart").runtime;
+        let mut daemon =
+            SessionOrchestrator::new(store, Vec::new(), temp.0.clone(), terminals, fetch, runtime);
+        let events = daemon.handle_request(Request::ListSessions);
+        let Some(Event::Sessions(rows)) = events.first() else {
+            panic!("expected Sessions, got {events:?}")
+        };
+        let row = rows.iter().find(|row| row.id == sid("one")).unwrap();
+        assert_eq!(row.state, SessionState::Closed);
+        assert_eq!(row.since, 61);
     }
 
     fn remote_base(path: &Path, branch: &str) {

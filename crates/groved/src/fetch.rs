@@ -231,6 +231,7 @@ mod tests {
             members: members.iter().map(|id| RepoId((*id).into())).collect(),
             owned: Vec::new(),
             state: SessionState::Closed,
+            state_changed_at: 0,
         }
     }
 
