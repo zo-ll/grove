@@ -2333,6 +2333,7 @@ fn handle_input(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
             // Keep the row, not just the id: the bar names the open session,
             // the picker lists it, and both need more than an id to do it.
             ui.sessions.upsert(row.clone());
+            ui.worktrees.name_sessions(ui.sessions.rows());
             match row.state {
                 grove_domain::SessionState::Attached => ui.session = Some(row.id.clone()),
                 // The session we were in stopped being open. Forgetting it is
@@ -2352,6 +2353,7 @@ fn handle_input(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
                 .find(|row| row.state == grove_domain::SessionState::Attached)
                 .map(|row| row.id.clone());
             ui.sessions.set(rows);
+            ui.worktrees.name_sessions(ui.sessions.rows());
             Flow::Continue { redraw: true }
         }
 
@@ -4171,6 +4173,49 @@ mod tests {
         assert!(
             asked.contains(&Request::ListWorktrees(grove_domain::RepoId("repo".into()))),
             "the row still says it has no terminal, which is the daemon's to correct: {asked:?}"
+        );
+    }
+
+    #[test]
+    fn another_sessions_rows_name_it_rather_than_its_id() {
+        // Found by hand: in a second session, the first one's worktrees were
+        // labelled `18d74f973718b6a3-0` — an id nobody has ever been shown.
+        let (mut s, _theirs, mut ui) = a_dash_to_click();
+        handle(
+            Input::Daemon(DaemonEvent::SessionChanged(grove_proto::SessionRow {
+                id: grove_domain::SessionId("18d7-0".into()),
+                name: "older work".into(),
+                members: vec!["repo".into()],
+                state: grove_domain::SessionState::Closed,
+                terminals: 0,
+                since: 0,
+                size: 0,
+            })),
+            &mut s,
+            &mut ui,
+        );
+        handle(
+            Input::Daemon(DaemonEvent::Worktrees {
+                repo: grove_domain::RepoId("repo".into()),
+                rows: vec![worktree_row(
+                    "feat/theirs",
+                    grove_domain::Ownership::Other(grove_domain::SessionId("18d7-0".into())),
+                )],
+            }),
+            &mut s,
+            &mut ui,
+        );
+        let screen = painted_dash(&s, &ui, 160, 40).join("\n");
+        assert!(screen.contains("older work"), "{screen}");
+        assert!(!screen.contains("18d7-0"), "{screen}");
+
+        ui.focus = Focus::Worktrees;
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('a')), &mut s, &mut ui);
+        let note = ui.note.clone().expect("adopting it is refused");
+        assert!(
+            note.contains("older work") && !note.contains("18d7-0"),
+            "{note}"
         );
     }
 
