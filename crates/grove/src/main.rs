@@ -736,6 +736,26 @@ fn act_on_session(intent: Option<sessions::Intent>, state: &mut State, ui: &mut 
     true
 }
 
+/// Open the palette already in `new`'s argument view, as if `new` had been
+/// typed and chosen.
+fn prefill_new(ui: &mut Ui) -> bool {
+    ui.screen = Screen::Palette;
+    ui.palette.open();
+    let Some(new) = ui
+        .palette
+        .matches()
+        .into_iter()
+        .find(|entry| entry.name == "new" && entry.user.is_none())
+    else {
+        // Unreachable while `new` is a built-in, and a palette with nothing
+        // prefilled is still the right place to have landed.
+        return true;
+    };
+    let repos = ui.repos.all().to_vec();
+    ui.palette.argue(new, &repos);
+    true
+}
+
 /// Open the session shell, or close it if it is what is open.
 ///
 /// One per session, kept by the daemon: grove attaches to the one it knows
@@ -1968,6 +1988,35 @@ fn handle_input(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
                 Routed::Act(Action::OpenSessionShell) => Flow::Continue {
                     redraw: open_session_shell(state, ui),
                 },
+                // Straight to `new`'s picker, which is what the first-run
+                // guidance promises this key does.
+                Routed::Act(Action::PrefillNew) => Flow::Continue {
+                    redraw: prefill_new(ui),
+                },
+                Routed::Act(Action::Snapshot) => {
+                    let request = ui.session.clone().map(Request::SaveSnapshot);
+                    match request {
+                        Some(request) => {
+                            if let Err(e) = send(state, &request) {
+                                ui.note = Some(format!("could not reach the daemon: {e}"));
+                            }
+                        }
+                        None => ui.note = Some("snapshot needs an open session".into()),
+                    }
+                    Flow::Continue { redraw: true }
+                }
+                // §3.3: the selected worktree in `config.editor`. The daemon
+                // spawns it, detached; grove only names the worktree.
+                Routed::Act(Action::OpenEditor) if ui.screen == Screen::Dash => {
+                    let Some(worktree) = ui.worktrees.selected().map(|row| row.worktree.clone())
+                    else {
+                        return Flow::Continue { redraw: false };
+                    };
+                    if let Err(e) = send(state, &Request::OpenEditor(worktree)) {
+                        ui.note = Some(format!("could not reach the daemon: {e}"));
+                    }
+                    Flow::Continue { redraw: true }
+                }
                 Routed::Act(Action::OpenPicker) => Flow::Continue {
                     redraw: open_picker(state, ui),
                 },
@@ -4871,6 +4920,89 @@ mod tests {
         handle(key(KeyCode::Char('?')), &mut s, &mut ui);
         let screen = painted_dash(&s, &ui, 160, 60).join("\n");
         assert!(screen.contains("session shell"), "{screen}");
+    }
+
+    #[test]
+    fn g_n_opens_new_ready_for_a_branch_name() {
+        let (mut s, _theirs, mut ui) = a_dash_to_click();
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('n')), &mut s, &mut ui);
+        assert_eq!(ui.screen, Screen::Palette);
+        assert_eq!(
+            ui.palette.arguing().map(|entry| entry.name.as_str()),
+            Some("new")
+        );
+        for c in "feat/x".chars() {
+            handle(key(KeyCode::Char(c)), &mut s, &mut ui);
+        }
+        assert_eq!(
+            ui.palette.argument(),
+            Some("feat/x"),
+            "typing goes to the branch name"
+        );
+    }
+
+    #[test]
+    fn g_capital_s_snapshots_the_open_session() {
+        let (mut s, mut theirs, mut ui) = a_dash_to_click();
+        let _ = sent(&mut theirs);
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('S')), &mut s, &mut ui);
+        assert!(
+            sent(&mut theirs)
+                .contains(&Request::SaveSnapshot(grove_domain::SessionId("s1".into())))
+        );
+    }
+
+    #[test]
+    fn g_o_opens_the_selected_worktree_in_the_editor() {
+        let (mut s, mut theirs, mut ui) = a_dash_to_click();
+        let _ = sent(&mut theirs);
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('o')), &mut s, &mut ui);
+        let asked = sent(&mut theirs);
+        assert!(
+            asked.iter().any(|request| matches!(
+                request,
+                Request::OpenEditor(worktree) if worktree.branch == "feat/first"
+            )),
+            "{asked:?}"
+        );
+    }
+
+    #[test]
+    fn every_bound_key_has_a_handler() {
+        // `^g n`, `^g o` and `^g S` were bound, listed in `^g ?`, `^g n` was
+        // even in the first-run guidance — and nothing handled them, so they
+        // did nothing at all. A key the keymap offers must be one grove acts
+        // on. Read from the source because an unhandled action compiles
+        // happily: it falls through to the catch-all like any other key.
+        let source = include_str!("main.rs");
+        let handlers = source
+            .split("#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("main.rs has code before its tests");
+        let mut missing = Vec::new();
+        for screen in [
+            Screen::Dash,
+            Screen::Palette,
+            Screen::Picker,
+            Screen::Prune,
+            Screen::Diff,
+            Screen::Shell,
+            Screen::EndSession,
+        ] {
+            for binding in keymap::bindings(screen) {
+                let action = format!("{:?}", binding.action);
+                let name = action.split('(').next().expect("an action name");
+                if !handlers.contains(&format!("Routed::Act(Action::{name}")) {
+                    missing.push(format!("{} on {screen:?}", keymap::label_of(binding)));
+                }
+            }
+        }
+        missing.sort();
+        missing.dedup();
+        assert!(missing.is_empty(), "bound but never handled: {missing:?}");
     }
 
     #[test]
