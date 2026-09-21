@@ -31,7 +31,7 @@
 //! behind, dirty and age; it cannot answer "how far along is this branch", and
 //! the source mock's progress bars were inventing it.
 
-use grove_domain::Ownership;
+use grove_domain::{Ownership, SessionId};
 use grove_proto::WorktreeRow;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -75,9 +75,28 @@ pub enum Intent {
 pub struct Worktrees {
     rows: Vec<WorktreeRow>,
     cursor: usize,
+    /// Session names by id, from the session list: a row owned elsewhere
+    /// carries only the owner's id, and nobody has ever been shown one.
+    names: Vec<(SessionId, String)>,
 }
 
 impl Worktrees {
+    /// Learn the sessions' names, for the rows another session owns.
+    pub fn name_sessions(&mut self, rows: &[grove_proto::SessionRow]) {
+        self.names = rows
+            .iter()
+            .map(|row| (row.id.clone(), row.name.clone()))
+            .collect();
+    }
+
+    /// A session's name, or its id while the session list has not said.
+    fn owner(&self, session: &SessionId) -> String {
+        self.names
+            .iter()
+            .find(|(id, _)| id == session)
+            .map_or_else(|| session.0.clone(), |(_, name)| name.clone())
+    }
+
     /// Replace the rows, keeping the cursor on the same branch where possible.
     ///
     /// Same reason as the REPOS pane: this list is re-sent for reasons the user
@@ -154,9 +173,10 @@ impl Worktrees {
                 Intent::Refused("the clone is the repository itself and is never owned".into())
             }
             Ownership::Ours => Intent::Refused("this session already owns it".into()),
-            Ownership::Other(session) => {
-                Intent::Refused(format!("{} owns it — release it there first", session.0))
-            }
+            Ownership::Other(session) => Intent::Refused(format!(
+                "{} owns it — release it there first",
+                self.owner(session)
+            )),
             // A detached checkout has no branch name, and adoption is recorded
             // by branch: §2 stores owned worktrees as repo + branch, so there
             // is nothing to write down.
@@ -176,7 +196,7 @@ impl Worktrees {
                 Intent::Refused("the clone is the repository itself and is never owned".into())
             }
             Ownership::Other(session) => {
-                Intent::Refused(format!("{} owns it, not this session", session.0))
+                Intent::Refused(format!("{} owns it, not this session", self.owner(session)))
             }
             Ownership::Unowned => Intent::Refused("nothing owns it".into()),
         })
@@ -243,7 +263,7 @@ impl Worktrees {
 
         let age = age_label(row.age);
         let owner = match &row.ownership {
-            Ownership::Other(session) => Some(session.0.clone()),
+            Ownership::Other(session) => Some(self.owner(session)),
             _ => None,
         };
 
