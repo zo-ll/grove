@@ -224,16 +224,20 @@ impl Prune {
                         format!("{:<22}", truncate(&row.candidate.worktree.branch, 22)),
                         Ink::Subtext,
                     ),
-                    (format!("{:<22}", reason(row)), Ink::Subtext),
+                    (format!("{:<22}", truncate(&reason(row), 22)), Ink::Subtext),
                     (format!("{:>7}", bytes(row.candidate.size)), Ink::Faint),
                 ],
                 theme,
             );
             // The reason keeps its own colour on an unselected row: safe rows
             // read as safe, and blocked ones read as the thing blocking them.
+            // Span 6: `row` puts a separator between cells, so the cells sit
+            // at the even indices — box 0, repo 2, branch 4, reason 6, size 8.
+            // This replaced 7, the separator after the reason, and every row
+            // but the selected one printed its reason twice.
             if !here {
-                spans[7] = Span::styled(
-                    format!("{:<22}", reason(row)),
+                spans[6] = Span::styled(
+                    format!("{:<22}", truncate(&reason(row), 22)),
                     if row.safe() {
                         theme.style(Role::Clean)
                     } else if row.owned_elsewhere() {
@@ -339,6 +343,40 @@ mod tests {
                 }],
             ),
         ]
+    }
+
+    #[test]
+    fn each_rows_reason_is_written_once_and_fits_its_column() {
+        // Every row but the selected one read `● owned by invoice split●
+        // owned by invoice split`: recolouring the reason replaced the span
+        // after it rather than the reason itself.
+        let mut prune = Prune::default();
+        prune.set(listing());
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 10,
+        };
+        let mut buf = Buffer::empty(area);
+        prune.render(&mut buf, crate::overlay::Parts::of(area), &theme());
+        let screen: Vec<String> = (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect();
+        let owned = screen
+            .iter()
+            .find(|line| line.contains("billing-svc"))
+            .expect("the owned row");
+        assert_eq!(owned.matches("owned by").count(), 1, "{owned}");
+        let unmerged = screen
+            .iter()
+            .find(|line| line.contains("unmerged"))
+            .expect("the unmerged row");
+        assert_eq!(unmerged.matches("unmerged").count(), 1, "{unmerged}");
     }
 
     #[test]
