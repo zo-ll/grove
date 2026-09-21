@@ -489,14 +489,15 @@ impl Palette {
                 let Takes::Argument(what) = command.takes else {
                     return;
                 };
-                Paragraph::new(Line::styled(
-                    format!(
-                        "type a {} and press enter",
-                        what.trim_matches(['<', '>', '[', ']', '…'])
-                    ),
-                    theme.ink_style(Ink::Faint),
-                ))
-                .render(body, buf);
+                let noun = what.trim_matches(['<', '>', '[', ']', '…']);
+                // `[repo]` is optional, and leaving it out is the usual case:
+                // saying only "type a repo" reads as if it were required.
+                let prompt = if what.starts_with('[') {
+                    format!("type a {noun}, or press enter for all")
+                } else {
+                    format!("type a {noun} and press enter")
+                };
+                Paragraph::new(Line::styled(prompt, theme.ink_style(Ink::Faint))).render(body, buf);
                 return;
             }
 
@@ -946,6 +947,16 @@ mod tests {
         let palette = arguing("new", &[based("api", "main"), based("scratchpad", "")]);
         let screen = painted_palette(&palette);
         assert!(screen.contains("no base branch"), "{screen}");
+    }
+
+    #[test]
+    fn an_optional_argument_says_enter_alone_will_do() {
+        // Found by hand: `fetch [repo]` said "type a repo and press enter",
+        // which reads as required — and the empty enter that fetches every
+        // member is the common case.
+        let palette = arguing("fetch", &[repo("a", true)]);
+        let screen = painted_palette(&palette);
+        assert!(screen.contains("or press enter for all"), "{screen}");
     }
 
     #[test]
