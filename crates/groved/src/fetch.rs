@@ -39,6 +39,7 @@ pub struct StaleAfterError {
 
 /// Fetches only when one of its methods is called and joins every worker before
 /// returning. It owns no timer and starts no persistent background thread.
+#[derive(Clone, Debug)]
 pub struct FetchPolicy {
     max_concurrency: usize,
     stale_after: Duration,

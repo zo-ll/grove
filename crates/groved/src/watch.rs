@@ -59,7 +59,7 @@ impl Broadcaster {
         receiver
     }
 
-    fn send(&self, event: Event) {
+    pub(crate) fn send(&self, event: Event) {
         if let Ok(mut clients) = self.clients.lock() {
             clients.retain(|client| match client.try_send(event.clone()) {
                 Ok(()) | Err(mpsc::TrySendError::Full(_)) => true,
