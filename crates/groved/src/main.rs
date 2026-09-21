@@ -54,7 +54,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 terminals,
                 fetch,
                 runtime,
-            );
+            )
+            .with_socket_path(daemon.path());
             daemon.run(service)?;
         }
         BindOutcome::Existing(_) => {}

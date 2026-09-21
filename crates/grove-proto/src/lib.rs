@@ -77,7 +77,7 @@ use serde::{Deserialize, Serialize};
 /// order is irrelevant and *any* addition breaks an older peer. The failure is
 /// clean rather than silent: framing is length-delimited, so an unknown variant
 /// is a decode error on one frame and the stream stays aligned.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Largest frame the reader will accept, to bound memory on a hostile or
 /// confused peer. Terminal output is chunked well below this.
@@ -113,6 +113,11 @@ pub struct TerminalRow {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TerminalTarget {
     Worktree(WorktreeRef),
+    /// One shell for the whole session, carrying a snapshot of its workspace
+    /// context in `GROVE_*` environment variables.
+    Session {
+        session: SessionId,
+    },
     /// `cwd` defaults to `config.scratch_cwd` when absent.
     Scratch {
         cwd: Option<PathBuf>,
@@ -904,6 +909,9 @@ mod tests {
                 worktree: wt.clone(),
             },
             Request::SpawnTerminal(TerminalTarget::Scratch { cwd: None }),
+            Request::SpawnTerminal(TerminalTarget::Session {
+                session: sid.clone(),
+            }),
             Request::KillTerminal(tid),
             Request::ResizeTerminal {
                 terminal: tid,
@@ -997,6 +1005,12 @@ mod tests {
             Event::Sessions(vec![session.clone()]),
             Event::TerminalSpawned {
                 target: TerminalTarget::Scratch { cwd: None },
+                terminal: tid,
+            },
+            Event::TerminalSpawned {
+                target: TerminalTarget::Session {
+                    session: SessionId("s".into()),
+                },
                 terminal: tid,
             },
             Event::Terminals(vec![TerminalRow {
