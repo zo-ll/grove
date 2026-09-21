@@ -2213,6 +2213,14 @@ mod tests {
             )),
             "duplicate name must identify its holder: {events:?}"
         );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                Event::Failed { message, .. }
+                    if message.ends_with("held by session holder")
+            )),
+            "the holder is named plainly, not as a debug-printed id: {events:?}"
+        );
         assert_eq!(daemon.store().sessions().len(), 1);
 
         let events = daemon.handle_request(Request::SessionNew {
