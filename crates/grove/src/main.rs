@@ -636,10 +636,30 @@ fn run_command(chosen: Option<palette::Entry>, state: &mut State, ui: &mut Ui) -
         // arrive.
         "prune" => Some(Request::ListPruneCandidates),
         "snapshot" => ui.session.clone().map(Request::SaveSnapshot),
-        // `defaults` is an editor and `keys` the help overlay (#30). Each is
-        // a screen rather than a request.
+        // The help overlay, for the screen the palette was opened over.
+        "keys" => {
+            ui.screen = Screen::Dash;
+            ui.helping = Some(Screen::Dash);
+            ui.help.open();
+            return true;
+        }
+        // An editor for the settings is not built. Saying where they live is
+        // better than a message about screens that means nothing to anyone
+        // who did not write grove — which is what this used to say.
+        "defaults" => {
+            ui.note = Some(match config_path() {
+                Some(path) => format!(
+                    "no settings editor yet — edit {} and restart grove",
+                    path.display()
+                ),
+                None => {
+                    "no settings editor yet — edit grove/config.lua in your config directory".into()
+                }
+            });
+            return true;
+        }
         _ => {
-            ui.note = Some(format!("{} lands with its screen", command.name));
+            ui.note = Some(format!("{} is not built yet", command.name));
             return true;
         }
     };
@@ -1342,6 +1362,22 @@ fn confirm_argument(state: &mut State, ui: &mut Ui) -> bool {
         return dispatch(requests, state, ui);
     }
 
+    // `open` is how you get to a stored session, so like `session new` it
+    // does not need one open first.
+    if command.name == "open" {
+        let name = argument.trim();
+        let Some(row) = ui.sessions.by_name(name) else {
+            ui.note = Some(if name.is_empty() {
+                "name the session to open — ^g s lists them".into()
+            } else {
+                format!("no session called {name:?} — ^g s lists them")
+            });
+            return true;
+        };
+        requests.push(Request::OpenSession(row.id.clone()));
+        return dispatch(requests, state, ui);
+    }
+
     // Everything else belongs to a session: membership and worktrees are a
     // session's, not the workspace's.
     let Some(session) = ui.session.clone() else {
@@ -1397,10 +1433,21 @@ fn confirm_argument(state: &mut State, ui: &mut Ui) -> bool {
             session: session.clone(),
             name: argument.trim().to_string(),
         }),
+        // Every member, or the one named. The daemon fetches before it
+        // answers, and a connection's requests are answered in order, so
+        // rows asked for after it show the new ↑ and ↓.
+        "fetch" => {
+            let repo = argument.trim();
+            requests.push(Request::Fetch {
+                session: session.clone(),
+                repo: (!repo.is_empty()).then(|| grove_domain::RepoId(repo.into())),
+            });
+            if let Some(showing) = ui.repos.selected() {
+                requests.push(Request::ListWorktrees(showing.repo.clone()));
+            }
+        }
         other => {
-            // `open` needs the session picker (#26) and `fetch` its own
-            // argument list. Said rather than silently doing nothing.
-            ui.note = Some(format!("{other} lands with its screen"));
+            ui.note = Some(format!("{other} is not built yet"));
             return true;
         }
     }
@@ -5119,6 +5166,86 @@ mod tests {
                 .map(|row| row.worktree.branch.as_str()),
             Some("feat/second")
         );
+    }
+
+    /// Type a palette command and press enter; then, if it takes an
+    /// argument, type that and press enter again.
+    fn run_palette(s: &mut State, ui: &mut Ui, command: &str, argument: Option<&str>) {
+        handle(prefix(), s, ui);
+        handle(key(KeyCode::Char('/')), s, ui);
+        for c in command.chars() {
+            handle(key(KeyCode::Char(c)), s, ui);
+        }
+        handle(key(KeyCode::Enter), s, ui);
+        if let Some(argument) = argument {
+            for c in argument.chars() {
+                handle(key(KeyCode::Char(c)), s, ui);
+            }
+            handle(key(KeyCode::Enter), s, ui);
+        }
+    }
+
+    #[test]
+    fn fetch_asks_the_daemon_and_then_for_fresh_rows() {
+        // It answered "fetch lands with its screen" and sent nothing.
+        let (mut s, mut theirs, mut ui) = a_dash_to_click();
+        let _ = sent(&mut theirs);
+        run_palette(&mut s, &mut ui, "fetch", Some(""));
+        let asked = sent(&mut theirs);
+        let fetch = asked
+            .iter()
+            .position(|r| matches!(r, Request::Fetch { repo: None, session } if session.0 == "s1"));
+        let rows = asked
+            .iter()
+            .position(|r| matches!(r, Request::ListWorktrees(_)));
+        assert!(fetch.is_some(), "{asked:?}");
+        assert!(
+            rows > fetch,
+            "rows are asked for after the fetch: {asked:?}"
+        );
+    }
+
+    #[test]
+    fn fetch_can_name_one_repo() {
+        let (mut s, mut theirs, mut ui) = a_dash_to_click();
+        let _ = sent(&mut theirs);
+        run_palette(&mut s, &mut ui, "fetch", Some("repo"));
+        assert!(sent(&mut theirs).iter().any(|r| matches!(
+            r,
+            Request::Fetch { repo: Some(repo), .. } if repo.0 == "repo"
+        )));
+    }
+
+    #[test]
+    fn open_resumes_a_stored_session_by_name() {
+        let (mut s, mut theirs, mut ui) = a_picker_to_click();
+        handle(key(KeyCode::Esc), &mut s, &mut ui);
+        let _ = sent(&mut theirs);
+        run_palette(&mut s, &mut ui, "open", Some("retry jitter"));
+        assert!(
+            sent(&mut theirs).contains(&Request::OpenSession(grove_domain::SessionId("s2".into())))
+        );
+    }
+
+    #[test]
+    fn keys_opens_help() {
+        let (mut s, _theirs, mut ui) = a_dash_to_click();
+        run_palette(&mut s, &mut ui, "keys", None);
+        assert!(ui.helping.is_some());
+    }
+
+    #[test]
+    fn no_command_answers_in_development_jargon() {
+        // "lands with its screen" meant something to whoever wrote it and
+        // nothing to anyone using grove.
+        for command in palette::COMMANDS {
+            let (mut s, _theirs, mut ui) = a_dash_to_click();
+            let argument = matches!(command.takes, palette::Takes::Argument(_)).then_some("");
+            run_palette(&mut s, &mut ui, command.name, argument);
+            if let Some(note) = &ui.note {
+                assert!(!note.contains("lands with"), "{}: {note}", command.name);
+            }
+        }
     }
 
     #[test]
