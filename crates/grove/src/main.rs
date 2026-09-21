@@ -120,6 +120,12 @@ struct Ui {
     /// The last size the terminal pane actually had, kept so hiding the pane
     /// does not reflow the program inside its pty.
     last_pane_size: (u16, u16),
+    /// Which shell the shell overlay is showing.
+    shell_kind: ShellKind,
+    /// Each session's shell that the daemon is running, by session. Kept for
+    /// every session rather than the open one, because the terminal list can
+    /// arrive before grove has learned which session is open.
+    session_shells: std::collections::HashMap<grove_domain::SessionId, grove_proto::TerminalId>,
     /// Text being selected with the mouse, or selected and still shown.
     selection: Option<selection::Selection>,
     /// Text waiting to be put on the clipboard. The loop owns the terminal,
@@ -184,6 +190,47 @@ impl Ui {
         self.terminal_pane_size()
     }
 
+    /// The shell overlay's footer: the global keys, and the one that closes
+    /// this shell — `^g i` for the scratch shell, `^g c` for the session
+    /// one. Taken from the keymap and relabelled, never written out, so it
+    /// stays true if either binding moves.
+    fn shell_footer(&self) -> Vec<statusbar::Hint> {
+        let mut hints = statusbar::hints(Screen::Shell);
+        let closes = match self.shell_kind {
+            ShellKind::Scratch => Action::OpenShell,
+            ShellKind::Session => Action::OpenSessionShell,
+        };
+        if let Some(binding) = keymap::bindings(Screen::Shell).find(|b| b.action == closes) {
+            hints.push(statusbar::Hint {
+                key: binding.key,
+                prefixed: binding.prefixed,
+                keys: keymap::label_of(binding),
+                label: "close".into(),
+            });
+        }
+        hints
+    }
+
+    /// The session shell's header: which session, and what it holds.
+    fn session_shell_title(&self) -> String {
+        let name = self.session_name();
+        let name = name.strip_prefix("session: ").unwrap_or(&name).to_string();
+        let repos = self.repos.member_count();
+        let worktrees = self.repos.member_worktrees();
+        let plural = |n: usize, one: &str| {
+            if n == 1 {
+                format!("1 {one}")
+            } else {
+                format!("{n} {one}s")
+            }
+        };
+        format!(
+            "{name} · {} · {}",
+            plural(repos, "repo"),
+            plural(worktrees as usize, "worktree")
+        )
+    }
+
     /// The area the dash is drawn in: all of it but the status bar and the
     /// blank row above it. `draw` lays the frame out the same way.
     fn body_area(&self) -> Rect {
@@ -233,7 +280,7 @@ impl Ui {
             Screen::Prune => (self.prune.height(), self.prune.footer()),
             Screen::Palette => (self.palette.height(), self.palette.footer()),
             Screen::Diff => (tall(body), self.diff.footer()),
-            Screen::Shell => (tall(body), statusbar::hints(Screen::Shell)),
+            Screen::Shell => (tall(body), self.shell_footer()),
         })
     }
 
@@ -333,6 +380,8 @@ impl Ui {
             width: 80,
             height: 24,
             last_pane_size: (22, 34),
+            shell_kind: ShellKind::Scratch,
+            session_shells: std::collections::HashMap::new(),
             selection: None,
             clipboard: None,
             theme,
@@ -379,6 +428,19 @@ enum State {
     /// user's terminals are still running inside a daemon it can no longer see,
     /// and exiting silently would suggest otherwise.
     Disconnected { workspace: PathBuf, reason: String },
+}
+
+/// The two shells the shell overlay can show.
+///
+/// The scratch shell is attached to nothing — `~`, no worktree, no session —
+/// and says so. The session shell carries the open session in its
+/// environment (#114), so an agent started there knows the repos and
+/// worktrees it is working in. Same box, same keys inside it; the header is
+/// what tells them apart, and that difference is the whole point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShellKind {
+    Scratch,
+    Session,
 }
 
 /// What the command line asked for.
@@ -670,6 +732,42 @@ fn act_on_session(intent: Option<sessions::Intent>, state: &mut State, ui: &mut 
         // The dash is about to be a different session's.
         ui.screen = Screen::Dash;
         let _ = send(state, &Request::ListRepos);
+    }
+    true
+}
+
+/// Open the session shell, or close it if it is what is open.
+///
+/// One per session, kept by the daemon: grove attaches to the one it knows
+/// about, and otherwise asks — the daemon answers a second request for the
+/// same session with the shell it already has, so asking is never how a
+/// second one starts.
+fn open_session_shell(state: &mut State, ui: &mut Ui) -> bool {
+    let Some(session) = ui.session.clone() else {
+        ui.note = Some("the session shell needs an open session".into());
+        return true;
+    };
+    if ui.screen == Screen::Shell && ui.shell_kind == ShellKind::Session {
+        ui.screen = Screen::Dash;
+        follow_selection(state, ui);
+        return true;
+    }
+    ui.screen = Screen::Shell;
+    ui.shell_kind = ShellKind::Session;
+    let requests = match ui.session_shells.get(&session).copied() {
+        Some(terminal) => {
+            let (rows, cols) = ui.shown_pty_size();
+            ui.terminals.show(Some(terminal), rows, cols)
+        }
+        None => vec![Request::SpawnTerminal(
+            grove_proto::TerminalTarget::Session { session },
+        )],
+    };
+    for request in requests {
+        if let Err(e) = send(state, &request) {
+            ui.note = Some(format!("could not reach the daemon: {e}"));
+            break;
+        }
     }
     true
 }
@@ -1086,7 +1184,12 @@ fn on_overlay_mouse(event: MouseEvent, state: &mut State, ui: &mut Ui) -> Flow {
                 // shell, where `esc` belongs to the program inside it and
                 // `^g i` is the way out.
                 return if ui.screen == Screen::Shell {
-                    press(KeyCode::Char('i'), true, state, ui)
+                    // The key that opened this shell is the one that closes it.
+                    let closes = match ui.shell_kind {
+                        ShellKind::Scratch => 'i',
+                        ShellKind::Session => 'c',
+                    };
+                    press(KeyCode::Char(closes), true, state, ui)
                 } else {
                     press(KeyCode::Esc, false, state, ui)
                 };
@@ -1823,7 +1926,7 @@ fn handle_input(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
                     redraw: ui.diff.scroll(-3, usize::from(ui.height).max(1)),
                 },
                 Routed::Act(Action::OpenShell) => {
-                    if ui.screen == Screen::Shell {
+                    if ui.screen == Screen::Shell && ui.shell_kind == ShellKind::Scratch {
                         // `^g i` is the way out as well as the way in: `esc`
                         // belongs to the program inside the pty.
                         ui.screen = Screen::Dash;
@@ -1832,6 +1935,7 @@ fn handle_input(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
                         return Flow::Continue { redraw: true };
                     }
                     ui.screen = Screen::Shell;
+                    ui.shell_kind = ShellKind::Scratch;
                     match ui.scratch {
                         // It survives closing and reopening: the daemon kept
                         // the pty, so grove re-attaches rather than spawning
@@ -1861,6 +1965,9 @@ fn handle_input(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
                     }
                     Flow::Continue { redraw: true }
                 }
+                Routed::Act(Action::OpenSessionShell) => Flow::Continue {
+                    redraw: open_session_shell(state, ui),
+                },
                 Routed::Act(Action::OpenPicker) => Flow::Continue {
                     redraw: open_picker(state, ui),
                 },
@@ -2150,7 +2257,32 @@ fn handle_input(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
                         .then_some(row.terminal)
                 });
             }
+            // Session shells have no row either, and are found the same way.
+            for row in &rows {
+                if let grove_proto::TerminalTarget::Session { session } = &row.target {
+                    ui.session_shells
+                        .entry(session.clone())
+                        .or_insert(row.terminal);
+                }
+            }
             Flow::Continue { redraw: false }
+        }
+
+        Input::Daemon(DaemonEvent::TerminalSpawned {
+            target: grove_proto::TerminalTarget::Session { session },
+            terminal,
+        }) => {
+            ui.session_shells.insert(session, terminal);
+            if ui.screen == Screen::Shell && ui.shell_kind == ShellKind::Session {
+                let (rows, cols) = ui.shown_pty_size();
+                for request in ui.terminals.show(Some(terminal), rows, cols) {
+                    if let Err(e) = send(state, &request) {
+                        ui.note = Some(format!("could not reach the daemon: {e}"));
+                        break;
+                    }
+                }
+            }
+            Flow::Continue { redraw: true }
         }
 
         Input::Daemon(DaemonEvent::TerminalSpawned {
@@ -2216,6 +2348,8 @@ fn handle_input(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
                 // of opening a new shell.
                 ui.scratch = None;
             }
+            // Likewise the session shells, which end with their session.
+            ui.session_shells.retain(|_, id| *id != terminal);
             Flow::Continue { redraw: true }
         }
 
@@ -2630,12 +2764,26 @@ fn draw_screen(f: &mut ratatui::Frame, state: &State, ui: &Ui) {
         // taking the frame.
         draw_dash(f, body_area, ui);
         let parts = overlay(f, body_area, ui, ui.theme.style(Role::Accent));
-        // The mock heads it with what it is and where it is: a shell, attached
-        // to nothing, in the directory the daemon started it in.
+        // The mock heads it with what it is and where it is. For the scratch
+        // shell that is "attached to nothing"; for the session shell it is
+        // the session and what it holds — the difference between the two
+        // has to be readable at a glance, because it is the whole point.
+        let (what, has_shell) = match ui.shell_kind {
+            ShellKind::Scratch => (
+                "scratch · not attached to a worktree".to_string(),
+                ui.scratch.is_some(),
+            ),
+            ShellKind::Session => (
+                ui.session_shell_title(),
+                ui.session
+                    .as_ref()
+                    .is_some_and(|session| ui.session_shells.contains_key(session)),
+            ),
+        };
         f.render_widget(
             Paragraph::new(overlay::header(
                 "shell",
-                "scratch · not attached to a worktree",
+                &what,
                 "",
                 parts.header.width,
                 &ui.theme,
@@ -2662,7 +2810,7 @@ fn draw_screen(f: &mut ratatui::Frame, state: &State, ui: &Ui) {
             f.buffer_mut(),
             shell_pty_area(parts.body),
             &ui.theme,
-            ui.scratch.is_some(),
+            has_shell,
         );
         status_bar(f, bar_area, ui);
         return;
@@ -4556,6 +4704,173 @@ mod tests {
             sent(&mut theirs).contains(&Request::ListTerminals),
             "a new grove must learn what the daemon kept running"
         );
+    }
+
+    fn session_shell_spawned(s: &mut State, ui: &mut Ui, id: u64) {
+        handle(
+            Input::Daemon(DaemonEvent::TerminalSpawned {
+                target: grove_proto::TerminalTarget::Session {
+                    session: grove_domain::SessionId("s1".into()),
+                },
+                terminal: grove_proto::TerminalId(id),
+            }),
+            s,
+            ui,
+        );
+    }
+
+    #[test]
+    fn the_session_shell_is_asked_for_by_session_and_headed_with_it() {
+        // #115: ^g c opens the shell whose environment carries the open
+        // session, and says so — the header names the session where the
+        // scratch shell's says "not attached to a worktree".
+        let (mut s, mut theirs, mut ui) = a_dash_to_click();
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('c')), &mut s, &mut ui);
+        assert_eq!(ui.screen, Screen::Shell);
+        assert!(
+            sent(&mut theirs).contains(&Request::SpawnTerminal(
+                grove_proto::TerminalTarget::Session {
+                    session: grove_domain::SessionId("s1".into())
+                }
+            )),
+            "it asks the daemon for this session's shell"
+        );
+        session_shell_spawned(&mut s, &mut ui, 11);
+        assert!(
+            sent(&mut theirs).iter().any(|request| matches!(
+                request,
+                Request::AttachTerminal(attach) if attach.terminal == grove_proto::TerminalId(11)
+            )),
+            "and shows the one the daemon answers with"
+        );
+        let screen = painted_dash(&s, &ui, 160, 40).join("\n");
+        assert!(
+            screen.contains("invoice split · 1 repo · 3 worktrees"),
+            "{screen}"
+        );
+        assert!(!screen.contains("not attached to a worktree"), "{screen}");
+        assert!(
+            screen.contains("^g c close"),
+            "its footer names its way out: {screen}"
+        );
+    }
+
+    #[test]
+    fn reopening_the_session_shell_attaches_rather_than_spawning_another() {
+        let (mut s, mut theirs, mut ui) = a_dash_to_click();
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('c')), &mut s, &mut ui);
+        session_shell_spawned(&mut s, &mut ui, 11);
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('c')), &mut s, &mut ui);
+        assert_eq!(ui.screen, Screen::Dash, "^g c closes the shell it opened");
+        let _ = sent(&mut theirs);
+
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('c')), &mut s, &mut ui);
+        let asked = sent(&mut theirs);
+        assert!(
+            !asked
+                .iter()
+                .any(|request| matches!(request, Request::SpawnTerminal(_))),
+            "no second shell: {asked:?}"
+        );
+        assert!(asked.iter().any(|request| matches!(
+            request,
+            Request::AttachTerminal(attach) if attach.terminal == grove_proto::TerminalId(11)
+        )));
+    }
+
+    #[test]
+    fn with_no_session_open_the_key_says_why_and_asks_for_nothing() {
+        let (mut s, mut theirs) = wired();
+        let mut ui = Ui::new();
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('c')), &mut s, &mut ui);
+        assert_eq!(ui.screen, Screen::Dash);
+        assert!(
+            ui.note
+                .as_deref()
+                .is_some_and(|note| note.contains("open session")),
+            "{:?}",
+            ui.note
+        );
+        assert!(sent(&mut theirs).is_empty());
+    }
+
+    #[test]
+    fn the_scratch_shell_is_unchanged_and_one_key_switches_to_it() {
+        let (mut s, mut theirs, mut ui) = a_dash_to_click();
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('c')), &mut s, &mut ui);
+        session_shell_spawned(&mut s, &mut ui, 11);
+        let _ = sent(&mut theirs);
+
+        // ^g i from inside the session shell goes to the scratch shell, not
+        // out to the dash — it is the other shell's key, not this one's.
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('i')), &mut s, &mut ui);
+        assert_eq!(ui.screen, Screen::Shell);
+        assert!(sent(&mut theirs).contains(&Request::SpawnTerminal(
+            grove_proto::TerminalTarget::Scratch { cwd: None }
+        )));
+        let screen = painted_dash(&s, &ui, 160, 40).join("\n");
+        assert!(
+            screen.contains("scratch · not attached to a worktree"),
+            "{screen}"
+        );
+        assert!(screen.contains("^g i close"), "{screen}");
+    }
+
+    #[test]
+    fn a_restarted_grove_finds_the_session_shell_too() {
+        // Acceptance: after grove restarts it finds the session shell again
+        // from the daemon's terminal list, as it does the scratch shell.
+        let (mut s, mut theirs, mut ui) = a_dash_to_click();
+        handle(
+            Input::Daemon(DaemonEvent::Terminals(vec![grove_proto::TerminalRow {
+                terminal: grove_proto::TerminalId(21),
+                target: grove_proto::TerminalTarget::Session {
+                    session: grove_domain::SessionId("s1".into()),
+                },
+                foreground: None,
+            }])),
+            &mut s,
+            &mut ui,
+        );
+        let _ = sent(&mut theirs);
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('c')), &mut s, &mut ui);
+        let asked = sent(&mut theirs);
+        assert!(
+            !asked
+                .iter()
+                .any(|request| matches!(request, Request::SpawnTerminal(_)))
+        );
+        assert!(asked.iter().any(|request| matches!(
+            request,
+            Request::AttachTerminal(attach) if attach.terminal == grove_proto::TerminalId(21)
+        )));
+    }
+
+    #[test]
+    fn a_click_outside_the_session_shell_closes_it_with_its_own_key() {
+        let (mut s, _theirs, mut ui) = a_dash_to_click();
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('c')), &mut s, &mut ui);
+        session_shell_spawned(&mut s, &mut ui, 11);
+        handle(click(1, 1), &mut s, &mut ui);
+        assert_eq!(ui.screen, Screen::Dash);
+    }
+
+    #[test]
+    fn help_lists_the_session_shell() {
+        let (mut s, _theirs, mut ui) = a_dash_to_click();
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('?')), &mut s, &mut ui);
+        let screen = painted_dash(&s, &ui, 160, 60).join("\n");
+        assert!(screen.contains("session shell"), "{screen}");
     }
 
     #[test]

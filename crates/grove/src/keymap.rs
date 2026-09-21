@@ -109,6 +109,9 @@ pub enum Action {
     OpenPicker,
     OpenDiff,
     OpenShell,
+    /// The session shell: a pty whose environment carries the open session
+    /// (#114, #115), for starting an agent that needs to know it.
+    OpenSessionShell,
     PrefillNew,
     EndSession,
     Snapshot,
@@ -260,6 +263,14 @@ const GLOBAL: &[Binding] = &[
     bar(true, KeyCode::Char('d'), Action::OpenDiff, "diff"),
     bar(true, KeyCode::Char('/'), Action::OpenPalette, "palette"),
     b(true, KeyCode::Char('i'), Action::OpenShell, "shell"),
+    // `c` for context: the difference from `^g i` is that this one knows the
+    // session — its repos, its worktrees, the daemon's socket.
+    b(
+        true,
+        KeyCode::Char('c'),
+        Action::OpenSessionShell,
+        "session shell",
+    ),
     b(true, KeyCode::Char('n'), Action::PrefillNew, "new"),
     b(true, KeyCode::Char('X'), Action::EndSession, "end"),
     b(true, KeyCode::Char('S'), Action::Snapshot, "snapshot"),
