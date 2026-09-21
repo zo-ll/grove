@@ -154,10 +154,12 @@ pub struct SessionOrchestrator {
     store: Store,
     repositories: HashMap<RepoId, Repository>,
     scan_root: PathBuf,
+    socket_path: PathBuf,
     terminals: TerminalManager,
     fetch: FetchPolicy,
     runtime: DaemonRuntime,
     live: HashMap<SessionId, Vec<LiveTerminal>>,
+    session_shells: HashMap<SessionId, TerminalId>,
     hook_reports: Vec<HookReport>,
     notified_exits: HashSet<TerminalId>,
     unknown_overrides: Vec<String>,
@@ -184,6 +186,8 @@ impl SessionOrchestrator {
         fetch: FetchPolicy,
         runtime: DaemonRuntime,
     ) -> Self {
+        let socket_path =
+            crate::socket_path(&scan_root).unwrap_or_else(|_| scan_root.join(".grove/groved.sock"));
         let input = terminals.input_handle();
         let mut runtime = runtime;
         runtime.set_terminal_sender(move |terminal, bytes| {
@@ -215,10 +219,12 @@ impl SessionOrchestrator {
                 .map(|repository| (repository.id.clone(), repository))
                 .collect(),
             scan_root,
+            socket_path,
             terminals,
             fetch,
             runtime,
             live: HashMap::new(),
+            session_shells: HashMap::new(),
             hook_reports: Vec::new(),
             notified_exits: HashSet::new(),
             unknown_overrides,
@@ -226,6 +232,14 @@ impl SessionOrchestrator {
             known_sizes: HashMap::new(),
             failed_sizes: HashSet::new(),
         }
+    }
+
+    /// Overrides the daemon socket advertised to session shells. The daemon
+    /// uses this with the path it actually bound; tests can supply an isolated
+    /// path without changing process-global runtime-directory variables.
+    pub fn with_socket_path(mut self, socket_path: impl Into<PathBuf>) -> Self {
+        self.socket_path = socket_path.into();
+        self
     }
 
     pub fn store(&self) -> &Store {
@@ -800,6 +814,24 @@ impl SessionOrchestrator {
         target: &TerminalTarget,
     ) -> Result<TerminalId, OrchestrationError> {
         match target {
+            TerminalTarget::Session { session } => {
+                self.store.session(session)?;
+                if let Some(id) = self.session_shells.get(session).copied()
+                    && self.terminals.is_alive(id).unwrap_or(false)
+                {
+                    return Ok(id);
+                }
+                let environment = self.session_environment(session)?;
+                let id = self.terminals.spawn_session(
+                    session.clone(),
+                    &self.scan_root,
+                    &environment,
+                    DEFAULT_ROWS,
+                    DEFAULT_COLS,
+                )?;
+                self.session_shells.insert(session.clone(), id);
+                Ok(id)
+            }
             TerminalTarget::Worktree(reference) => {
                 let repository = self.repository(&reference.repo)?.clone();
                 let checkout = self
@@ -858,6 +890,9 @@ impl SessionOrchestrator {
             }
             let target = match &key {
                 TerminalKey::Scratch => TerminalTarget::Scratch { cwd: None },
+                TerminalKey::Session(session) => TerminalTarget::Session {
+                    session: session.clone(),
+                },
                 // A checkout git no longer names (removed while its terminal
                 // was alive) is omitted from the list.
                 TerminalKey::Worktree(path) => match names.get(path) {
@@ -876,6 +911,62 @@ impl SessionOrchestrator {
             });
         }
         Ok(rows)
+    }
+
+    /// Builds the immutable context exported when a session shell starts.
+    /// Repository and worktree collections are JSON so names and paths need
+    /// no shell-specific escaping. A caller needing later changes asks the
+    /// daemon for live state instead of relying on this snapshot.
+    fn session_environment(
+        &self,
+        session: &SessionId,
+    ) -> Result<Vec<(String, String)>, OrchestrationError> {
+        let stored = self.store.session(session)?;
+        let repos: Vec<_> = stored
+            .members
+            .iter()
+            .filter_map(|id| self.repositories.get(id))
+            .map(|repository| {
+                serde_json::json!({
+                    "id": repository.id.0,
+                    "name": repository.name,
+                    "path": repository.path.to_string_lossy(),
+                })
+            })
+            .collect();
+        let worktrees: Vec<_> = stored
+            .owned
+            .iter()
+            .filter_map(|owned| {
+                self.resolve_owned(owned).ok().map(|path| {
+                    serde_json::json!({
+                        "repo": owned.repo.0,
+                        "branch": owned.branch,
+                        "path": path.to_string_lossy(),
+                    })
+                })
+            })
+            .collect();
+        Ok(vec![
+            ("GROVE_SESSION".into(), stored.name.clone()),
+            ("GROVE_SESSION_ID".into(), stored.id.0.clone()),
+            (
+                "GROVE_WORKSPACE".into(),
+                self.scan_root.to_string_lossy().into_owned(),
+            ),
+            (
+                "GROVE_REPOS".into(),
+                serde_json::to_string(&repos).expect("JSON values serialize"),
+            ),
+            (
+                "GROVE_WORKTREES".into(),
+                serde_json::to_string(&worktrees).expect("JSON values serialize"),
+            ),
+            (
+                "GROVE_SOCKET".into(),
+                self.socket_path.to_string_lossy().into_owned(),
+            ),
+        ])
     }
 
     /// Spawns the configured editor for a checkout, detached (§3.3's `^g o`).
@@ -1218,7 +1309,12 @@ impl SessionOrchestrator {
             .into_iter()
             .flatten()
             .filter(|terminal| self.terminals.is_alive(terminal.id).unwrap_or(false))
-            .count();
+            .count()
+            + usize::from(
+                self.session_shells
+                    .get(session)
+                    .is_some_and(|id| self.terminals.is_alive(*id).unwrap_or(false)),
+            );
         Ok(SessionRow {
             id: stored.id.clone(),
             name: stored.name.clone(),
@@ -1281,6 +1377,21 @@ impl SessionOrchestrator {
         self.store.session(session)?;
         let mut killed = Vec::new();
         let mut failed = Vec::new();
+        if let Some(id) = self.session_shells.get(session).copied() {
+            match self.terminals.kill(id) {
+                Ok(()) => {
+                    killed.push(id);
+                    self.session_shells.remove(session);
+                }
+                Err(TerminalError::Missing(_)) => {
+                    self.session_shells.remove(session);
+                }
+                Err(error) => failed.push(EffectFailure {
+                    worktree: None,
+                    message: error.to_string(),
+                }),
+            }
+        }
         let mut remaining = Vec::new();
         for terminal in self.live.remove(session).unwrap_or_default() {
             match self.terminals.kill(terminal.id) {
@@ -1921,6 +2032,20 @@ mod tests {
         OwnedWorktree {
             repo: RepoId("repo".into()),
             branch: branch.into(),
+        }
+    }
+
+    fn wait_for_terminal(manager: &TerminalManager, id: TerminalId, text: &str) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if manager.snapshot(id).unwrap().contents.contains(text) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "terminal never displayed {text:?}"
+            );
+            thread::sleep(Duration::from_millis(10));
         }
     }
 
@@ -2732,6 +2857,178 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert!(matches!(rows[0].target, TerminalTarget::Scratch { .. }));
         assert!(daemon.terminals().is_alive(*scratch).unwrap());
+    }
+
+    #[test]
+    fn session_terminal_exports_context_reuses_one_pty_and_ends_with_session() {
+        let temp = TempDir::new();
+        let clone = temp.0.join("repo");
+        let worktree = temp.0.join("ours");
+        fs::create_dir_all(&clone).unwrap();
+        git(&clone, &["init", "-q", "-b", "main"]);
+        git(&clone, &["config", "user.name", "Grove Test"]);
+        git(&clone, &["config", "user.email", "grove@example.test"]);
+        fs::write(clone.join("tracked"), "base\n").unwrap();
+        git(&clone, &["add", "tracked"]);
+        git(&clone, &["commit", "-qm", "base"]);
+        git(
+            &clone,
+            &["worktree", "add", "-qb", "ours", worktree.to_str().unwrap()],
+        );
+
+        let mut store = Store::load_at(&temp.0.join("state"), &temp.0, "");
+        store
+            .create(sid("session-1"), "invoice split".to_string())
+            .unwrap();
+        store
+            .add_member(&sid("session-1"), RepoId("repo".into()))
+            .unwrap();
+        store
+            .adopt(&sid("session-1"), owned("ours"), &worktree, &clone)
+            .unwrap();
+        let socket = temp.0.join("groved.sock");
+        let repository = Repository {
+            id: RepoId("repo".into()),
+            name: "payments".into(),
+            path: clone.clone(),
+            base_branch: Some("main".into()),
+        };
+        let terminals = TerminalManager::new(PathBuf::from("/bin/sh"), temp.0.clone(), 200);
+        let fetch = FetchPolicy::new(2, Duration::from_secs(60));
+        let runtime = DaemonRuntime::load_source("", "session-terminal").runtime;
+        let mut daemon = SessionOrchestrator::new(
+            store,
+            vec![repository],
+            temp.0.clone(),
+            terminals,
+            fetch,
+            runtime,
+        )
+        .with_socket_path(&socket);
+
+        let target = TerminalTarget::Session {
+            session: sid("session-1"),
+        };
+        let events = daemon.handle_request(Request::SpawnTerminal(target.clone()));
+        let Some(Event::TerminalSpawned { terminal, .. }) = events.first() else {
+            panic!("expected session terminal, got {events:?}")
+        };
+        let terminal = *terminal;
+
+        let echo_disabled = temp.0.join("session-echo-disabled");
+        daemon
+            .terminals
+            .input(
+                terminal,
+                format!("stty -echo; touch '{}'\r", echo_disabled.display()).as_bytes(),
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !echo_disabled.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "session shell did not disable echo"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let expected_repos = format!(
+            r#"[{{"id":"repo","name":"payments","path":"{}"}}]"#,
+            clone.display()
+        );
+        let expected_worktrees = format!(
+            r#"[{{"branch":"ours","path":"{}","repo":"repo"}}]"#,
+            worktree.display()
+        );
+        let command = format!(
+            "[ \"$GROVE_SESSION\" = 'invoice split' ] && echo SESSION_OK; \
+             [ \"$GROVE_SESSION_ID\" = 'session-1' ] && echo ID_OK; \
+             [ \"$GROVE_WORKSPACE\" = '{}' ] && echo WORKSPACE_OK; \
+             [ \"$GROVE_REPOS\" = '{}' ] && echo REPOS_OK; \
+             [ \"$GROVE_WORKTREES\" = '{}' ] && echo WORKTREES_OK; \
+             [ \"$GROVE_SOCKET\" = '{}' ] && echo SOCKET_OK; \
+             [ \"$PWD\" = '{}' ] && echo CWD_OK\r",
+            temp.0.display(),
+            expected_repos,
+            expected_worktrees,
+            socket.display(),
+            temp.0.display(),
+        );
+        daemon
+            .terminals
+            .input(terminal, command.as_bytes())
+            .unwrap();
+        for marker in [
+            "SESSION_OK",
+            "ID_OK",
+            "WORKSPACE_OK",
+            "REPOS_OK",
+            "WORKTREES_OK",
+            "SOCKET_OK",
+            "CWD_OK",
+        ] {
+            wait_for_terminal(&daemon.terminals, terminal, marker);
+        }
+
+        let again = daemon.handle_request(Request::SpawnTerminal(target.clone()));
+        assert!(matches!(
+            again.first(),
+            Some(Event::TerminalSpawned { terminal: same, target: actual })
+                if *same == terminal && actual == &target
+        ));
+        let listed = daemon.handle_request(Request::ListTerminals);
+        let Some(Event::Terminals(rows)) = listed.first() else {
+            panic!("expected terminal rows, got {listed:?}")
+        };
+        assert!(
+            rows.iter()
+                .any(|row| { row.terminal == terminal && row.target == target })
+        );
+
+        let scratch_events =
+            daemon.handle_request(Request::SpawnTerminal(TerminalTarget::Scratch {
+                cwd: None,
+            }));
+        let Some(Event::TerminalSpawned {
+            terminal: scratch, ..
+        }) = scratch_events.first()
+        else {
+            panic!("expected scratch terminal, got {scratch_events:?}")
+        };
+        let scratch_echo_disabled = temp.0.join("scratch-echo-disabled");
+        daemon
+            .terminals
+            .input(
+                *scratch,
+                format!("stty -echo; touch '{}'\r", scratch_echo_disabled.display()).as_bytes(),
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !scratch_echo_disabled.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "scratch shell did not disable echo"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        daemon
+            .terminals
+            .input(
+                *scratch,
+                b"env | grep '^GROVE_' >/dev/null || echo SCRATCH_CLEAN\r",
+            )
+            .unwrap();
+        wait_for_terminal(&daemon.terminals, *scratch, "SCRATCH_CLEAN");
+
+        let ended = daemon.handle_request(Request::EndSession(sid("session-1")));
+        assert!(ended.iter().any(
+            |event| matches!(event, Event::SessionEnded(session) if session == &sid("session-1"))
+        ));
+        assert!(matches!(
+            daemon.terminals.is_alive(terminal),
+            Err(TerminalError::Missing(_))
+        ));
+        assert!(daemon.terminals.is_alive(*scratch).unwrap());
     }
 
     #[test]

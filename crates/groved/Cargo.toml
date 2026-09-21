@@ -17,5 +17,6 @@ grove-lua = { workspace = true }
 grove-git = { workspace = true }
 grove-state = { workspace = true }
 portable-pty = "0.9"
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 vt100 = "0.16"

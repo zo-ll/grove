@@ -18,6 +18,7 @@ type WriterMap = Arc<Mutex<HashMap<TerminalId, SharedWriter>>>;
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum TerminalKey {
     Worktree(PathBuf),
+    Session(SessionId),
     Scratch,
 }
 
@@ -151,12 +152,24 @@ impl TerminalManager {
         cols: u16,
     ) -> Result<TerminalId, TerminalError> {
         let path = fs::canonicalize(path.into())?;
-        self.spawn(TerminalKey::Worktree(path.clone()), &path, rows, cols)
+        self.spawn(TerminalKey::Worktree(path.clone()), &path, rows, cols, &[])
+    }
+
+    pub fn spawn_session(
+        &mut self,
+        session: SessionId,
+        cwd: impl Into<PathBuf>,
+        environment: &[(String, String)],
+        rows: u16,
+        cols: u16,
+    ) -> Result<TerminalId, TerminalError> {
+        let cwd = fs::canonicalize(cwd.into())?;
+        self.spawn(TerminalKey::Session(session), &cwd, rows, cols, environment)
     }
 
     pub fn spawn_scratch(&mut self, rows: u16, cols: u16) -> Result<TerminalId, TerminalError> {
         let cwd = self.scratch_cwd.clone();
-        self.spawn(TerminalKey::Scratch, &cwd, rows, cols)
+        self.spawn(TerminalKey::Scratch, &cwd, rows, cols, &[])
     }
 
     /// The scratch shell at an explicit directory, for a spawn request that
@@ -169,7 +182,7 @@ impl TerminalManager {
         cols: u16,
     ) -> Result<TerminalId, TerminalError> {
         let cwd = fs::canonicalize(cwd.into())?;
-        self.spawn(TerminalKey::Scratch, &cwd, rows, cols)
+        self.spawn(TerminalKey::Scratch, &cwd, rows, cols, &[])
     }
 
     fn spawn(
@@ -178,6 +191,7 @@ impl TerminalManager {
         cwd: &Path,
         rows: u16,
         cols: u16,
+        environment: &[(String, String)],
     ) -> Result<TerminalId, TerminalError> {
         validate_size(rows, cols)?;
         if let Some(existing) = self.keys.get(&key).copied() {
@@ -204,6 +218,9 @@ impl TerminalManager {
         let pair = native_pty_system().openpty(size).map_err(pty_error)?;
         let mut command = CommandBuilder::new(&self.shell);
         command.cwd(cwd);
+        for (name, value) in environment {
+            command.env(name, value);
+        }
         let child = pair.slave.spawn_command(command).map_err(pty_error)?;
         drop(pair.slave);
         let process_id = child.process_id();
