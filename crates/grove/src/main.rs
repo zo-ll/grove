@@ -1352,7 +1352,11 @@ fn act_on_worktree(intent: Option<Intent>, state: &mut State, ui: &mut Ui) -> bo
 /// there is a selection to ask about.
 fn ask_for_the_dash<W: std::io::Write>(daemon: &mut W) -> Result<(), grove_proto::FrameError> {
     grove_proto::write_frame(daemon, &Request::ListSessions)?;
-    grove_proto::write_frame(daemon, &Request::ListRepos)
+    grove_proto::write_frame(daemon, &Request::ListRepos)?;
+    // What the daemon kept running while no grove was attached. Without it
+    // a restarted grove asks for a scratch shell the daemon already has,
+    // is refused, and the one left running is out of reach.
+    grove_proto::write_frame(daemon, &Request::ListTerminals)
 }
 
 /// Follow the WORKTREES cursor with the terminal pane.
@@ -2136,6 +2140,19 @@ fn handle_input(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
 
         // The scratch shell grove asked for. Remembered so reopening the
         // overlay re-attaches rather than spawning another shell beside it.
+        // The terminals the daemon is running. Worktree terminals come back on
+        // their rows; the scratch shell has no row, so this is the only way a
+        // grove started after it learns it exists.
+        Input::Daemon(DaemonEvent::Terminals(rows)) => {
+            if ui.scratch.is_none() {
+                ui.scratch = rows.iter().find_map(|row| {
+                    matches!(row.target, grove_proto::TerminalTarget::Scratch { .. })
+                        .then_some(row.terminal)
+                });
+            }
+            Flow::Continue { redraw: false }
+        }
+
         Input::Daemon(DaemonEvent::TerminalSpawned {
             target: grove_proto::TerminalTarget::Scratch { .. },
             terminal,
@@ -4492,6 +4509,53 @@ mod tests {
         handle(click(10, 5), &mut s, &mut ui);
         assert!(ui.helping.is_none(), "a click puts it away");
         assert_eq!(ui.screen, Screen::Dash, "back where it was opened");
+    }
+
+    #[test]
+    fn a_restarted_grove_finds_the_scratch_shell_it_left_running() {
+        // The daemon outlives the TUI — that is its point — but a new grove
+        // never asked which terminals were running, so `^g i` asked for a
+        // fresh scratch shell, the daemon refused because one was alive, and
+        // whatever was left running in it was unreachable.
+        let (mut s, mut theirs) = wired();
+        let mut ui = Ui::new();
+        handle(
+            Input::Daemon(DaemonEvent::Terminals(vec![grove_proto::TerminalRow {
+                terminal: grove_proto::TerminalId(7),
+                target: grove_proto::TerminalTarget::Scratch { cwd: None },
+                foreground: None,
+            }])),
+            &mut s,
+            &mut ui,
+        );
+        let _ = sent(&mut theirs);
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('i')), &mut s, &mut ui);
+        let asked = sent(&mut theirs);
+        assert!(
+            asked.iter().any(|request| matches!(
+                request,
+                Request::AttachTerminal(attach) if attach.terminal == grove_proto::TerminalId(7)
+            )),
+            "it must attach to the shell that is running: {asked:?}"
+        );
+        assert!(
+            !asked
+                .iter()
+                .any(|request| matches!(request, Request::SpawnTerminal(_))),
+            "not ask for a second one: {asked:?}"
+        );
+    }
+
+    #[test]
+    fn connecting_asks_which_terminals_are_running() {
+        let (mut ours, mut theirs) = UnixStream::pair().expect("a socket pair");
+        ask_for_the_dash(&mut ours).expect("the requests are written");
+        drop(ours);
+        assert!(
+            sent(&mut theirs).contains(&Request::ListTerminals),
+            "a new grove must learn what the daemon kept running"
+        );
     }
 
     #[test]
