@@ -2287,9 +2287,9 @@ mod tests {
             events.iter().any(|event| matches!(
                 event,
                 Event::Failed { message, .. }
-                    if message.ends_with("held by invoice split")
+                    if message == "there is already a session called \"invoice split\""
             )),
-            "the holder is named plainly, not as a debug-printed id: {events:?}"
+            "said once, plainly — the holder's name is the name asked for: {events:?}"
         );
         assert_eq!(daemon.store().sessions().len(), 1);
 

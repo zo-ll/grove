@@ -93,7 +93,7 @@ impl Default for StateFile {
 pub enum Error {
     #[error("session {0} already exists")]
     SessionExists(SessionId),
-    #[error("session name {name:?} is already held by {owner_name}")]
+    #[error("there is already a session called {name:?}")]
     SessionNameTaken {
         name: String,
         owner: SessionId,
