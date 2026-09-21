@@ -80,6 +80,11 @@ impl Prune {
         self.cursor = 0;
     }
 
+    /// Where the cursor is and how many rows there are, for the mouse.
+    pub fn cursor(&self) -> (usize, usize) {
+        (self.cursor, self.rows.len())
+    }
+
     /// The rows as the picker holds them. The screen draws itself, so this is
     /// for tests asserting what the daemon's verdict became.
     #[cfg(test)]

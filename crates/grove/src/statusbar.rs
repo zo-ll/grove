@@ -40,6 +40,12 @@ fn key_of(b: &Binding) -> String {
 /// One entry on the bar: the keys that do it, and what it is called.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hint {
+    /// The key a click on this hint presses — the first of a folded run, so
+    /// `↑↓ file` presses `↑`. The overlays' footers are buttons in the mock,
+    /// and a button that pressed anything other than its own key would be a
+    /// second keymap.
+    pub key: KeyCode,
+    pub prefixed: bool,
     pub keys: String,
     /// Owned rather than borrowed from the binding, because an overlay's
     /// footer says `enter prune 3` — the verb is the keymap's and the count
@@ -83,6 +89,8 @@ pub fn hints(screen: Screen) -> Vec<Hint> {
             _ => keys.concat(),
         };
         out.push(Hint {
+            key: first.key,
+            prefixed: first.prefixed,
             keys: if first.prefixed {
                 format!("^g {spelled}")
             } else {

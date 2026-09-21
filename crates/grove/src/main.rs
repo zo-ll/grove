@@ -55,7 +55,9 @@ use prune::Prune;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::Event as TermEvent;
-use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+use ratatui::crossterm::event::{
+    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
@@ -191,6 +193,24 @@ impl Ui {
             Some(_) => self.panes.for_guidance(),
             None => self.panes,
         }
+    }
+
+    /// How many rows an overlay's contents take and what its footer offers,
+    /// for the screen that is open — or `None` on the dash.
+    ///
+    /// Drawing and the mouse both ask this. The box's size and the footer's
+    /// buttons follow from it, so if the two asked separately a click could
+    /// land on a button drawn a column to the left of where it was aimed.
+    fn overlay_shape(&self, body: Rect) -> Option<(u16, Vec<statusbar::Hint>)> {
+        Some(match self.screen {
+            Screen::Dash => return None,
+            Screen::EndSession => (self.ending.height(), self.ending.footer()),
+            Screen::Picker => (self.sessions.height(), self.sessions.footer()),
+            Screen::Prune => (self.prune.height(), self.prune.footer()),
+            Screen::Palette => (self.palette.height(), self.palette.footer()),
+            Screen::Diff => (tall(body), self.diff.footer()),
+            Screen::Shell => (tall(body), statusbar::hints(Screen::Shell)),
+        })
     }
 
     /// How many lines the help has and how many fit, for the scroll.
@@ -568,13 +588,20 @@ fn open_picker(state: &mut State, ui: &mut Ui) -> bool {
 /// was drawn with, so a click means whatever is painted under the pointer.
 /// Only the dash for now: while an overlay is open the dash underneath is not
 /// what anyone is pointing at, and the overlays' own clicks are the next piece.
-fn on_mouse(event: MouseEvent, state: &mut State, ui: &mut Ui) -> bool {
-    if !matches!(state, State::Connected { .. })
-        || ui.screen != Screen::Dash
-        || ui.helping.is_some()
-    {
-        return false;
+fn on_mouse(event: MouseEvent, state: &mut State, ui: &mut Ui) -> Flow {
+    if !matches!(state, State::Connected { .. }) || ui.helping.is_some() {
+        return Flow::Continue { redraw: false };
     }
+    if ui.screen != Screen::Dash {
+        return on_overlay_mouse(event, state, ui);
+    }
+    Flow::Continue {
+        redraw: on_dash_mouse(event, state, ui),
+    }
+}
+
+/// The mouse on the dash itself: its panes, rows and the bar's session name.
+fn on_dash_mouse(event: MouseEvent, state: &mut State, ui: &mut Ui) -> bool {
     let (column, row) = (event.column, event.row);
     let (frames, rows) = dash::layout(ui.body_area(), ui.drawn_panes(), &ui.theme);
     let under = mouse::hit(&frames, &rows, column, row);
@@ -648,6 +675,231 @@ fn on_mouse(event: MouseEvent, state: &mut State, ui: &mut Ui) -> bool {
             }
         }
         _ => false,
+    }
+}
+
+/// Press a key as if it had been typed, prefix and all.
+///
+/// Every mouse action on an overlay comes down to this, so a click can only
+/// ever do what some key already does — through the same routing, the same
+/// guards, the same requests. A mouse layer with its own idea of what
+/// "resume" means would be a second implementation of every screen.
+fn press(code: KeyCode, prefixed: bool, state: &mut State, ui: &mut Ui) -> Flow {
+    let mut redraw = false;
+    if prefixed {
+        match handle(
+            Input::Terminal(TermEvent::Key(KeyEvent::new(
+                KeyCode::Char('g'),
+                KeyModifiers::CONTROL,
+            ))),
+            state,
+            ui,
+        ) {
+            Flow::Quit => return Flow::Quit,
+            Flow::Continue { redraw: r } => redraw |= r,
+        }
+    }
+    match handle(
+        Input::Terminal(TermEvent::Key(KeyEvent::new(code, KeyModifiers::NONE))),
+        state,
+        ui,
+    ) {
+        Flow::Quit => Flow::Quit,
+        Flow::Continue { redraw: r } => Flow::Continue {
+            redraw: redraw || r,
+        },
+    }
+}
+
+/// What a click on a row of an overlay's list does, beyond moving there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OnClick {
+    /// Pick lists: the first click selects, a click on the row already
+    /// selected presses `enter` — the session picker's resume, the palette's
+    /// run.
+    ConfirmOnSecond,
+    /// Tick lists — prune, and the palette's repo picker: every click
+    /// toggles, as `space` does and as the mock's rows do.
+    Toggle,
+    /// The diff's files: selecting is all there is.
+    Select,
+}
+
+/// An overlay's list, as it is drawn: where it is, and where its cursor is.
+#[derive(Debug, Clone, Copy)]
+struct ClickList {
+    /// The rows that are painted, one per item from the first.
+    area: Rect,
+    cursor: usize,
+    on_click: OnClick,
+}
+
+impl Ui {
+    /// The clickable list on the overlay that is open, if it has one.
+    fn overlay_list(&self, body: Rect) -> Option<ClickList> {
+        let list = |top: u16, count: usize, width: u16, cursor: usize, on_click| {
+            let painted = u16::try_from(count)
+                .unwrap_or(u16::MAX)
+                .min(body.bottom().saturating_sub(top));
+            ClickList {
+                area: Rect {
+                    x: body.x,
+                    y: top,
+                    width,
+                    height: painted,
+                },
+                cursor,
+                on_click,
+            }
+        };
+        match self.screen {
+            Screen::Palette if self.palette.arguing().is_none() => {
+                let (cursor, count) = self.palette.cursor();
+                Some(list(
+                    body.y,
+                    count,
+                    body.width,
+                    cursor,
+                    OnClick::ConfirmOnSecond,
+                ))
+            }
+            Screen::Palette => {
+                // A command that takes a name has no rows to click.
+                let select = self.palette.select()?;
+                Some(list(
+                    body.y + self.palette.list_offset(),
+                    select.rows().len(),
+                    body.width,
+                    select.cursor(),
+                    OnClick::Toggle,
+                ))
+            }
+            Screen::Picker => {
+                let (cursor, count) = self.sessions.cursor();
+                Some(list(
+                    body.y,
+                    count,
+                    body.width,
+                    cursor,
+                    OnClick::ConfirmOnSecond,
+                ))
+            }
+            Screen::Prune => {
+                let (cursor, count) = self.prune.cursor();
+                Some(list(body.y, count, body.width, cursor, OnClick::Toggle))
+            }
+            Screen::Diff => {
+                let (cursor, count) = self.diff.cursor();
+                Some(list(
+                    body.y,
+                    count,
+                    diff::list_width(body.width),
+                    cursor,
+                    OnClick::Select,
+                ))
+            }
+            Screen::Dash | Screen::EndSession | Screen::Shell => None,
+        }
+    }
+}
+
+/// The mouse over an overlay (#111).
+///
+/// A click outside the box closes it, the way that screen closes; a click on
+/// a footer hint presses its key; a click on a row walks the cursor there
+/// with the arrows and then does what that list does with a click; the wheel
+/// presses the arrows. Everything is a key in the end — see [`press`].
+fn on_overlay_mouse(event: MouseEvent, state: &mut State, ui: &mut Ui) -> Flow {
+    let quiet = Flow::Continue { redraw: false };
+    let body = ui.body_area();
+    let Some((rows, hints)) = ui.overlay_shape(body) else {
+        return quiet;
+    };
+    let laid = overlay::layout(body, rows, hints);
+    let at = ratatui::layout::Position {
+        x: event.column,
+        y: event.row,
+    };
+
+    match event.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            if !laid.frame.contains(at) {
+                // Out of the box: close it. `esc` everywhere but the scratch
+                // shell, where `esc` belongs to the program inside it and
+                // `^g i` is the way out.
+                return if ui.screen == Screen::Shell {
+                    press(KeyCode::Char('i'), true, state, ui)
+                } else {
+                    press(KeyCode::Esc, false, state, ui)
+                };
+            }
+            if let Some((_, hint)) = laid.buttons.iter().find(|(area, _)| area.contains(at)) {
+                return press(hint.key, hint.prefixed, state, ui);
+            }
+            let Some(list) = ui.overlay_list(laid.parts.body) else {
+                return quiet;
+            };
+            if !list.area.contains(at) {
+                return quiet;
+            }
+            click_row(list, usize::from(at.y - list.area.y), state, ui)
+        }
+        kind @ (MouseEventKind::ScrollUp | MouseEventKind::ScrollDown)
+            if laid.frame.contains(at) =>
+        {
+            let key = if kind == MouseEventKind::ScrollUp {
+                KeyCode::Up
+            } else {
+                KeyCode::Down
+            };
+            match ui.screen {
+                // The shell's wheel belongs to the pty; that is the next part.
+                Screen::Shell => quiet,
+                // Over the patch, scroll the patch (`^g ↑`/`^g ↓`); over the
+                // file list, move between files.
+                Screen::Diff
+                    if at.x >= laid.parts.body.x + diff::list_width(laid.parts.body.width) =>
+                {
+                    press(key, true, state, ui)
+                }
+                _ => press(key, false, state, ui),
+            }
+        }
+        _ => quiet,
+    }
+}
+
+/// Walk an overlay's cursor to the clicked row, then act as that list acts.
+///
+/// Walked with the arrows rather than set directly, so whatever moving the
+/// cursor does — the diff asking for the file's patch, say — happens exactly
+/// as it would from the keyboard.
+fn click_row(list: ClickList, index: usize, state: &mut State, ui: &mut Ui) -> Flow {
+    let (key, steps) = if index >= list.cursor {
+        (KeyCode::Down, index - list.cursor)
+    } else {
+        (KeyCode::Up, list.cursor - index)
+    };
+    let mut redraw = false;
+    for _ in 0..steps {
+        match press(key, false, state, ui) {
+            Flow::Quit => return Flow::Quit,
+            Flow::Continue { redraw: r } => redraw |= r,
+        }
+    }
+    let follow = match list.on_click {
+        OnClick::Toggle => Some(KeyCode::Char(' ')),
+        OnClick::ConfirmOnSecond if steps == 0 => Some(KeyCode::Enter),
+        OnClick::ConfirmOnSecond | OnClick::Select => None,
+    };
+    match follow {
+        Some(key) => match press(key, false, state, ui) {
+            Flow::Quit => Flow::Quit,
+            Flow::Continue { redraw: r } => Flow::Continue {
+                redraw: redraw || r,
+            },
+        },
+        None => Flow::Continue { redraw },
     }
 }
 
@@ -1512,9 +1764,7 @@ fn handle(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
         Input::Terminal(TermEvent::FocusGained | TermEvent::FocusLost) => {
             Flow::Continue { redraw: false }
         }
-        Input::Terminal(TermEvent::Mouse(event)) => Flow::Continue {
-            redraw: on_mouse(event, state, ui),
-        },
+        Input::Terminal(TermEvent::Mouse(event)) => on_mouse(event, state, ui),
         Input::Terminal(_) => Flow::Continue { redraw: false },
 
         // The REPOS pane's data. Kept ahead of the catch-all below because
@@ -2050,14 +2300,7 @@ fn draw(f: &mut ratatui::Frame, state: &State, ui: &Ui) {
 
     if matches!(state, State::Connected { .. }) && ui.screen == Screen::Diff {
         draw_dash(f, body_area, ui);
-        let parts = overlay(
-            f,
-            body_area,
-            ui,
-            ui.theme.style(Role::Accent),
-            tall(body_area),
-            ui.diff.footer(),
-        );
+        let parts = overlay(f, body_area, ui, ui.theme.style(Role::Accent));
         ui.diff.render(f.buffer_mut(), parts, &ui.theme);
         status_bar(f, bar_area, ui);
         return;
@@ -2069,14 +2312,7 @@ fn draw(f: &mut ratatui::Frame, state: &State, ui: &Ui) {
         // does that by making it the tallest of the overlays rather than by
         // taking the frame.
         draw_dash(f, body_area, ui);
-        let parts = overlay(
-            f,
-            body_area,
-            ui,
-            ui.theme.style(Role::Accent),
-            tall(body_area),
-            statusbar::hints(Screen::Shell),
-        );
+        let parts = overlay(f, body_area, ui, ui.theme.style(Role::Accent));
         // The mock heads it with what it is and where it is: a shell, attached
         // to nothing, in the directory the daemon started it in.
         f.render_widget(
@@ -2123,14 +2359,7 @@ fn draw(f: &mut ratatui::Frame, state: &State, ui: &Ui) {
         // The one overlay that is not accent-bordered: it is about to remove
         // work, and the mock gives it the error colour for exactly that
         // reason — the border is the warning, before a word is read.
-        let parts = overlay(
-            f,
-            body_area,
-            ui,
-            ui.theme.style(Role::Error),
-            ui.ending.height(),
-            ui.ending.footer(),
-        );
+        let parts = overlay(f, body_area, ui, ui.theme.style(Role::Error));
         ui.ending.render(f.buffer_mut(), parts, &ui.theme);
         status_bar(f, bar_area, ui);
         return;
@@ -2138,14 +2367,7 @@ fn draw(f: &mut ratatui::Frame, state: &State, ui: &Ui) {
 
     if matches!(state, State::Connected { .. }) && ui.screen == Screen::Picker {
         draw_dash(f, body_area, ui);
-        let parts = overlay(
-            f,
-            body_area,
-            ui,
-            ui.theme.style(Role::Accent),
-            ui.sessions.height(),
-            ui.sessions.footer(),
-        );
+        let parts = overlay(f, body_area, ui, ui.theme.style(Role::Accent));
         ui.sessions.render(f.buffer_mut(), parts, &ui.theme);
         status_bar(f, bar_area, ui);
         return;
@@ -2153,14 +2375,7 @@ fn draw(f: &mut ratatui::Frame, state: &State, ui: &Ui) {
 
     if matches!(state, State::Connected { .. }) && ui.screen == Screen::Prune {
         draw_dash(f, body_area, ui);
-        let parts = overlay(
-            f,
-            body_area,
-            ui,
-            ui.theme.style(Role::Accent),
-            ui.prune.height(),
-            ui.prune.footer(),
-        );
+        let parts = overlay(f, body_area, ui, ui.theme.style(Role::Accent));
         ui.prune.render(f.buffer_mut(), parts, &ui.theme);
         status_bar(f, bar_area, ui);
         return;
@@ -2171,14 +2386,7 @@ fn draw(f: &mut ratatui::Frame, state: &State, ui: &Ui) {
         // Over the dash rather than beside it: §4.2 calls it grove's command
         // line, and a command line that moves the screen under it makes the
         // thing you were looking at harder to act on.
-        let parts = overlay(
-            f,
-            body_area,
-            ui,
-            ui.theme.style(Role::Accent),
-            ui.palette.height(),
-            ui.palette.footer(),
-        );
+        let parts = overlay(f, body_area, ui, ui.theme.style(Role::Accent));
         ui.palette.render(f.buffer_mut(), parts, &ui.theme);
         status_bar(f, bar_area, ui);
         return;
@@ -2345,9 +2553,10 @@ fn overlay(
     area: Rect,
     ui: &Ui,
     border: ratatui::style::Style,
-    rows: u16,
-    hints: Vec<statusbar::Hint>,
 ) -> overlay::Parts {
+    let (rows, hints) = ui
+        .overlay_shape(area)
+        .expect("an overlay is only drawn while its screen is open");
     overlay::render(f.buffer_mut(), area, border, rows, hints, &ui.theme)
 }
 
@@ -3455,6 +3664,192 @@ mod tests {
                 .map(|row| row.worktree.branch.as_str()),
             Some("feat/first")
         );
+    }
+
+    /// The dash above, with a second, detached session stored, and the
+    /// session picker open over it.
+    fn a_picker_to_click() -> (State, UnixStream, Ui) {
+        let (mut s, mut theirs, mut ui) = a_dash_to_click();
+        handle(
+            Input::Daemon(DaemonEvent::Sessions(vec![
+                grove_proto::SessionRow {
+                    id: grove_domain::SessionId("s1".into()),
+                    name: "invoice split".into(),
+                    members: vec!["repo".into()],
+                    state: grove_domain::SessionState::Attached,
+                    terminals: 0,
+                    since: 0,
+                    size: 0,
+                },
+                grove_proto::SessionRow {
+                    id: grove_domain::SessionId("s2".into()),
+                    name: "retry jitter".into(),
+                    members: vec!["repo".into()],
+                    state: grove_domain::SessionState::Detached,
+                    terminals: 0,
+                    since: 0,
+                    size: 0,
+                },
+            ])),
+            &mut s,
+            &mut ui,
+        );
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('s')), &mut s, &mut ui);
+        let _ = sent(&mut theirs);
+        (s, theirs, ui)
+    }
+
+    #[test]
+    fn a_click_on_a_session_selects_it_and_a_second_click_resumes_it() {
+        // The mock's pick-list behaviour: the first click is "this one", the
+        // second is "go".
+        let (mut s, mut theirs, mut ui) = a_picker_to_click();
+        let (column, row) = where_painted(&s, &ui, "retry jitter");
+        handle(click(column, row), &mut s, &mut ui);
+        assert_eq!(
+            ui.sessions.selected().map(|row| row.name.as_str()),
+            Some("retry jitter")
+        );
+        assert!(
+            !sent(&mut theirs)
+                .iter()
+                .any(|request| matches!(request, Request::OpenSession(_))),
+            "one click selects; it does not resume"
+        );
+
+        handle(click(column, row), &mut s, &mut ui);
+        assert!(
+            sent(&mut theirs).contains(&Request::OpenSession(grove_domain::SessionId("s2".into()))),
+            "the second click resumes the session under it"
+        );
+    }
+
+    #[test]
+    fn a_footer_hint_is_a_button_for_its_key() {
+        // `esc back` in the picker's footer closes it, as `esc` does.
+        let (mut s, _theirs, mut ui) = a_picker_to_click();
+        let (column, row) = where_painted(&s, &ui, "esc back");
+        handle(click(column, row), &mut s, &mut ui);
+        assert_eq!(ui.screen, Screen::Dash);
+    }
+
+    #[test]
+    fn a_click_outside_an_overlay_closes_it() {
+        let (mut s, _theirs, mut ui) = a_picker_to_click();
+        assert_eq!(ui.screen, Screen::Picker);
+        // Top-left corner of the screen: the washed-out dash, not the box.
+        handle(click(1, 1), &mut s, &mut ui);
+        assert_eq!(ui.screen, Screen::Dash);
+    }
+
+    #[test]
+    fn a_click_inside_an_overlay_on_nothing_does_nothing() {
+        // The header line of the box is not a row and not a button.
+        let (mut s, mut theirs, mut ui) = a_picker_to_click();
+        let (column, row) = where_painted(&s, &ui, "session ❯");
+        handle(click(column, row), &mut s, &mut ui);
+        assert_eq!(ui.screen, Screen::Picker, "it stays open");
+        assert!(sent(&mut theirs).is_empty(), "and asks for nothing");
+    }
+
+    #[test]
+    fn a_palette_command_runs_on_a_second_click() {
+        let (mut s, mut theirs, mut ui) = a_dash_to_click();
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('/')), &mut s, &mut ui);
+        let _ = sent(&mut theirs);
+        let (column, row) = where_painted(&s, &ui, "prune ");
+        handle(click(column, row), &mut s, &mut ui);
+        assert_eq!(
+            ui.palette.selected().map(|entry| entry.name),
+            Some("prune".to_string())
+        );
+        assert!(!sent(&mut theirs).contains(&Request::ListPruneCandidates));
+        handle(click(column, row), &mut s, &mut ui);
+        assert!(sent(&mut theirs).contains(&Request::ListPruneCandidates));
+    }
+
+    #[test]
+    fn every_click_on_a_prune_row_toggles_it() {
+        // The tick lists toggle on every click, as `space` does — the mock's
+        // prune rows do exactly that.
+        let (mut s, _theirs, mut ui) = a_dash_to_click();
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('/')), &mut s, &mut ui);
+        for c in "prune".chars() {
+            handle(key(KeyCode::Char(c)), &mut s, &mut ui);
+        }
+        handle(key(KeyCode::Enter), &mut s, &mut ui);
+        handle(
+            Input::Daemon(DaemonEvent::PruneCandidates(vec![
+                prune_candidate("web-app", "feat/done", vec![]),
+                prune_candidate("sdk-js", "feat/also-done", vec![]),
+            ])),
+            &mut s,
+            &mut ui,
+        );
+        assert_eq!(ui.screen, Screen::Prune);
+        let before = ui.prune.count();
+        let (column, row) = where_painted(&s, &ui, "feat/also-done");
+        handle(click(column, row), &mut s, &mut ui);
+        assert_eq!(ui.prune.count(), before - 1, "the click unticked it");
+        handle(click(column, row), &mut s, &mut ui);
+        assert_eq!(ui.prune.count(), before, "and the next one ticks it again");
+    }
+
+    #[test]
+    fn a_repo_is_ticked_by_clicking_it_in_the_add_picker() {
+        let (mut s, _theirs, mut ui) = a_dash_to_click();
+        let mut outsider = repo_row("elsewhere", 0);
+        outsider.member = false;
+        let mut member = repo_row("repo", 3);
+        member.member = true;
+        handle(
+            Input::Daemon(DaemonEvent::Repos(vec![member, outsider])),
+            &mut s,
+            &mut ui,
+        );
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('/')), &mut s, &mut ui);
+        for c in "add".chars() {
+            handle(key(KeyCode::Char(c)), &mut s, &mut ui);
+        }
+        handle(key(KeyCode::Enter), &mut s, &mut ui);
+        let (column, row) = where_painted(&s, &ui, "elsewhere");
+        handle(click(column, row), &mut s, &mut ui);
+        assert_eq!(
+            ui.palette.select().map(|select| select.count()),
+            Some(1),
+            "the clicked repo is ticked"
+        );
+    }
+
+    #[test]
+    fn the_wheel_moves_an_overlays_cursor() {
+        let (mut s, _theirs, mut ui) = a_picker_to_click();
+        let (column, row) = where_painted(&s, &ui, "invoice split  ");
+        handle(
+            wheel(MouseEventKind::ScrollDown, column, row),
+            &mut s,
+            &mut ui,
+        );
+        assert_eq!(
+            ui.sessions.selected().map(|row| row.name.as_str()),
+            Some("retry jitter")
+        );
+    }
+
+    #[test]
+    fn a_click_outside_the_scratch_shell_leaves_it_as_its_own_key_does() {
+        // `esc` belongs to the program in the pty, so the way out is `^g i`,
+        // and a click outside the box presses that rather than `esc`.
+        let (mut s, _theirs, mut ui) = a_dash_to_click();
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('i')), &mut s, &mut ui);
+        assert_eq!(ui.screen, Screen::Shell);
+        handle(click(1, 1), &mut s, &mut ui);
+        assert_eq!(ui.screen, Screen::Dash);
     }
 
     #[test]
