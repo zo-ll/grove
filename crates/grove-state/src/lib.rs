@@ -25,6 +25,12 @@ pub struct OwnedWorktree {
     pub branch: String,
 }
 
+impl std::fmt::Display for OwnedWorktree {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}@{}", self.repo, self.branch)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredSession {
     pub id: SessionId,
@@ -85,21 +91,25 @@ impl Default for StateFile {
 
 #[derive(Debug, Error)]
 pub enum Error {
-    #[error("session {0:?} already exists")]
+    #[error("session {0} already exists")]
     SessionExists(SessionId),
-    #[error("session name {name:?} is already held by session {}", owner.0)]
-    SessionNameTaken { name: String, owner: SessionId },
-    #[error("session {0:?} does not exist")]
+    #[error("there is already a session called {name:?}")]
+    SessionNameTaken {
+        name: String,
+        owner: SessionId,
+        owner_name: String,
+    },
+    #[error("session {0} does not exist")]
     SessionMissing(SessionId),
-    #[error("repo {repo:?} is not a member of session {session:?}")]
+    #[error("repo {repo} is not a member of session {session}")]
     NotMember { session: SessionId, repo: RepoId },
-    #[error("worktree {repo:?}@{branch} is already owned by session {owner:?}")]
+    #[error("worktree {repo}@{branch} is already owned by session {owner}")]
     OwnedByOther {
         repo: RepoId,
         branch: String,
         owner: SessionId,
     },
-    #[error("worktree {repo:?}@{branch} is not owned by session {session:?}")]
+    #[error("worktree {repo}@{branch} is not owned by session {session}")]
     NotOwned {
         session: SessionId,
         repo: RepoId,
@@ -111,7 +121,7 @@ pub enum Error {
     SessionPathTemplate,
     #[error("could not persist session state at {path}: {source}")]
     Persist { path: PathBuf, source: io::Error },
-    #[error("no snapshot exists for session {session:?} at {path}")]
+    #[error("no snapshot exists for session {session} at {path}")]
     SnapshotMissing { session: SessionId, path: PathBuf },
     #[error("could not read snapshot at {path}: {source}")]
     SnapshotRead { path: PathBuf, source: io::Error },
@@ -122,7 +132,7 @@ pub enum Error {
     },
     #[error("snapshot at {path} uses unsupported format version {version}")]
     SnapshotVersion { path: PathBuf, version: u32 },
-    #[error("snapshot at {path} belongs to {actual:?}, not {expected:?}")]
+    #[error("snapshot at {path} belongs to {actual}, not {expected}")]
     SnapshotSession {
         path: PathBuf,
         expected: SessionId,
@@ -226,14 +236,18 @@ impl Store {
             return Err(Error::SessionExists(id));
         }
         let name = normalize_session_name(name);
-        if let Some(owner) = self
+        if let Some((owner, owner_name)) = self
             .state
             .sessions
             .iter()
             .find(|session| session.name.trim() == name)
-            .map(|session| session.id.clone())
+            .map(|session| (session.id.clone(), session.name.clone()))
         {
-            return Err(Error::SessionNameTaken { name, owner });
+            return Err(Error::SessionNameTaken {
+                name,
+                owner,
+                owner_name,
+            });
         }
         self.state.sessions.push(StoredSession {
             id,
@@ -258,14 +272,18 @@ impl Store {
     pub fn rename(&mut self, session: &SessionId, name: String) -> Result<(), Error> {
         self.session(session)?;
         let name = normalize_session_name(name);
-        if let Some(owner) = self
+        if let Some((owner, owner_name)) = self
             .state
             .sessions
             .iter()
             .find(|candidate| candidate.id != *session && candidate.name.trim() == name)
-            .map(|candidate| candidate.id.clone())
+            .map(|candidate| (candidate.id.clone(), candidate.name.clone()))
         {
-            return Err(Error::SessionNameTaken { name, owner });
+            return Err(Error::SessionNameTaken {
+                name,
+                owner,
+                owner_name,
+            });
         }
         self.session_mut(session)?.name = name;
         self.persist()

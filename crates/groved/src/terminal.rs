@@ -22,6 +22,16 @@ pub enum TerminalKey {
     Scratch,
 }
 
+impl std::fmt::Display for TerminalKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Worktree(path) => write!(formatter, "worktree {}", path.display()),
+            Self::Session(session) => write!(formatter, "session {session}"),
+            Self::Scratch => formatter.write_str("scratch shell"),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TerminalSnapshot {
     pub rows: u16,
@@ -87,11 +97,11 @@ pub struct RestoreFailure {
 
 #[derive(Debug, Error)]
 pub enum TerminalError {
-    #[error("a terminal already exists for {0:?}")]
+    #[error("a terminal already exists for {0}")]
     AlreadyExists(TerminalKey),
-    #[error("terminal {0:?} does not exist")]
+    #[error("terminal {0} does not exist")]
     Missing(TerminalId),
-    #[error("scratch terminal {0:?} does not belong in a session snapshot")]
+    #[error("scratch terminal {0} does not belong in a session snapshot")]
     ScratchSnapshot(TerminalId),
     #[error("terminal size must be non-zero, got {rows}x{cols}")]
     InvalidSize { rows: u16, cols: u16 },

@@ -110,23 +110,23 @@ pub struct CreateReport {
 pub enum OrchestrationError {
     #[error(transparent)]
     State(#[from] grove_state::Error),
-    #[error("repository {0:?} is not available in this workspace")]
+    #[error("repository {0} is not available in this workspace")]
     RepositoryMissing(RepoId),
-    #[error("worktree {0:?} does not exist")]
+    #[error("worktree {0} does not exist")]
     WorktreeMissing(OwnedWorktree),
-    #[error("repository {0:?} has no base branch")]
+    #[error("repository {0} has no base branch")]
     BaseMissing(RepoId),
-    #[error("repo {repo:?} is not a member of session {session:?}")]
+    #[error("repo {repo} is not a member of session {session}")]
     NotMember { session: SessionId, repo: RepoId },
-    #[error("repo {repo:?} still owns worktrees in session {session:?}")]
-    MemberOwnsWorktrees { session: SessionId, repo: RepoId },
-    #[error("worktree {0:?} is the repository's own checkout and cannot be session-owned")]
+    #[error("{repo} still has worktrees in {session_name} — end or release them first")]
+    MemberOwnsWorktrees { session_name: String, repo: RepoId },
+    #[error("worktree {0} is the repository's own checkout and cannot be session-owned")]
     CloneNotAdoptable(OwnedWorktree),
     #[error("worktree path {path:?} is the repository's own checkout")]
     WorktreePathIsClone { path: PathBuf },
     #[error("worktree path {path:?} is already claimed by branch {branch:?}")]
     PathClaimed { path: PathBuf, branch: String },
-    #[error("{0:?} is the repository's own checkout; end session must not remove it")]
+    #[error("{0} is the repository's own checkout; end session must not remove it")]
     CloneNotRemovable(OwnedWorktree),
     #[error("terminal operation failed: {0}")]
     Terminal(#[from] TerminalError),
@@ -287,12 +287,48 @@ impl SessionOrchestrator {
             Ok(events) => events,
             Err(error) => vec![Event::Failed {
                 context: context.into(),
-                message: error.to_string(),
+                message: self.failure_message(&error),
             }],
         });
         self.hook_reports.extend(self.runtime.drain_reports());
         events.extend(self.hook_reports.drain(..).filter_map(hook_report_event));
         events
+    }
+
+    fn failure_message(&self, error: &OrchestrationError) -> String {
+        let session_name = |id: &SessionId| {
+            self.store
+                .sessions()
+                .iter()
+                .find(|session| &session.id == id)
+                .map(|session| session.name.as_str())
+        };
+        match error {
+            OrchestrationError::State(grove_state::Error::OwnedByOther {
+                repo,
+                branch,
+                owner,
+            }) => session_name(owner)
+                .map(|name| format!("worktree {repo}@{branch} is already owned by {name}"))
+                .unwrap_or_else(|| error.to_string()),
+            OrchestrationError::State(grove_state::Error::NotMember { session, repo })
+            | OrchestrationError::NotMember { session, repo } => session_name(session)
+                .map(|name| format!("{repo} is not a member of {name}"))
+                .unwrap_or_else(|| error.to_string()),
+            OrchestrationError::State(grove_state::Error::NotOwned {
+                session,
+                repo,
+                branch,
+            }) => session_name(session)
+                .map(|name| format!("worktree {repo}@{branch} is not owned by {name}"))
+                .unwrap_or_else(|| error.to_string()),
+            OrchestrationError::Terminal(TerminalError::AlreadyExists(TerminalKey::Session(
+                session,
+            ))) => session_name(session)
+                .map(|name| format!("a terminal already exists for session {name}"))
+                .unwrap_or_else(|| error.to_string()),
+            _ => error.to_string(),
+        }
     }
 
     /// Reports config overrides that name no repository in the workspace.
@@ -515,14 +551,12 @@ impl SessionOrchestrator {
                 Ok(vec![self.session_changed(&session)?])
             }
             Request::RemoveMember { session, repo } => {
-                if self
-                    .store
-                    .session(&session)?
-                    .owned
-                    .iter()
-                    .any(|worktree| worktree.repo == repo)
-                {
-                    return Err(OrchestrationError::MemberOwnsWorktrees { session, repo });
+                let stored = self.store.session(&session)?;
+                if stored.owned.iter().any(|worktree| worktree.repo == repo) {
+                    return Err(OrchestrationError::MemberOwnsWorktrees {
+                        session_name: stored.name.clone(),
+                        repo,
+                    });
                 }
                 self.store.remove_member(&session, &repo)?;
                 Ok(vec![self.session_changed(&session)?])
@@ -1169,10 +1203,14 @@ impl SessionOrchestrator {
             repo: want.repo.clone(),
             branch: want.branch.clone(),
         };
-        if let Some((session, state)) = crate::prune::live_owner(sessions, &owned) {
+        if let Some(session) = sessions
+            .iter()
+            .find(|session| session.state != SessionState::Closed && session.owned.contains(&owned))
+        {
             return Err(format!(
-                "session {session:?} ({state:?}) owns this worktree; \
-                 end that session instead"
+                "{} ({:?}) owns this worktree; \
+                 end that session instead",
+                session.name, session.state
             ));
         }
         let repository = self
@@ -2238,7 +2276,6 @@ mod tests {
                 Event::Failed { context, message }
                     if context == "session new"
                         && message.contains("invoice split")
-                        && message.contains("holder")
             )),
             "duplicate name must identify its holder: {events:?}"
         );
@@ -2250,9 +2287,9 @@ mod tests {
             events.iter().any(|event| matches!(
                 event,
                 Event::Failed { message, .. }
-                    if message.ends_with("held by session holder")
+                    if message == "there is already a session called \"invoice split\""
             )),
-            "the holder is named plainly, not as a debug-printed id: {events:?}"
+            "said once, plainly — the holder's name is the name asked for: {events:?}"
         );
         assert_eq!(daemon.store().sessions().len(), 1);
 
@@ -2293,7 +2330,7 @@ mod tests {
             events.iter().any(|event| matches!(
                 event,
                 Event::Failed { message, .. }
-                    if message.contains("invoice split") && message.contains("holder")
+                    if message.contains("invoice split")
             )),
             "duplicate name must identify its holder: {events:?}"
         );
@@ -2324,6 +2361,84 @@ mod tests {
                 .sessions()
                 .iter()
                 .all(|session| session.name == "duplicate")
+        );
+    }
+
+    #[test]
+    fn remove_member_refusal_uses_human_names_without_debug_ids() {
+        let temp = TempDir::new();
+        let mut store = Store::load_at(&temp.0.join("state"), &temp.0, "");
+        let session = sid("18d74f973718b6a3-0");
+        let repo = RepoId("web-app".into());
+        store
+            .create(session.clone(), "invoice split".into())
+            .unwrap();
+        store.add_member(&session, repo.clone()).unwrap();
+        store
+            .adopt(
+                &session,
+                OwnedWorktree {
+                    repo: repo.clone(),
+                    branch: "feature".into(),
+                },
+                &temp.0.join("worktree"),
+                &temp.0.join("clone"),
+            )
+            .unwrap();
+        let terminals = TerminalManager::new(PathBuf::from("/bin/sh"), temp.0.clone(), 100);
+        let fetch = FetchPolicy::new(2, Duration::from_secs(60));
+        let runtime = DaemonRuntime::load_source("", "human-refusal").runtime;
+        let mut daemon =
+            SessionOrchestrator::new(store, Vec::new(), temp.0.clone(), terminals, fetch, runtime);
+
+        let events = daemon.handle_request(Request::RemoveMember { session, repo });
+        let messages: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Failed { message, .. } => Some(message.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            messages,
+            ["web-app still has worktrees in invoice split — end or release them first"]
+        );
+        assert!(
+            messages
+                .iter()
+                .all(|message| !message.contains("Id(") && !message.contains("(\""))
+        );
+    }
+
+    #[test]
+    fn orchestrator_failed_messages_never_debug_print_ids() {
+        let temp = TempDir::new();
+        let store = Store::load_at(&temp.0.join("state"), &temp.0, "");
+        let terminals = TerminalManager::new(PathBuf::from("/bin/sh"), temp.0.clone(), 100);
+        let fetch = FetchPolicy::new(2, Duration::from_secs(60));
+        let runtime = DaemonRuntime::load_source("", "human-errors").runtime;
+        let mut daemon =
+            SessionOrchestrator::new(store, Vec::new(), temp.0.clone(), terminals, fetch, runtime);
+
+        let requests = [
+            Request::OpenSession(sid("missing-session")),
+            Request::ListWorktrees(RepoId("missing-repo".into())),
+            Request::KillTerminal(TerminalId(42)),
+        ];
+        let messages: Vec<String> = requests
+            .into_iter()
+            .flat_map(|request| daemon.handle_request(request))
+            .filter_map(|event| match event {
+                Event::Failed { message, .. } => Some(message),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(messages.len(), 3, "every request should be refused");
+        assert!(
+            messages
+                .iter()
+                .all(|message| { !message.contains("Id(") && !message.contains("(\"") }),
+            "debug-formatted refusal in {messages:?}"
         );
     }
 
