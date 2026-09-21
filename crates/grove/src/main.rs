@@ -26,6 +26,7 @@ mod repos;
 mod select;
 mod selection;
 mod sessions;
+mod start;
 mod statusbar;
 mod terminal;
 mod terminals;
@@ -125,6 +126,13 @@ struct Ui {
     /// it, and the cursor otherwise stays on whatever it was on, usually the
     /// clone.
     land_on: Option<String>,
+    /// Open a terminal on the row `land_on` finds, if it has none: grove
+    /// started inside a repository opens it, and an open repository with no
+    /// shell in it is a dash with nothing to type into.
+    open_on_land: bool,
+    /// The session grove opens for the repository it was started in, while
+    /// the daemon is still answering the questions that decide it.
+    autostart: Option<start::Autostart>,
     /// Which shell the shell overlay is showing.
     shell_kind: ShellKind,
     /// Each session's shell that the daemon is running, by session. Kept for
@@ -386,6 +394,8 @@ impl Ui {
             height: 24,
             last_pane_size: (22, 34),
             land_on: None,
+            open_on_land: false,
+            autostart: None,
             shell_kind: ShellKind::Scratch,
             session_shells: std::collections::HashMap::new(),
             selection: None,
@@ -524,8 +534,15 @@ fn main() -> ExitCode {
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| PathBuf::from(".")),
     };
+    // Inside a repository, the repository is the workspace — from any
+    // subdirectory of it — and grove opens it. Anywhere else, the directory
+    // is the workspace, as it always was.
+    let (workspace, here) = match start::Here::of(&workspace) {
+        Some((root, here)) => (root, Some(here)),
+        None => (workspace, None),
+    };
 
-    match run(workspace) {
+    match run(workspace, here) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             // The guard has already restored the terminal by here, so this
@@ -536,7 +553,41 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(workspace: PathBuf) -> std::io::Result<()> {
+/// How a launched grove begins, as opposed to one a test builds.
+///
+/// WORKTREES starts hidden and the terminal has focus: grove opens onto a
+/// shell in the repository, with the branch list a key away (`^g 2`). When
+/// started inside a repository, the session for it is opened and the cursor
+/// lands on the branch checked out there, with a terminal.
+fn start_here(ui: &mut Ui, here: Option<start::Here>) {
+    ui.panes = Panes::at_start();
+    ui.focus = Focus::Terminal;
+    if let Some(here) = here {
+        ui.autostart = Some(start::Autostart::new(here.name));
+        ui.land_on = here.branch;
+        ui.open_on_land = ui.land_on.is_some();
+    }
+}
+
+/// Send whatever the start-up session needs next, now that the daemon has
+/// said more.
+fn advance_autostart(state: &mut State, ui: &mut Ui) {
+    let Some(auto) = ui.autostart.as_mut() else {
+        return;
+    };
+    let requests = auto.next(ui.sessions.rows(), ui.session.as_ref(), ui.repos.all());
+    if auto.done() {
+        ui.autostart = None;
+    }
+    for request in requests {
+        if let Err(e) = send(state, &request) {
+            ui.note = Some(format!("could not reach the daemon: {e}"));
+            return;
+        }
+    }
+}
+
+fn run(workspace: PathBuf, here: Option<start::Here>) -> std::io::Result<()> {
     // Before the terminal is taken, so a config error can still be printed if
     // anything below fails outright.
     let loaded = config_path().map(TuiRuntime::load);
@@ -549,6 +600,8 @@ fn run(workspace: PathBuf) -> std::io::Result<()> {
         // Nowhere to look, so defaults — see `config_path_from`.
         None => Ui::with_config(&TuiConfig::default(), None, Depth::detect()),
     };
+
+    start_here(&mut ui, here);
 
     let inputs = Inputs::new();
     let mut state = connect(&workspace, &inputs);
@@ -2342,6 +2395,7 @@ fn handle_input(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
                 _ if ui.session.as_ref() == Some(&row.id) => ui.session = None,
                 _ => {}
             }
+            advance_autostart(state, ui);
             Flow::Continue { redraw: true }
         }
 
@@ -2354,6 +2408,10 @@ fn handle_input(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
                 .map(|row| row.id.clone());
             ui.sessions.set(rows);
             ui.worktrees.name_sessions(ui.sessions.rows());
+            if let Some(auto) = ui.autostart.as_mut() {
+                auto.sessions_arrived();
+            }
+            advance_autostart(state, ui);
             Flow::Continue { redraw: true }
         }
 
@@ -2546,6 +2604,7 @@ fn handle_input(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
             // The WORKTREES pane follows this selection, and the daemon sends
             // worktrees only when asked for a repo by name.
             request_worktrees(state, ui);
+            advance_autostart(state, ui);
             Flow::Continue { redraw: true }
         }
 
@@ -2569,6 +2628,16 @@ fn handle_input(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
                 && ui.worktrees.select_branch(branch)
             {
                 ui.land_on = None;
+                if std::mem::take(&mut ui.open_on_land)
+                    && let Some(row) = ui.worktrees.selected().filter(|row| row.terminal.is_none())
+                {
+                    let request = Request::SpawnTerminal(grove_proto::TerminalTarget::Worktree(
+                        row.worktree.clone(),
+                    ));
+                    if let Err(e) = send(state, &request) {
+                        ui.note = Some(format!("could not reach the daemon: {e}"));
+                    }
+                }
             }
             refresh_user_columns(ui);
             follow_selection(state, ui);
@@ -4216,6 +4285,110 @@ mod tests {
         assert!(
             note.contains("older work") && !note.contains("18d7-0"),
             "{note}"
+        );
+    }
+
+    #[test]
+    fn a_launched_grove_opens_the_repo_it_was_started_in() {
+        // Asked for: `grove` inside a repo starts a session there with the
+        // repo in it, lands on the branch checked out, opens a terminal on
+        // it, and hides WORKTREES until asked for.
+        let (mut s, mut theirs) = wired();
+        let mut ui = Ui::new();
+        start_here(
+            &mut ui,
+            Some(start::Here {
+                name: "shop".into(),
+                branch: Some("main".into()),
+            }),
+        );
+        assert!(
+            !ui.panes.visible(Focus::Worktrees),
+            "WORKTREES starts hidden"
+        );
+        assert_eq!(ui.focus, Focus::Terminal);
+
+        handle(
+            Input::Daemon(DaemonEvent::Sessions(Vec::new())),
+            &mut s,
+            &mut ui,
+        );
+        assert!(
+            sent(&mut theirs).contains(&Request::SessionNew {
+                name: "shop".into()
+            }),
+            "no session called shop, so one is made"
+        );
+
+        handle(
+            Input::Daemon(DaemonEvent::SessionChanged(grove_proto::SessionRow {
+                id: grove_domain::SessionId("s9".into()),
+                name: "shop".into(),
+                members: Vec::new(),
+                state: grove_domain::SessionState::Attached,
+                terminals: 0,
+                since: 0,
+                size: 0,
+            })),
+            &mut s,
+            &mut ui,
+        );
+        handle(
+            Input::Daemon(DaemonEvent::Repos(vec![repo_row("shop", 0)])),
+            &mut s,
+            &mut ui,
+        );
+        assert!(
+            sent(&mut theirs).contains(&Request::AddMember {
+                session: grove_domain::SessionId("s9".into()),
+                repo: grove_domain::RepoId("shop".into()),
+            }),
+            "and the repo is its member"
+        );
+
+        handle(
+            Input::Daemon(DaemonEvent::Worktrees {
+                repo: grove_domain::RepoId("shop".into()),
+                rows: vec![
+                    worktree_row("feat/other", grove_domain::Ownership::Unowned),
+                    worktree_row("main", grove_domain::Ownership::Clone),
+                ],
+            }),
+            &mut s,
+            &mut ui,
+        );
+        assert_eq!(
+            ui.worktrees
+                .selected()
+                .map(|row| row.worktree.branch.as_str()),
+            Some("main"),
+            "the cursor is on the branch grove was started on"
+        );
+        assert!(
+            sent(&mut theirs).iter().any(|request| matches!(
+                request,
+                Request::SpawnTerminal(grove_proto::TerminalTarget::Worktree(wt)) if wt.branch == "main"
+            )),
+            "with a terminal opened on it"
+        );
+    }
+
+    #[test]
+    fn a_plain_launch_hides_worktrees_but_asks_the_daemon_for_nothing_new() {
+        let (mut s, mut theirs) = wired();
+        let mut ui = Ui::new();
+        start_here(&mut ui, None);
+        assert!(!ui.panes.visible(Focus::Worktrees));
+        handle(
+            Input::Daemon(DaemonEvent::Sessions(Vec::new())),
+            &mut s,
+            &mut ui,
+        );
+        assert!(
+            !sent(&mut theirs)
+                .iter()
+                .any(|request| matches!(request, Request::SessionNew { .. })),
+            "outside a repo nothing is made on the user's behalf"
         );
     }
 
