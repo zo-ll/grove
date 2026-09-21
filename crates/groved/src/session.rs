@@ -2934,8 +2934,8 @@ mod tests {
             &worktree_row.target,
             TerminalTarget::Worktree(reference) if reference.branch == "ours"
         ));
-        // The shell itself is the foreground process of a fresh pane.
-        assert!(worktree_row.foreground.is_some());
+        // An idle shell is the pane itself, not a foreground job worth warning about.
+        assert_eq!(worktree_row.foreground, None);
 
         // Killing emits TerminalExited exactly once, on the killer's response.
         let events = daemon.handle_request(Request::KillTerminal(id));

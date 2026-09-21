@@ -351,19 +351,22 @@ impl TerminalManager {
             return Ok(None);
         };
         let output = Command::new("ps")
-            .args(["-o", "tpgid=", "-p", &shell_pid.to_string()])
+            .args(["-o", "pgid=", "-o", "tpgid=", "-p", &shell_pid.to_string()])
             .output()?;
         if !output.status.success() {
             return Ok(None);
         }
-        let foreground = String::from_utf8_lossy(&output.stdout)
-            .trim()
-            .parse::<u32>()
-            .ok();
-        let Some(pid) = foreground.filter(|pid| *pid > 0) else {
+        let groups = String::from_utf8_lossy(&output.stdout);
+        let mut groups = groups
+            .split_whitespace()
+            .filter_map(|value| value.parse::<u32>().ok());
+        let (Some(shell_group), Some(foreground_group)) = (groups.next(), groups.next()) else {
             return Ok(None);
         };
-        Ok(fs::read_to_string(format!("/proc/{pid}/comm"))
+        if foreground_group == 0 || foreground_group == shell_group {
+            return Ok(None);
+        }
+        Ok(fs::read_to_string(format!("/proc/{foreground_group}/comm"))
             .ok()
             .map(|name| name.trim().to_owned()))
     }
@@ -632,15 +635,30 @@ mod tests {
     }
 
     #[test]
-    fn output_accumulates_without_a_client_and_reattach_gets_current_screen() {
+    fn a_real_pty_distinguishes_an_idle_shell_from_a_foreground_job() {
         let cwd = temp_dir();
         let mut manager = TerminalManager::new(PathBuf::from("/bin/sh"), cwd.clone(), 100);
         let id = manager.spawn_worktree(&cwd, 24, 80).unwrap();
         manager.input(id, b"printf 'grove-ready\\n'\r").unwrap();
         wait_for(&manager, id, "grove-ready");
-        assert!(manager.foreground_process(id).unwrap().is_some());
+        assert_eq!(manager.foreground_process(id).unwrap(), None);
+
+        manager.input(id, b"sleep 30\r").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if manager.foreground_process(id).unwrap().as_deref() == Some("sleep") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "sleep never became the pty's foreground process"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
         let attachment = manager.attach(id).unwrap();
         assert!(attachment.snapshot.contents.contains("grove-ready"));
+        manager.input(id, &[3]).unwrap();
         drop(manager);
         let _ = fs::remove_dir_all(cwd);
     }
