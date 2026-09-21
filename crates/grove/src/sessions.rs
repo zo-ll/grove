@@ -92,7 +92,6 @@ impl Sessions {
         self.rows.get(self.cursor)
     }
 
-    #[cfg(test)]
     pub fn rows(&self) -> &[SessionRow] {
         &self.rows
     }
