@@ -68,7 +68,11 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use grove_domain::{Ownership, RepoId, SessionId, SessionState};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+
+/// Serialization bound for helpers that emit the CLI's versioned JSON shape.
+pub use serde::Serialize as CliSerialize;
 
 /// Incremented for any change an older peer cannot decode: a changed field
 /// type, a removed variant, a different wire codec — or a new variant.
@@ -82,6 +86,46 @@ pub const PROTOCOL_VERSION: u32 = 3;
 /// Largest frame the reader will accept, to bound memory on a hostile or
 /// confused peer. Terminal output is chunked well below this.
 pub const MAX_FRAME_BYTES: u32 = 16 * 1024 * 1024;
+
+/// Stable JSON envelope emitted by non-interactive clients.
+///
+/// The payload is made from protocol row types and the envelope names the
+/// protocol version that defines them. Changing either shape incompatibly
+/// therefore requires the same version bump as changing the daemon wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CliJson<T> {
+    pub protocol: u32,
+    pub result: T,
+}
+
+impl<T> CliJson<T> {
+    pub fn new(result: T) -> Self {
+        Self {
+            protocol: PROTOCOL_VERSION,
+            result,
+        }
+    }
+}
+
+impl<T: Serialize> CliJson<T> {
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
+    }
+}
+
+impl<T: DeserializeOwned> CliJson<T> {
+    pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(json)
+    }
+}
+
+/// Worktrees are grouped by repository because the daemon's request and the
+/// dashboard both read one repository at a time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CliWorktrees {
+    pub repo: RepoId,
+    pub rows: Vec<WorktreeRow>,
+}
 
 /// Names a worktree without describing it.
 ///
