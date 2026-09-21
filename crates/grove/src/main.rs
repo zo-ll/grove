@@ -2061,6 +2061,19 @@ fn handle_input(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
                         redraw: act_on_session(intent, state, ui),
                     }
                 }
+                // Anywhere else, `^g X` ends the open session — the same
+                // confirm the picker's `X` opens, for the session you are in.
+                // It was only ever handled inside the picker, so on the dash,
+                // where the keymap offers it, it did nothing.
+                Routed::Act(Action::EndSession) => match ui.session.clone() {
+                    Some(session) => Flow::Continue {
+                        redraw: begin_end_session(session, state, ui),
+                    },
+                    None => {
+                        ui.note = Some("no open session to end".into());
+                        Flow::Continue { redraw: true }
+                    }
+                },
                 Routed::Act(Action::OpenPalette) => {
                     ui.screen = Screen::Palette;
                     ui.palette.open();
@@ -4979,6 +4992,43 @@ mod tests {
                 Request::OpenEditor(worktree) if worktree.branch == "feat/first"
             )),
             "{asked:?}"
+        );
+    }
+
+    #[test]
+    fn every_global_key_does_something_on_the_dash() {
+        // `^g X` had a handler — guarded to the session picker — so the
+        // source guard above passed while the key did nothing on the dash,
+        // where the keymap offers it. This presses each global key on a
+        // realistic dash and requires an effect: a request, a screen change,
+        // a note, a redraw, or quitting.
+        let globals: Vec<(KeyCode, String)> = keymap::bindings(Screen::Dash)
+            .filter(|binding| binding.prefixed)
+            // Scrolling a terminal with no history has nothing to do, and
+            // that is correct; the scroll keys have tests of their own.
+            .filter(|binding| !matches!(binding.action, Action::ScrollUp | Action::ScrollDown))
+            .map(|binding| (binding.key, keymap::label_of(binding)))
+            .collect();
+        let mut dead = Vec::new();
+        for (code, label) in globals {
+            let (mut s, mut theirs, mut ui) = a_dash_to_click();
+            let _ = sent(&mut theirs);
+            let before = (ui.screen, ui.note.clone(), ui.helping, ui.focus, ui.panes);
+            handle(prefix(), &mut s, &mut ui);
+            let flow = handle(key(code), &mut s, &mut ui);
+            let after = (ui.screen, ui.note.clone(), ui.helping, ui.focus, ui.panes);
+            // Not "asked for a redraw": the catch-all asks for one for any
+            // key it does not recognise, which is how `^g X` passed a
+            // version of this that trusted it.
+            let effect =
+                matches!(flow, Flow::Quit) || before != after || !sent(&mut theirs).is_empty();
+            if !effect {
+                dead.push(label);
+            }
+        }
+        assert!(
+            dead.is_empty(),
+            "these keys do nothing on the dash: {dead:?}"
         );
     }
 
