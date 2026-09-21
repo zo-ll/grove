@@ -2191,6 +2191,101 @@ mod tests {
         )));
     }
 
+    #[test]
+    fn session_new_refuses_a_trimmed_duplicate_name_but_keeps_case_distinct() {
+        let temp = TempDir::new();
+        let mut store = Store::load_at(&temp.0.join("state"), &temp.0, "");
+        store.create(sid("holder"), "invoice split".into()).unwrap();
+        let terminals = TerminalManager::new(PathBuf::from("/bin/sh"), temp.0.clone(), 100);
+        let fetch = FetchPolicy::new(2, Duration::from_secs(60));
+        let runtime = DaemonRuntime::load_source("", "duplicate-session-name").runtime;
+        let mut daemon =
+            SessionOrchestrator::new(store, Vec::new(), temp.0.clone(), terminals, fetch, runtime);
+
+        let events = daemon.handle_request(Request::SessionNew {
+            name: "  invoice split  ".into(),
+        });
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                Event::Failed { message, .. }
+                    if message.contains("invoice split") && message.contains("holder")
+            )),
+            "duplicate name must identify its holder: {events:?}"
+        );
+        assert_eq!(daemon.store().sessions().len(), 1);
+
+        let events = daemon.handle_request(Request::SessionNew {
+            name: "Invoice Split".into(),
+        });
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, Event::SessionChanged(_)))
+        );
+        assert!(
+            daemon
+                .store()
+                .sessions()
+                .iter()
+                .any(|session| session.name == "Invoice Split")
+        );
+    }
+
+    #[test]
+    fn session_rename_refuses_another_sessions_trimmed_name() {
+        let temp = TempDir::new();
+        let mut store = Store::load_at(&temp.0.join("state"), &temp.0, "");
+        store.create(sid("holder"), "invoice split".into()).unwrap();
+        store.create(sid("other"), "other".into()).unwrap();
+        let terminals = TerminalManager::new(PathBuf::from("/bin/sh"), temp.0.clone(), 100);
+        let fetch = FetchPolicy::new(2, Duration::from_secs(60));
+        let runtime = DaemonRuntime::load_source("", "duplicate-session-rename").runtime;
+        let mut daemon =
+            SessionOrchestrator::new(store, Vec::new(), temp.0.clone(), terminals, fetch, runtime);
+
+        let events = daemon.handle_request(Request::SessionRename {
+            session: sid("other"),
+            name: " invoice split ".into(),
+        });
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                Event::Failed { message, .. }
+                    if message.contains("invoice split") && message.contains("holder")
+            )),
+            "duplicate name must identify its holder: {events:?}"
+        );
+        assert_eq!(daemon.store().session(&sid("other")).unwrap().name, "other");
+    }
+
+    #[test]
+    fn legacy_duplicate_session_names_still_load() {
+        let temp = TempDir::new();
+        let state_home = temp.0.join("state");
+        let state_dir = state_home
+            .join("grove")
+            .join(grove_state::workspace_hash(&temp.0));
+        fs::create_dir_all(&state_dir).unwrap();
+        fs::write(
+            state_dir.join("sessions.json"),
+            r#"{"version":1,"sessions":[
+                {"id":"one","name":"duplicate","members":[],"owned":[],"state":"Closed"},
+                {"id":"two","name":"duplicate","members":[],"owned":[],"state":"Closed"}
+            ],"open":null}"#,
+        )
+        .unwrap();
+
+        let store = Store::load_at(&state_home, &temp.0, "");
+        assert_eq!(store.sessions().len(), 2);
+        assert!(
+            store
+                .sessions()
+                .iter()
+                .all(|session| session.name == "duplicate")
+        );
+    }
+
     fn remote_base(path: &Path, branch: &str) {
         // Gives discovery an advertised default branch without needing a real
         // remote: base_branch reads refs/remotes/origin/HEAD only.

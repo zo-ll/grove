@@ -83,6 +83,8 @@ impl Default for StateFile {
 pub enum Error {
     #[error("session {0:?} already exists")]
     SessionExists(SessionId),
+    #[error("session name {name:?} is already held by session {owner:?}")]
+    SessionNameTaken { name: String, owner: SessionId },
     #[error("session {0:?} does not exist")]
     SessionMissing(SessionId),
     #[error("repo {repo:?} is not a member of session {session:?}")]
@@ -182,6 +184,16 @@ impl Store {
         if self.state.sessions.iter().any(|session| session.id == id) {
             return Err(Error::SessionExists(id));
         }
+        let name = normalize_session_name(name);
+        if let Some(owner) = self
+            .state
+            .sessions
+            .iter()
+            .find(|session| session.name.trim() == name)
+            .map(|session| session.id.clone())
+        {
+            return Err(Error::SessionNameTaken { name, owner });
+        }
         self.state.sessions.push(StoredSession {
             id,
             name,
@@ -202,6 +214,17 @@ impl Store {
     }
 
     pub fn rename(&mut self, session: &SessionId, name: String) -> Result<(), Error> {
+        self.session(session)?;
+        let name = normalize_session_name(name);
+        if let Some(owner) = self
+            .state
+            .sessions
+            .iter()
+            .find(|candidate| candidate.id != *session && candidate.name.trim() == name)
+            .map(|candidate| candidate.id.clone())
+        {
+            return Err(Error::SessionNameTaken { name, owner });
+        }
         self.session_mut(session)?.name = name;
         self.persist()
     }
@@ -463,6 +486,10 @@ impl Store {
         let bytes = serde_json::to_vec_pretty(&self.state)?;
         write_atomic(&self.path, &bytes)
     }
+}
+
+fn normalize_session_name(name: String) -> String {
+    name.trim().to_owned()
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), Error> {
