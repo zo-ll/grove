@@ -167,6 +167,23 @@ impl Ui {
         }
     }
 
+    /// The size of the pty on screen: the scratch shell's box while it is
+    /// open, the dash's terminal pane otherwise.
+    ///
+    /// The shell used to be attached and resized with the pane's size and
+    /// then drawn in its own box — 34x53 inside a 20x92 area at 160x40, so it
+    /// wrapped at half the width it had and ran fourteen rows past the bottom.
+    fn shown_pty_size(&self) -> (u16, u16) {
+        if self.screen == Screen::Shell {
+            let body = self.body_area();
+            if let Some((rows, hints)) = self.overlay_shape(body) {
+                let area = shell_pty_area(overlay::layout(body, rows, hints).parts.body);
+                return (area.height.max(1), area.width.max(1));
+            }
+        }
+        self.terminal_pane_size()
+    }
+
     /// The area the dash is drawn in: all of it but the status bar and the
     /// blank row above it. `draw` lays the frame out the same way.
     fn body_area(&self) -> Rect {
@@ -1804,7 +1821,7 @@ fn handle_input(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
                         // the pty, so grove re-attaches rather than spawning
                         // a second shell in the same place.
                         Some(terminal) => {
-                            let (rows, cols) = ui.terminal_pane_size();
+                            let (rows, cols) = ui.shown_pty_size();
                             for request in ui.terminals.show(Some(terminal), rows, cols) {
                                 if let Err(e) = send(state, &request) {
                                     ui.note = Some(format!("could not reach the daemon: {e}"));
@@ -1999,7 +2016,7 @@ fn handle_input(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
             ui.width = width;
             ui.height = height;
             ui.remember_pane_size();
-            let (rows, cols) = ui.terminal_pane_size();
+            let (rows, cols) = ui.shown_pty_size();
             if let Some(request) = ui.terminals.resize(rows, cols)
                 && let Err(e) = send(state, &request)
             {
@@ -2112,7 +2129,7 @@ fn handle_input(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
             terminal,
         }) => {
             ui.scratch = Some(terminal);
-            let (rows, cols) = ui.terminal_pane_size();
+            let (rows, cols) = ui.shown_pty_size();
             for request in ui.terminals.show(Some(terminal), rows, cols) {
                 if let Err(e) = send(state, &request) {
                     ui.note = Some(format!("could not reach the daemon: {e}"));
@@ -4397,6 +4414,51 @@ mod tests {
             Invocation::Run(Some(PathBuf::from("-odd")))
         );
         assert!(matches!(parsed(&["--"]), Invocation::Bad(_)));
+    }
+
+    #[test]
+    fn the_scratch_shell_is_the_size_of_the_box_it_is_drawn_in() {
+        // It was sized like the dash's terminal pane — a third of the width —
+        // and then drawn in the scratch box, which is 98 columns: a shell
+        // wrapping at 50 inside a box twice as wide.
+        let (mut s, mut theirs) = wired();
+        let mut ui = Ui::new();
+        handle(Input::Terminal(TermEvent::Resize(160, 40)), &mut s, &mut ui);
+        ui.scratch = Some(grove_proto::TerminalId(9));
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('i')), &mut s, &mut ui);
+        assert_eq!(ui.screen, Screen::Shell);
+
+        let body = ui.body_area();
+        let (rows, hints) = ui.overlay_shape(body).expect("the shell is an overlay");
+        let drawn = shell_pty_area(overlay::layout(body, rows, hints).parts.body);
+        let asked = sent(&mut theirs);
+        assert!(
+            asked.iter().any(|request| matches!(
+                request,
+                Request::AttachTerminal(attach)
+                    if attach.terminal == grove_proto::TerminalId(9)
+                        && (attach.rows, attach.cols) == (drawn.height, drawn.width)
+            )),
+            "the shell must attach at {}x{}: {asked:?}",
+            drawn.height,
+            drawn.width
+        );
+
+        // And a resize while it is open resizes it to the box, not the pane.
+        handle(Input::Terminal(TermEvent::Resize(120, 30)), &mut s, &mut ui);
+        let body = ui.body_area();
+        let (rows, hints) = ui.overlay_shape(body).expect("still open");
+        let drawn = shell_pty_area(overlay::layout(body, rows, hints).parts.body);
+        let asked = sent(&mut theirs);
+        assert!(
+            asked.iter().any(|request| matches!(
+                request,
+                Request::ResizeTerminal { rows, cols, .. }
+                    if (*rows, *cols) == (drawn.height, drawn.width)
+            )),
+            "a resize must follow the box: {asked:?}"
+        );
     }
 
     #[test]
