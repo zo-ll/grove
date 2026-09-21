@@ -110,6 +110,16 @@ impl Default for Panes {
 }
 
 impl Panes {
+    /// What a launched grove shows first: REPOS and the terminal, with
+    /// WORKTREES a key away (`^g 2`). `default` stays all three — it is the
+    /// full layout the rest of this module measures against.
+    pub fn at_start() -> Self {
+        Self {
+            worktrees: false,
+            ..Self::default()
+        }
+    }
+
     pub fn visible(self, pane: Pane) -> bool {
         match pane {
             Focus::Repos => self.repos,

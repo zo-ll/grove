@@ -161,8 +161,8 @@ impl DaemonSocket {
     }
 
     pub fn run(self, service: session::SessionOrchestrator) -> Result<(), LifecycleError> {
-        let service = Arc::new(Mutex::new(service));
         let updates = watch::Broadcaster::default();
+        let service = Arc::new(Mutex::new(service.with_updates(updates.clone())));
         let _watcher = watch::tolerate_start(watch::WorktreeWatcher::start(
             Arc::clone(&service),
             updates.clone(),

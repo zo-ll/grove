@@ -176,6 +176,10 @@ pub struct SessionOrchestrator {
     /// Checkouts whose size walk failed. Their rows stay at 0 and are marked
     /// stale rather than presenting an unmeasured checkout as measured.
     failed_sizes: HashSet<PathBuf>,
+    /// Where work finished behind an answer reports, when a daemon is
+    /// serving clients. With it, the fetch on open runs in the background;
+    /// without it (a bare orchestrator in a test) it runs in line, as before.
+    updates: Option<crate::watch::Broadcaster>,
 }
 
 impl SessionOrchestrator {
@@ -232,12 +236,18 @@ impl SessionOrchestrator {
             pending_sizes: HashMap::new(),
             known_sizes: HashMap::new(),
             failed_sizes: HashSet::new(),
+            updates: None,
         }
     }
 
     /// Overrides the daemon socket advertised to session shells. The daemon
     /// uses this with the path it actually bound; tests can supply an isolated
     /// path without changing process-global runtime-directory variables.
+    pub(crate) fn with_updates(mut self, updates: crate::watch::Broadcaster) -> Self {
+        self.updates = Some(updates);
+        self
+    }
+
     pub fn with_socket_path(mut self, socket_path: impl Into<PathBuf>) -> Self {
         self.socket_path = socket_path.into();
         self
@@ -1398,7 +1408,25 @@ impl SessionOrchestrator {
     pub fn open(&mut self, session: &SessionId) -> Result<OpenReport, OrchestrationError> {
         let stored = self.store.session(session)?.clone();
         let repositories: Vec<_> = self.repositories.values().cloned().collect();
-        let fetches = self.fetch.fetch_on_open(&stored, &repositories);
+        // The fetch is the network, and opening must not wait on it: a
+        // relaunch took 2.3s, all of it this, while the TUI waited for the
+        // answer. Behind the answer, what it changes reaches clients through
+        // the watcher (it watches refs), and a failure is pushed.
+        let fetches = match &self.updates {
+            Some(updates) => {
+                let (policy, updates) = (self.fetch.clone(), updates.clone());
+                let stored = stored.clone();
+                let repositories = repositories.clone();
+                std::thread::spawn(move || {
+                    let results = policy.fetch_on_open(&stored, &repositories);
+                    for event in fetch_failure_events(&results) {
+                        updates.send(event);
+                    }
+                });
+                Vec::new()
+            }
+            None => self.fetch.fetch_on_open(&stored, &repositories),
+        };
         let mut terminal_ids = Vec::new();
         let mut failed = Vec::new();
         for owned in &stored.owned {
@@ -2036,14 +2064,21 @@ fn fetch_failure_events(results: &[FetchResult]) -> Vec<Event> {
         .iter()
         .filter_map(|result| match &result.status {
             FetchStatus::Fetched => None,
+            // The context is the verb's phrase, as for every other failure
+            // (#144) — it was `fetch RepoId("…")`, which the CLI's pairing
+            // by phrase could never match. The repo goes in the message.
             status => Some(Event::Failed {
-                context: format!("fetch {:?}", result.repo),
-                message: match status {
-                    FetchStatus::Failed(message) => message.clone(),
-                    FetchStatus::RepositoryMissing => "repository is not available".into(),
-                    FetchStatus::NotMember => "repository is not a session member".into(),
-                    FetchStatus::Fetched => unreachable!(),
-                },
+                context: "fetch".into(),
+                message: format!(
+                    "{}: {}",
+                    result.repo,
+                    match status {
+                        FetchStatus::Failed(message) => message.clone(),
+                        FetchStatus::RepositoryMissing => "repository is not available".into(),
+                        FetchStatus::NotMember => "repository is not a session member".into(),
+                        FetchStatus::Fetched => unreachable!(),
+                    }
+                ),
             }),
         })
         .collect()
@@ -2259,6 +2294,113 @@ mod tests {
             event,
             Event::Failed { context, .. } if context == "config: repo override"
         )));
+    }
+
+    /// A member repo whose remote takes `delay` to answer a fetch, and one
+    /// whose remote does not exist.
+    fn slow_and_broken_members(temp: &TempDir, delay: &str) -> Vec<Repository> {
+        let origin = temp.0.join("origin.git");
+        git(
+            &temp.0,
+            &[
+                "init",
+                "-q",
+                "--bare",
+                "-b",
+                "main",
+                origin.to_str().unwrap(),
+            ],
+        );
+        let slow = temp.0.join("slow");
+        fs::create_dir_all(&slow).unwrap();
+        git(&slow, &["init", "-q", "-b", "main"]);
+        git(
+            &slow,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        // The fetch runs this through a shell before the real upload-pack.
+        git(
+            &slow,
+            &[
+                "config",
+                "remote.origin.uploadpack",
+                &format!("sleep {delay}; git-upload-pack"),
+            ],
+        );
+        let broken = temp.0.join("broken");
+        fs::create_dir_all(&broken).unwrap();
+        git(&broken, &["init", "-q", "-b", "main"]);
+        git(
+            &broken,
+            &[
+                "remote",
+                "add",
+                "origin",
+                temp.0.join("nowhere.git").to_str().unwrap(),
+            ],
+        );
+        ["slow", "broken"]
+            .into_iter()
+            .map(|name| Repository {
+                id: RepoId(name.into()),
+                name: name.into(),
+                path: temp.0.join(name),
+                base_branch: None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn opening_a_session_does_not_wait_for_the_network() {
+        // Found timing a relaunch: resuming a stored session took 2.3s, all of
+        // it a synchronous `git fetch` of every member while the TUI waited
+        // for the answer. The fetch now runs behind the answer; what it
+        // changes arrives through the watcher, and a failure is pushed.
+        let temp = TempDir::new();
+        let repositories = slow_and_broken_members(&temp, "3");
+        let mut store = Store::load_at(&temp.0.join("state"), &temp.0, "");
+        store.create(sid("s"), "shop".into()).unwrap();
+        store.add_member(&sid("s"), RepoId("slow".into())).unwrap();
+        store
+            .add_member(&sid("s"), RepoId("broken".into()))
+            .unwrap();
+        let terminals = TerminalManager::new(PathBuf::from("/bin/sh"), temp.0.clone(), 100);
+        let fetch = FetchPolicy::new(2, Duration::from_secs(60));
+        let runtime = DaemonRuntime::load_source("", "open-in-background").runtime;
+        let updates = crate::watch::Broadcaster::default();
+        let pushed = updates.subscribe();
+        let mut daemon = SessionOrchestrator::new(
+            store,
+            repositories,
+            temp.0.clone(),
+            terminals,
+            fetch,
+            runtime,
+        )
+        .with_updates(updates);
+
+        let started = std::time::Instant::now();
+        let events = daemon.handle_request(Request::OpenSession(sid("s")));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "open answered after {:?}, waiting on a 3s remote",
+            started.elapsed()
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, Event::SessionChanged(_))),
+            "{events:?}"
+        );
+
+        let failure = pushed
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the broken remote's failure is pushed once the fetch is done");
+        assert!(
+            matches!(&failure, Event::Failed { context, message }
+                if context == "fetch" && message.contains("broken")),
+            "{failure:?}"
+        );
     }
 
     #[test]
