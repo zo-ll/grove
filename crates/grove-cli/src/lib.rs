@@ -610,7 +610,7 @@ impl Client {
         request: Request,
         done: impl Fn(&Event) -> bool,
     ) -> Result<Vec<Event>, Failure> {
-        let failure_context = format!("{request:?}");
+        let failure_context = request.failure_context();
         write_frame(&mut self.stream, &request)
             .map_err(|error| protocol(format!("could not send request: {error}")))?;
         let mut events = Vec::new();
@@ -618,23 +618,17 @@ impl Client {
             let event: Event = read_frame(&mut self.stream)
                 .map_err(|error| protocol(format!("daemon response failed: {error}")))?;
             let is_done = done(&event);
-            let direct_failure = matches!(
-                &event,
-                Event::Failed { context, .. } if context == &failure_context
-            );
+            let direct_failure = match &event {
+                Event::Failed { context, message } if context == failure_context => {
+                    Some(format!("{context}: {message}"))
+                }
+                _ => None,
+            };
             events.push(event);
             if is_done {
                 return Ok(events);
             }
-            if direct_failure {
-                let message = events
-                    .iter()
-                    .filter_map(|event| match event {
-                        Event::Failed { context, message } => Some(format!("{context}: {message}")),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("; ");
+            if let Some(message) = direct_failure {
                 return Err(Failure::new(EXIT_REFUSED, message));
             }
         }

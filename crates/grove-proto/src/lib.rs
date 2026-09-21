@@ -482,6 +482,47 @@ pub enum Request {
     RestoreSnapshot(SessionId),
 }
 
+impl Request {
+    /// Short, stable words for a direct failure of this request.
+    ///
+    /// This is user-facing protocol vocabulary, not a serialization of the
+    /// request or its arguments. Clients may use it to distinguish a direct
+    /// refusal from unrelated events that arrived on the same stream.
+    pub fn failure_context(&self) -> &'static str {
+        match self {
+            Self::Hello { .. } => "handshake",
+            Self::ListSessions => "list sessions",
+            Self::ListRepos => "list repos",
+            Self::Scan => "scan",
+            Self::SessionNew { .. } => "session new",
+            Self::SessionRename { .. } => "rename",
+            Self::ListWorktrees(_) => "list worktrees",
+            Self::ListPruneCandidates | Self::Prune(_) => "prune",
+            Self::DiffWorktree { .. } => "diff",
+            Self::OpenSession(_) => "open",
+            Self::DetachSession(_) => "detach",
+            Self::CloseSession(_) => "close",
+            Self::EndSession(_) => "end session",
+            Self::AddMember { .. } => "add",
+            Self::RemoveMember { .. } => "remove",
+            Self::NewWorktrees { .. } => "new worktrees",
+            Self::AdoptWorktree { .. } => "adopt",
+            Self::ReleaseWorktree { .. } => "release",
+            Self::SpawnTerminal(_) => "spawn terminal",
+            Self::KillTerminal(_) => "kill terminal",
+            Self::ResizeTerminal { .. } => "resize terminal",
+            Self::Input { .. } => "terminal input",
+            Self::AttachTerminal(_) => "attach terminal",
+            Self::DetachTerminal(_) => "detach terminal",
+            Self::Fetch { .. } => "fetch",
+            Self::OpenEditor(_) => "open editor",
+            Self::ListTerminals => "list terminals",
+            Self::SaveSnapshot(_) => "snapshot",
+            Self::RestoreSnapshot(_) => "restore snapshot",
+        }
+    }
+}
+
 /// A colour, as a terminal can express one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum Color {
