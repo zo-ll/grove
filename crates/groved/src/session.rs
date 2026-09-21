@@ -264,6 +264,11 @@ impl SessionOrchestrator {
         }
     }
 
+    /// The REPOS pane's rows as an event, for the watcher to push.
+    pub(crate) fn repos_event(&self) -> Result<Event, OrchestrationError> {
+        Ok(Event::Repos(self.repo_rows()?))
+    }
+
     pub(crate) fn worktrees_event(&mut self, repo: &RepoId) -> Result<Event, OrchestrationError> {
         self.repository(repo)?;
         Ok(Event::Worktrees {

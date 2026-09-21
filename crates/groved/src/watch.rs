@@ -167,10 +167,17 @@ impl WorktreeWatcher {
                 // receive timeout from ever occurring.
                 if debounce.deadline().is_some_and(|at| Instant::now() >= at) {
                     if let Ok(mut service) = service.lock() {
+                        let changed = !pending.is_empty();
                         for repo in pending.drain() {
                             if let Ok(event) = service.worktrees_event(&repo) {
                                 updates.send(event);
                             }
+                        }
+                        // The REPOS pane's dot is a repo row's `dirty`, and a
+                        // commit moves its count: one list per flush, after
+                        // the worktree rows it summarises (#157).
+                        if changed && let Ok(event) = service.repos_event() {
+                            updates.send(event);
                         }
                         plan = service.watch_plan();
                         reconcile(&mut watcher, &mut roots, &plan);
