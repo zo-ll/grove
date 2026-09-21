@@ -541,6 +541,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "grove-cli"
+version = "0.1.0"
+dependencies = [
+ "grove-domain",
+ "grove-proto",
+]
+
+[[package]]
 name = "grove-domain"
 version = "0.1.0"
 dependencies = [

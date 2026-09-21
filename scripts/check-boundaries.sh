@@ -195,6 +195,9 @@ deny_declared groved "daemon may parse terminals but must not render UI chrome" 
 
 deny_declared grove-fakedaemon "UI-lane tooling must not reach backend concerns" \
     $BACKEND_CRATES $GIT_CRATES $PTY_CRATES
+
+allow_declared grove-cli "the non-interactive client speaks only the shared contract" \
+    grove-domain grove-proto
 }
 
 # Coverage, both directions. members -> rules catches a new crate arriving with
@@ -214,6 +217,8 @@ deny_reach grove "UI lane must not reach backend concerns" \
 deny_reach groved "daemon may parse terminals but must not render UI chrome" $UI_ONLY_CRATES
 deny_reach grove-fakedaemon "UI-lane tooling must not reach backend concerns" \
     $BACKEND_CRATES $GIT_CRATES $PTY_CRATES
+deny_reach grove-cli "CLI must not reach either implementation lane" \
+    $BACKEND_CRATES $GIT_CRATES $PTY_CRATES $RENDER_CRATES grove-lua grove-fakedaemon groved grove
 deny_reach grove-proto "the contract must not embed implementations" \
     $BACKEND_CRATES $GIT_CRATES $PTY_CRATES $RENDER_CRATES grove-lua
 deny_reach grove-domain "domain types must stay I/O-free" \
