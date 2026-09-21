@@ -54,7 +54,7 @@ To remove grove completely, run `grove --uninstall`. It lists what it will
 remove and asks first: the running daemons (their terminals close), `grove`
 and `groved`, your config, saved sessions, the installer's source copy and
 the runtime sockets. Worktrees you made with grove are never touched. Add
-`--yes` to skip the question in a script.
+`--y` to skip the question in a script.
 
 Point it at a directory that holds your clones:
 

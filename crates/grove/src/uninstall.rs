@@ -7,7 +7,7 @@
 //! and removing a program is not a reason to delete someone's branches.
 //!
 //! The plan is built first and shown, and nothing is touched until the user
-//! says yes — or passes `--yes`, for scripts. Building and carrying out the
+//! says yes — or passes `--y`, for scripts. Building and carrying out the
 //! plan take their inputs as arguments (the environment, a `/proc` to read),
 //! so both are tested against a temporary directory, not this machine.
 
