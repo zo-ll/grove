@@ -692,8 +692,20 @@ fn open_picker(state: &mut State, ui: &mut Ui) -> bool {
 /// Only the dash for now: while an overlay is open the dash underneath is not
 /// what anyone is pointing at, and the overlays' own clicks are the next piece.
 fn on_mouse(event: MouseEvent, state: &mut State, ui: &mut Ui) -> Flow {
-    if !matches!(state, State::Connected { .. }) || ui.helping.is_some() {
+    if !matches!(state, State::Connected { .. }) {
         return Flow::Continue { redraw: false };
+    }
+    // Help covers the screen and is a glance, not a destination: the wheel
+    // scrolls it as `^g ↑`/`^g ↓` do, and a click anywhere puts it away as
+    // `^g ?` does. There is nothing in it to click on, and nothing under it
+    // that should take a click meant for it.
+    if ui.helping.is_some() {
+        return match event.kind {
+            MouseEventKind::ScrollUp => press(KeyCode::Up, true, state, ui),
+            MouseEventKind::ScrollDown => press(KeyCode::Down, true, state, ui),
+            MouseEventKind::Down(MouseButton::Left) => press(KeyCode::Char('?'), true, state, ui),
+            _ => Flow::Continue { redraw: false },
+        };
     }
     let at = ratatui::layout::Position {
         x: event.column,
@@ -4459,6 +4471,27 @@ mod tests {
             )),
             "a resize must follow the box: {asked:?}"
         );
+    }
+
+    #[test]
+    fn the_wheel_scrolls_help_and_a_click_puts_it_away() {
+        // #111's acceptance: every keyboard affordance has a mouse one. Help
+        // was the screen the mouse could not touch at all.
+        let (mut s, _theirs, mut ui) = a_dash_to_click();
+        handle(Input::Terminal(TermEvent::Resize(160, 12)), &mut s, &mut ui);
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('?')), &mut s, &mut ui);
+        assert!(ui.helping.is_some());
+        let top = painted_dash(&s, &ui, 160, 12).join("\n");
+
+        handle(wheel(MouseEventKind::ScrollDown, 10, 5), &mut s, &mut ui);
+        let scrolled = painted_dash(&s, &ui, 160, 12).join("\n");
+        assert_ne!(top, scrolled, "the wheel must move help");
+        assert!(ui.helping.is_some(), "and leave it open");
+
+        handle(click(10, 5), &mut s, &mut ui);
+        assert!(ui.helping.is_none(), "a click puts it away");
+        assert_eq!(ui.screen, Screen::Dash, "back where it was opened");
     }
 
     #[test]
