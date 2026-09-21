@@ -2525,6 +2525,13 @@ fn handle_input(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
             Flow::Continue { redraw: true }
         }
 
+        // A refusal from the daemon is about something the user just asked
+        // for, so it goes where the UI's own refusals go: the bar.
+        Input::Daemon(DaemonEvent::Failed { context, message }) => {
+            ui.note = Some(format!("{context} failed: {message}"));
+            Flow::Continue { redraw: true }
+        }
+
         Input::Daemon(ev) => {
             if let State::Connected { note, .. } = state {
                 *note = describe(&ev);
@@ -2563,7 +2570,6 @@ fn describe(ev: &DaemonEvent) -> String {
             ownership_movable,
         } => format!("connected, protocol v{version}, movable {ownership_movable}"),
         DaemonEvent::Sessions(s) => format!("{} session(s)", s.len()),
-        DaemonEvent::Failed { context, message } => format!("{context} failed: {message}"),
         other => format!("{other:?}"),
     }
 }
@@ -3522,6 +3528,28 @@ mod tests {
         handle(key(KeyCode::Char('a')), &mut s, &mut ui);
         let note = ui.note.expect("a refusal must be reported");
         assert!(note.contains("clone"), "{note}");
+    }
+
+    #[test]
+    fn a_daemon_refusal_is_shown_on_the_dash() {
+        // Found by hand: `session new` with a taken name was refused by the
+        // daemon and the dash showed nothing at all — the failure went to a
+        // note drawn only on the placeholder screen nobody reaches.
+        let mut s = connected();
+        let mut ui = Ui::new();
+        handle(
+            Input::Daemon(DaemonEvent::Failed {
+                context: "session new".into(),
+                message: "session name \"invoice split\" is already held by session s-1".into(),
+            }),
+            &mut s,
+            &mut ui,
+        );
+        let screen = painted_dash(&s, &ui, 190, 30).join("\n");
+        assert!(
+            screen.contains("already held by session s-1"),
+            "the refusal must be on screen:\n{screen}"
+        );
     }
 
     #[test]
