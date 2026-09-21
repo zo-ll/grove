@@ -672,7 +672,7 @@ fn run_command(chosen: Option<palette::Entry>, state: &mut State, ui: &mut Ui) -
             // Ran. The palette closes, because a command line that stays open
             // after running invites the same command twice.
             ui.screen = Screen::Dash;
-            ui.note = None;
+            ui.note = matches!(request, Request::SaveSnapshot(_)).then(|| snapshot_saved(ui));
             true
         }
         Err(e) => {
@@ -680,6 +680,19 @@ fn run_command(chosen: Option<palette::Entry>, state: &mut State, ui: &mut Ui) -
             true
         }
     }
+}
+
+/// What a snapshot says once sent. The daemon's only answer to success is a
+/// fresh session list, which changes nothing visible — so without this the
+/// key did nothing anyone could see. A failure arrives as a `Failed` a moment
+/// later and replaces it.
+fn snapshot_saved(ui: &Ui) -> String {
+    let name = ui
+        .session
+        .as_ref()
+        .and_then(|open| ui.sessions.by_id(open))
+        .map_or_else(|| "this session".to_string(), |row| row.name.clone());
+    format!("snapshot of {name} saved")
 }
 
 /// Open the end-session confirm for `session`.
@@ -2085,9 +2098,10 @@ fn handle_input(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
                     let request = ui.session.clone().map(Request::SaveSnapshot);
                     match request {
                         Some(request) => {
-                            if let Err(e) = send(state, &request) {
-                                ui.note = Some(format!("could not reach the daemon: {e}"));
-                            }
+                            ui.note = Some(match send(state, &request) {
+                                Ok(()) => snapshot_saved(ui),
+                                Err(e) => format!("could not reach the daemon: {e}"),
+                            });
                         }
                         None => ui.note = Some("snapshot needs an open session".into()),
                     }
@@ -4993,6 +5007,33 @@ mod tests {
             screen.matches("SHELLTEXT").count(),
             1,
             "the shell's output belongs in its box only:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_says_it_was_saved() {
+        // Found by hand: `snapshot` and ^g S wrote the file and said nothing,
+        // so the only way to know was to look in the state directory.
+        let (mut s, _theirs, mut ui) = a_dash_to_click();
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('S')), &mut s, &mut ui);
+        let note = ui.note.clone().expect("the key says what it did");
+        assert!(
+            note.contains("snapshot") && note.contains("invoice split"),
+            "{note}"
+        );
+
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('/')), &mut s, &mut ui);
+        for c in "snapshot".chars() {
+            handle(key(KeyCode::Char(c)), &mut s, &mut ui);
+        }
+        handle(key(KeyCode::Enter), &mut s, &mut ui);
+        assert_eq!(ui.screen, Screen::Dash);
+        let note = ui.note.clone().expect("and so does the command");
+        assert!(
+            note.contains("snapshot") && note.contains("invoice split"),
+            "{note}"
         );
     }
 

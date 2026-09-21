@@ -101,7 +101,7 @@ pub const COMMANDS: &[Command] = &[
     },
     Command {
         name: "defaults",
-        summary: "show and edit config values",
+        summary: "where the config file is",
         takes: Takes::Nothing,
     },
     Command {
