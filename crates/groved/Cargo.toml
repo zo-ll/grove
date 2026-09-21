@@ -16,6 +16,7 @@ grove-proto = { workspace = true }
 grove-lua = { workspace = true }
 grove-git = { workspace = true }
 grove-state = { workspace = true }
+notify = "8.2"
 portable-pty = "0.9"
 serde_json = { workspace = true }
 thiserror = { workspace = true }

@@ -13,11 +13,13 @@
 //! itself is pruned from the walk.
 
 use grove_domain::RepoId;
+use ignore::WalkBuilder;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs;
 use std::io;
+use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -48,6 +50,10 @@ pub enum Error {
     },
     #[error("could not read ref timestamp at {path}: {source}")]
     RefTimestamp { path: PathBuf, source: io::Error },
+    #[error("could not read git metadata at {path}: {source}")]
+    GitMetadata { path: PathBuf, source: io::Error },
+    #[error("git metadata at {path} is malformed: {message}")]
+    MalformedGitMetadata { path: PathBuf, message: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -66,6 +72,17 @@ pub struct Worktree {
     pub branch: Option<String>,
     pub head: String,
     pub is_clone: bool,
+}
+
+/// Filesystem locations whose changes can alter a worktree row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitWatchPaths {
+    pub worktree: PathBuf,
+    /// Non-ignored directories to watch non-recursively. This keeps native
+    /// watchers out of large build trees while still seeing their creation.
+    pub worktree_dirs: Vec<PathBuf>,
+    pub git_dir: PathBuf,
+    pub common_dir: PathBuf,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -242,6 +259,111 @@ pub fn base_branch(repo: &Path) -> Result<Option<String>, Error> {
 pub fn worktrees(repo: &Path) -> Result<Vec<Worktree>, Error> {
     let output = git_success(repo, "worktree list", &["worktree", "list", "--porcelain"])?;
     parse_worktrees(repo, &output)
+}
+
+/// Resolves each worktree's checkout and administrative directories once so
+/// the daemon can use native filesystem notifications without polling Git.
+pub fn watch_paths(repo: &Path) -> Result<Vec<GitWatchPaths>, Error> {
+    worktrees(repo)?
+        .into_iter()
+        .map(|worktree| {
+            let dot_git = worktree.path.join(".git");
+            let metadata = fs::metadata(&dot_git).map_err(|source| Error::GitMetadata {
+                path: dot_git.clone(),
+                source,
+            })?;
+            let git_dir = if metadata.is_dir() {
+                fs::canonicalize(&dot_git).map_err(|source| Error::GitMetadata {
+                    path: dot_git.clone(),
+                    source,
+                })?
+            } else {
+                let contents =
+                    fs::read_to_string(&dot_git).map_err(|source| Error::GitMetadata {
+                        path: dot_git.clone(),
+                        source,
+                    })?;
+                let value = contents.trim().strip_prefix("gitdir: ").ok_or_else(|| {
+                    Error::MalformedGitMetadata {
+                        path: dot_git.clone(),
+                        message: "expected a gitdir pointer".into(),
+                    }
+                })?;
+                let path = PathBuf::from(value);
+                let path = if path.is_absolute() {
+                    path
+                } else {
+                    worktree.path.join(path)
+                };
+                fs::canonicalize(&path).map_err(|source| Error::GitMetadata { path, source })?
+            };
+            let common_file = git_dir.join("commondir");
+            let common_dir = match fs::read_to_string(&common_file) {
+                Ok(value) => {
+                    let path = PathBuf::from(value.trim());
+                    let path = if path.is_absolute() {
+                        path
+                    } else {
+                        git_dir.join(path)
+                    };
+                    fs::canonicalize(&path).map_err(|source| Error::GitMetadata { path, source })?
+                }
+                Err(source) if source.kind() == io::ErrorKind::NotFound => git_dir.clone(),
+                Err(source) => {
+                    return Err(Error::GitMetadata {
+                        path: common_file,
+                        source,
+                    });
+                }
+            };
+            Ok(GitWatchPaths {
+                worktree_dirs: watch_directories(&worktree.path)?,
+                worktree: worktree.path,
+                git_dir,
+                common_dir,
+            })
+        })
+        .collect()
+}
+
+fn watch_directories(worktree: &Path) -> Result<Vec<PathBuf>, Error> {
+    let root = worktree.to_owned();
+    let mut builder = WalkBuilder::new(worktree);
+    builder
+        // Hidden source files are Git state too; only the administrative
+        // directory is excluded explicitly below.
+        .hidden(false)
+        // Grove follows Git's ignores, not ripgrep's additional .ignore files.
+        .ignore(false)
+        .filter_entry(move |entry| entry.path() == root || entry.file_name() != OsStr::new(".git"));
+    let mut directories: HashSet<PathBuf> = builder
+        .build()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_some_and(|kind| kind.is_dir()))
+        .map(|entry| entry.into_path())
+        .collect();
+
+    // Ignore rules do not apply to files Git already tracks. Put every
+    // tracked file's ancestor back so a later ignore rule cannot make edits
+    // to that file invisible to the daemon.
+    let tracked = git_success(worktree, "tracked files", &["ls-files", "-z"])?;
+    for name in tracked
+        .split(|byte| *byte == 0)
+        .filter(|name| !name.is_empty())
+    {
+        let path = worktree.join(std::ffi::OsString::from_vec(name.to_vec()));
+        let mut parent = path.parent();
+        while let Some(directory) = parent.filter(|directory| directory.starts_with(worktree)) {
+            directories.insert(directory.to_owned());
+            if directory == worktree {
+                break;
+            }
+            parent = directory.parent();
+        }
+    }
+    let mut directories: Vec<_> = directories.into_iter().collect();
+    directories.sort();
+    Ok(directories)
 }
 
 fn parse_worktrees(repo: &Path, bytes: &[u8]) -> Result<Vec<Worktree>, Error> {
@@ -851,6 +973,9 @@ fn directory_size(path: &Path, cancelled: &AtomicBool) -> Option<Result<u64, io:
 
 fn git_output(path: &Path, args: &[&str]) -> Result<Output, Error> {
     Command::new("git")
+        // Read-only inspection must not refresh the index and wake the
+        // daemon's filesystem watcher itself.
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .arg("-C")
         .arg(path)
         .args(args)
@@ -877,6 +1002,7 @@ fn git_success_os<'a>(
     args: impl IntoIterator<Item = &'a OsStr>,
 ) -> Result<Vec<u8>, Error> {
     let output = Command::new("git")
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .arg("-C")
         .arg(path)
         .args(args)
@@ -1038,6 +1164,59 @@ mod tests {
                 .any(|row| row.is_clone && row.branch.as_deref() == Some("main"))
         );
         assert!(rows.iter().any(|row| !row.is_clone && row.branch.is_none()));
+    }
+
+    #[test]
+    fn watch_paths_resolve_linked_worktree_git_and_common_directories() {
+        let temp = TempDir::new("watch-paths");
+        let clone = temp.0.join("clone");
+        let linked = temp.0.join("linked");
+        repo(&clone);
+        git(
+            &clone,
+            &[
+                "worktree",
+                "add",
+                "-qb",
+                "feature",
+                linked.to_str().unwrap(),
+            ],
+        );
+
+        let paths = watch_paths(&clone).unwrap();
+        let common = fs::canonicalize(clone.join(".git")).unwrap();
+        assert_eq!(paths.len(), 2);
+        assert!(paths.iter().all(|paths| paths.common_dir == common));
+        assert!(paths.iter().any(|paths| {
+            paths.worktree == linked
+                && paths.git_dir.starts_with(common.join("worktrees"))
+                && paths.git_dir != common
+        }));
+    }
+
+    #[test]
+    fn watch_paths_exclude_gitignored_build_directories() {
+        let temp = TempDir::new("watch-ignores");
+        repo(&temp.0);
+        fs::write(temp.0.join(".gitignore"), "target/\nnode_modules/\n").unwrap();
+        fs::create_dir_all(temp.0.join("target/deep")).unwrap();
+        fs::write(temp.0.join("target/tracked"), "keep watching me\n").unwrap();
+        git(&temp.0, &["add", "-f", "target/tracked"]);
+        git(&temp.0, &["commit", "-qm", "track ignored file"]);
+        fs::create_dir_all(temp.0.join("node_modules/package")).unwrap();
+        fs::create_dir_all(temp.0.join("src/nested")).unwrap();
+
+        let paths = watch_paths(&temp.0).unwrap();
+        assert_eq!(paths.len(), 1);
+        assert!(paths[0].worktree_dirs.contains(&temp.0));
+        assert!(paths[0].worktree_dirs.contains(&temp.0.join("src/nested")));
+        assert!(paths[0].worktree_dirs.contains(&temp.0.join("target")));
+        assert!(
+            paths[0]
+                .worktree_dirs
+                .iter()
+                .all(|path| !path.starts_with(temp.0.join("node_modules")))
+        );
     }
 
     #[test]
