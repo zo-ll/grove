@@ -114,6 +114,21 @@ impl Worktrees {
         true
     }
 
+    /// Put the cursor on a branch, if it is listed. Returns whether it is.
+    pub fn select_branch(&mut self, branch: &str) -> bool {
+        match self
+            .rows
+            .iter()
+            .position(|row| row.worktree.branch == branch)
+        {
+            Some(index) => {
+                self.cursor = index;
+                true
+            }
+            None => false,
+        }
+    }
+
     pub fn move_down(&mut self) -> bool {
         let last = self.rows.len().saturating_sub(1);
         if self.rows.is_empty() || self.cursor >= last {
