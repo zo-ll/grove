@@ -21,6 +21,11 @@ pub struct Row {
     /// Already a member of the open session.
     pub member: bool,
     pub checked: bool,
+    /// The branch `new` would cut from, as the daemon reports it; empty for
+    /// a repo that has none (no `origin/HEAD`, no configured base).
+    pub base: String,
+    /// Whether that came from `origin/HEAD` rather than configuration.
+    pub from_origin_head: bool,
 }
 
 /// Which repositories a command wants to see, and which start checked.
@@ -57,6 +62,8 @@ impl Select {
                 repo: row.repo.clone(),
                 name: row.name.clone(),
                 member: row.member,
+                base: row.base_branch.clone(),
+                from_origin_head: row.base_from_origin_head,
                 checked: match wants {
                     // The common case is "the repos I am already working in",
                     // so that is what is checked when the picker opens.
