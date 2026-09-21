@@ -439,7 +439,7 @@ fn serve_client_for(
                     }
                 } else {
                     vec![Event::Failed {
-                        context: format!("{request:?}"),
+                        context: request.failure_context().into(),
                         message: "request handling is not installed yet".into(),
                     }]
                 };

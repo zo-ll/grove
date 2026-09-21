@@ -256,11 +256,11 @@ impl SessionOrchestrator {
         self.fire_observed_terminal_exits();
         self.drain_sizes();
         let mut events = self.drain_unknown_overrides();
-        let context = format!("{request:?}");
+        let context = request.failure_context();
         events.extend(match self.apply_request(request) {
             Ok(events) => events,
             Err(error) => vec![Event::Failed {
-                context,
+                context: context.into(),
                 message: error.to_string(),
             }],
         });
@@ -2208,11 +2208,17 @@ mod tests {
         assert!(
             events.iter().any(|event| matches!(
                 event,
-                Event::Failed { message, .. }
-                    if message.contains("invoice split") && message.contains("holder")
+                Event::Failed { context, message }
+                    if context == "session new"
+                        && message.contains("invoice split")
+                        && message.contains("holder")
             )),
             "duplicate name must identify its holder: {events:?}"
         );
+        assert!(events.iter().all(|event| match event {
+            Event::Failed { context, .. } => !context.contains('{') && !context.contains("::"),
+            _ => true,
+        }));
         assert!(
             events.iter().any(|event| matches!(
                 event,

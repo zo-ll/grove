@@ -251,6 +251,49 @@ fn no_open_session_has_its_own_exit_code() {
 }
 
 #[test]
+fn a_failure_is_paired_with_its_request_by_human_context() {
+    let temp = TempDir::new();
+    let runtime = temp.0.join("runtime");
+    let workspace = temp.0.join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let listener = listener(&runtime, &workspace);
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        greet(&mut stream);
+        assert_eq!(
+            read_frame::<_, Request>(&mut stream).unwrap(),
+            Request::SessionNew {
+                name: "invoice split".into()
+            }
+        );
+        write_frame(
+            &mut stream,
+            &Event::Failed {
+                context: "fetch".into(),
+                message: "an unrelated background fetch failed".into(),
+            },
+        )
+        .unwrap();
+        write_frame(
+            &mut stream,
+            &Event::Failed {
+                context: "session new".into(),
+                message: "session name is already taken".into(),
+            },
+        )
+        .unwrap();
+    });
+
+    let output = run(&runtime, &workspace, &["session", "new", "invoice split"]);
+    assert_eq!(output.status.code(), Some(5));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("session new: session name is already taken"));
+    assert!(!stderr.contains("background fetch"));
+    server.join().unwrap();
+}
+
+#[test]
 fn script_can_create_add_branch_and_list_two_repos() {
     let temp = TempDir::new();
     let runtime = temp.0.join("runtime");
