@@ -120,6 +120,11 @@ struct Ui {
     /// The last size the terminal pane actually had, kept so hiding the pane
     /// does not reflow the program inside its pty.
     last_pane_size: (u16, u16),
+    /// A branch `new` has just asked for. When rows containing it arrive the
+    /// cursor goes there, once — the point of making a branch is to work on
+    /// it, and the cursor otherwise stays on whatever it was on, usually the
+    /// clone.
+    land_on: Option<String>,
     /// Which shell the shell overlay is showing.
     shell_kind: ShellKind,
     /// Each session's shell that the daemon is running, by session. Kept for
@@ -380,6 +385,7 @@ impl Ui {
             width: 80,
             height: 24,
             last_pane_size: (22, 34),
+            land_on: None,
             shell_kind: ShellKind::Scratch,
             session_shells: std::collections::HashMap::new(),
             selection: None,
@@ -1361,6 +1367,7 @@ fn confirm_argument(state: &mut State, ui: &mut Ui) -> bool {
                     repo: row.repo.clone(),
                 });
             }
+            ui.land_on = Some(argument.trim().to_string());
             requests.push(Request::NewWorktrees {
                 session: session.clone(),
                 branch: argument.trim().to_string(),
@@ -2448,6 +2455,11 @@ fn handle_input(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
                 return Flow::Continue { redraw: false };
             }
             ui.worktrees.set(rows);
+            if let Some(branch) = ui.land_on.as_deref()
+                && ui.worktrees.select_branch(branch)
+            {
+                ui.land_on = None;
+            }
             refresh_user_columns(ui);
             follow_selection(state, ui);
             Flow::Continue { redraw: true }
@@ -5003,6 +5015,60 @@ mod tests {
         missing.sort();
         missing.dedup();
         assert!(missing.is_empty(), "bound but never handled: {missing:?}");
+    }
+
+    #[test]
+    fn after_new_the_cursor_lands_on_the_branch_just_made() {
+        // Found using it: `new feat/x` made the worktrees, and the cursor
+        // stayed on `main`, so the terminal pane went on showing the clone
+        // and the new branch had to be found by hand.
+        let (mut s, _theirs, mut ui) = a_dash_to_click();
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('n')), &mut s, &mut ui);
+        for c in "feat/fresh".chars() {
+            handle(key(KeyCode::Char(c)), &mut s, &mut ui);
+        }
+        handle(key(KeyCode::Enter), &mut s, &mut ui);
+        handle(
+            Input::Daemon(DaemonEvent::Worktrees {
+                repo: grove_domain::RepoId("repo".into()),
+                rows: vec![
+                    worktree_row("feat/first", grove_domain::Ownership::Unowned),
+                    worktree_row("feat/second", grove_domain::Ownership::Unowned),
+                    worktree_row("feat/fresh", grove_domain::Ownership::Ours),
+                    worktree_row("feat/third", grove_domain::Ownership::Unowned),
+                ],
+            }),
+            &mut s,
+            &mut ui,
+        );
+        assert_eq!(
+            ui.worktrees
+                .selected()
+                .map(|row| row.worktree.branch.as_str()),
+            Some("feat/fresh")
+        );
+
+        // Once: the next refresh leaves the cursor wherever the user put it.
+        handle(key(KeyCode::Up), &mut s, &mut ui);
+        handle(
+            Input::Daemon(DaemonEvent::Worktrees {
+                repo: grove_domain::RepoId("repo".into()),
+                rows: vec![
+                    worktree_row("feat/first", grove_domain::Ownership::Unowned),
+                    worktree_row("feat/second", grove_domain::Ownership::Unowned),
+                    worktree_row("feat/fresh", grove_domain::Ownership::Ours),
+                ],
+            }),
+            &mut s,
+            &mut ui,
+        );
+        assert_eq!(
+            ui.worktrees
+                .selected()
+                .map(|row| row.worktree.branch.as_str()),
+            Some("feat/second")
+        );
     }
 
     #[test]
