@@ -3,6 +3,7 @@
 use crate::fetch::{FetchPolicy, FetchResult, FetchStatus, RefFreshness};
 use crate::prune::{PruneDisqualifier, PruneHistory};
 use crate::terminal::{TerminalError, TerminalKey, TerminalManager};
+use crate::watch::{RepoWatch, WatchPlan};
 use grove_domain::{Ownership, RepoId, SessionId, SessionState};
 use grove_git::{RemoveOptions, Repository, SizeTask, Tracking, Workspace};
 use grove_lua::{DaemonRuntime, HookReport, LifecycleEvent, LifecyclePayload, WorktreePathContext};
@@ -244,6 +245,31 @@ impl SessionOrchestrator {
 
     pub fn store(&self) -> &Store {
         &self.store
+    }
+
+    pub(crate) fn watch_plan(&self) -> WatchPlan {
+        WatchPlan {
+            repos: self
+                .repositories
+                .values()
+                .filter_map(|repository| {
+                    grove_git::watch_paths(&repository.path)
+                        .ok()
+                        .map(|paths| RepoWatch {
+                            repo: repository.id.clone(),
+                            paths,
+                        })
+                })
+                .collect(),
+        }
+    }
+
+    pub(crate) fn worktrees_event(&mut self, repo: &RepoId) -> Result<Event, OrchestrationError> {
+        self.repository(repo)?;
+        Ok(Event::Worktrees {
+            repo: repo.clone(),
+            rows: self.worktree_rows(repo)?,
+        })
     }
 
     pub fn terminals(&self) -> &TerminalManager {

@@ -25,6 +25,7 @@ pub mod fetch;
 pub mod prune;
 pub mod session;
 pub mod terminal;
+mod watch;
 
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -57,6 +58,8 @@ pub enum LifecycleError {
     Spawn { path: PathBuf, source: io::Error },
     #[error("groved did not become ready within {0:?}")]
     StartupTimeout(Duration),
+    #[error("could not watch worktrees: {0}")]
+    Watch(String),
 }
 
 pub enum BindOutcome {
@@ -161,12 +164,16 @@ impl DaemonSocket {
 
     pub fn run(self, service: session::SessionOrchestrator) -> Result<(), LifecycleError> {
         let service = Arc::new(Mutex::new(service));
+        let updates = watch::Broadcaster::default();
+        let _watcher = watch::WorktreeWatcher::start(Arc::clone(&service), updates.clone())
+            .map_err(|error| LifecycleError::Watch(error.to_string()))?;
         loop {
             match self.listener.accept() {
                 Ok((stream, _)) => {
                     let service = Arc::clone(&service);
+                    let receiver = updates.subscribe();
                     thread::spawn(move || {
-                        let _ = serve_client_with(stream, Some(service));
+                        let _ = serve_client_for(stream, Some(service), Some(receiver), IO_TIMEOUT);
                     });
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
@@ -287,11 +294,23 @@ fn serve_client(stream: UnixStream) -> Result<(), grove_proto::FrameError> {
     serve_client_with(stream, None)
 }
 
+#[cfg(test)]
 fn serve_client_with(
     stream: UnixStream,
     service: Option<Arc<Mutex<session::SessionOrchestrator>>>,
 ) -> Result<(), grove_proto::FrameError> {
-    serve_client_for(stream, service, IO_TIMEOUT)
+    serve_client_for(stream, service, None, IO_TIMEOUT)
+}
+
+#[cfg(test)]
+fn serve_client_with_watcher(
+    stream: UnixStream,
+    service: Arc<Mutex<session::SessionOrchestrator>>,
+) -> Result<(), grove_proto::FrameError> {
+    let updates = watch::Broadcaster::default();
+    let receiver = updates.subscribe();
+    let _watcher = watch::WorktreeWatcher::start(Arc::clone(&service), updates).unwrap();
+    serve_client_for(stream, Some(service), Some(receiver), IO_TIMEOUT)
 }
 
 /// A client's connection, with the read timeout the caller wants.
@@ -301,6 +320,7 @@ fn serve_client_with(
 fn serve_client_for(
     mut stream: UnixStream,
     service: Option<Arc<Mutex<session::SessionOrchestrator>>>,
+    updates: Option<mpsc::Receiver<Event>>,
     timeout: Duration,
 ) -> Result<(), grove_proto::FrameError> {
     stream.set_read_timeout(Some(timeout))?;
@@ -354,6 +374,17 @@ fn serve_client_for(
             }
         }
     });
+    if let Some(updates) = updates {
+        let outbound = outbound.clone();
+        thread::spawn(move || {
+            for event in updates {
+                match outbound.try_send(event) {
+                    Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
+                    Err(mpsc::TrySendError::Disconnected(_)) => break,
+                }
+            }
+        });
+    }
 
     // This client's live terminal feed, if attached. At most one at a time:
     // a pane follows one terminal, and a new attach or an explicit detach
@@ -538,6 +569,9 @@ fn socket_error(path: &Path, source: io::Error) -> LifecycleError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use grove_domain::RepoId;
+    use grove_git::Repository;
+    use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -563,6 +597,20 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    fn git(path: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
@@ -621,7 +669,7 @@ mod tests {
         // went grey five seconds later without anyone touching it.
         let (client, server) = UnixStream::pair().unwrap();
         let quick = Duration::from_millis(100);
-        let worker = thread::spawn(move || serve_client_for(server, None, quick));
+        let worker = thread::spawn(move || serve_client_for(server, None, None, quick));
         let mut client = client;
         client
             .set_read_timeout(Some(Duration::from_secs(5)))
@@ -844,6 +892,96 @@ mod tests {
             event,
             Event::Failed { message, .. } if message.contains("does not exist")
         ));
+        drop(client);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn worktree_changes_are_pushed_without_polling_an_idle_client() {
+        let temp = TempDir::new();
+        let repo = temp.0.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        git(&repo, &["config", "user.name", "Grove Test"]);
+        git(&repo, &["config", "user.email", "grove@example.test"]);
+        fs::write(repo.join("tracked"), "clean\n").unwrap();
+        git(&repo, &["add", "tracked"]);
+        git(&repo, &["commit", "-qm", "base"]);
+        git(&repo, &["remote", "add", "origin", "."]);
+        git(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        git(&repo, &["branch", "--set-upstream-to=origin/main", "main"]);
+
+        let runtime = grove_lua::DaemonRuntime::load(temp.0.join("missing.lua")).runtime;
+        let fetch = fetch::FetchPolicy::from_config(2, runtime.config()).unwrap();
+        let store = grove_state::Store::load_at(&temp.0, &temp.0, "");
+        let terminals =
+            terminal::TerminalManager::new(PathBuf::from("/bin/sh"), temp.0.clone(), 100);
+        let service = session::SessionOrchestrator::new(
+            store,
+            vec![Repository {
+                id: RepoId("repo".into()),
+                name: "repo".into(),
+                path: repo.clone(),
+                base_branch: None,
+            }],
+            temp.0.clone(),
+            terminals,
+            fetch,
+            runtime,
+        );
+        let service = Arc::new(Mutex::new(service));
+        let (client, server) = UnixStream::pair().unwrap();
+        let worker = thread::spawn(move || serve_client_with_watcher(server, service).unwrap());
+        let mut client = client;
+        client.set_read_timeout(Some(IO_TIMEOUT)).unwrap();
+        write_frame(
+            &mut client,
+            &Request::Hello {
+                version: PROTOCOL_VERSION,
+            },
+        )
+        .unwrap();
+        let _: Event = read_frame(&mut client).unwrap();
+        write_frame(&mut client, &Request::ListWorktrees(RepoId("repo".into()))).unwrap();
+        let Event::Worktrees { rows, .. } = read_frame(&mut client).unwrap() else {
+            panic!("expected initial Worktrees")
+        };
+        assert_eq!(rows[0].dirty_files, 0);
+
+        client
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        assert!(
+            read_frame::<_, Event>(&mut client).is_err(),
+            "an idle workspace must not push a repaint"
+        );
+
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        fs::write(repo.join("tracked"), "dirty\n").unwrap();
+        let Event::Worktrees { repo: pushed, rows } = read_frame(&mut client).unwrap() else {
+            panic!("expected a pushed Worktrees event")
+        };
+        assert_eq!(pushed, RepoId("repo".into()));
+        assert_eq!(rows[0].dirty_files, 1);
+
+        git(&repo, &["add", "tracked"]);
+        git(&repo, &["commit", "-qm", "next"]);
+        let Event::Worktrees { rows, .. } = read_frame(&mut client).unwrap() else {
+            panic!("expected a pushed Worktrees event after commit")
+        };
+        assert_eq!(rows[0].dirty_files, 0);
+        assert_eq!(rows[0].ahead, 1);
+
+        client
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        assert!(
+            read_frame::<_, Event>(&mut client).is_err(),
+            "one git operation burst must produce only one debounced update"
+        );
+
         drop(client);
         worker.join().unwrap();
     }

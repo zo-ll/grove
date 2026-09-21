@@ -48,6 +48,10 @@ pub enum Error {
     },
     #[error("could not read ref timestamp at {path}: {source}")]
     RefTimestamp { path: PathBuf, source: io::Error },
+    #[error("could not read git metadata at {path}: {source}")]
+    GitMetadata { path: PathBuf, source: io::Error },
+    #[error("git metadata at {path} is malformed: {message}")]
+    MalformedGitMetadata { path: PathBuf, message: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -66,6 +70,14 @@ pub struct Worktree {
     pub branch: Option<String>,
     pub head: String,
     pub is_clone: bool,
+}
+
+/// Filesystem locations whose changes can alter a worktree row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitWatchPaths {
+    pub worktree: PathBuf,
+    pub git_dir: PathBuf,
+    pub common_dir: PathBuf,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -242,6 +254,70 @@ pub fn base_branch(repo: &Path) -> Result<Option<String>, Error> {
 pub fn worktrees(repo: &Path) -> Result<Vec<Worktree>, Error> {
     let output = git_success(repo, "worktree list", &["worktree", "list", "--porcelain"])?;
     parse_worktrees(repo, &output)
+}
+
+/// Resolves each worktree's checkout and administrative directories once so
+/// the daemon can use native filesystem notifications without polling Git.
+pub fn watch_paths(repo: &Path) -> Result<Vec<GitWatchPaths>, Error> {
+    worktrees(repo)?
+        .into_iter()
+        .map(|worktree| {
+            let dot_git = worktree.path.join(".git");
+            let metadata = fs::metadata(&dot_git).map_err(|source| Error::GitMetadata {
+                path: dot_git.clone(),
+                source,
+            })?;
+            let git_dir = if metadata.is_dir() {
+                fs::canonicalize(&dot_git).map_err(|source| Error::GitMetadata {
+                    path: dot_git.clone(),
+                    source,
+                })?
+            } else {
+                let contents =
+                    fs::read_to_string(&dot_git).map_err(|source| Error::GitMetadata {
+                        path: dot_git.clone(),
+                        source,
+                    })?;
+                let value = contents.trim().strip_prefix("gitdir: ").ok_or_else(|| {
+                    Error::MalformedGitMetadata {
+                        path: dot_git.clone(),
+                        message: "expected a gitdir pointer".into(),
+                    }
+                })?;
+                let path = PathBuf::from(value);
+                let path = if path.is_absolute() {
+                    path
+                } else {
+                    worktree.path.join(path)
+                };
+                fs::canonicalize(&path).map_err(|source| Error::GitMetadata { path, source })?
+            };
+            let common_file = git_dir.join("commondir");
+            let common_dir = match fs::read_to_string(&common_file) {
+                Ok(value) => {
+                    let path = PathBuf::from(value.trim());
+                    let path = if path.is_absolute() {
+                        path
+                    } else {
+                        git_dir.join(path)
+                    };
+                    fs::canonicalize(&path).map_err(|source| Error::GitMetadata { path, source })?
+                }
+                Err(source) if source.kind() == io::ErrorKind::NotFound => git_dir.clone(),
+                Err(source) => {
+                    return Err(Error::GitMetadata {
+                        path: common_file,
+                        source,
+                    });
+                }
+            };
+            Ok(GitWatchPaths {
+                worktree: worktree.path,
+                git_dir,
+                common_dir,
+            })
+        })
+        .collect()
 }
 
 fn parse_worktrees(repo: &Path, bytes: &[u8]) -> Result<Vec<Worktree>, Error> {
@@ -851,6 +927,9 @@ fn directory_size(path: &Path, cancelled: &AtomicBool) -> Option<Result<u64, io:
 
 fn git_output(path: &Path, args: &[&str]) -> Result<Output, Error> {
     Command::new("git")
+        // Read-only inspection must not refresh the index and wake the
+        // daemon's filesystem watcher itself.
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .arg("-C")
         .arg(path)
         .args(args)
@@ -877,6 +956,7 @@ fn git_success_os<'a>(
     args: impl IntoIterator<Item = &'a OsStr>,
 ) -> Result<Vec<u8>, Error> {
     let output = Command::new("git")
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .arg("-C")
         .arg(path)
         .args(args)
@@ -1038,6 +1118,34 @@ mod tests {
                 .any(|row| row.is_clone && row.branch.as_deref() == Some("main"))
         );
         assert!(rows.iter().any(|row| !row.is_clone && row.branch.is_none()));
+    }
+
+    #[test]
+    fn watch_paths_resolve_linked_worktree_git_and_common_directories() {
+        let temp = TempDir::new("watch-paths");
+        let clone = temp.0.join("clone");
+        let linked = temp.0.join("linked");
+        repo(&clone);
+        git(
+            &clone,
+            &[
+                "worktree",
+                "add",
+                "-qb",
+                "feature",
+                linked.to_str().unwrap(),
+            ],
+        );
+
+        let paths = watch_paths(&clone).unwrap();
+        let common = fs::canonicalize(clone.join(".git")).unwrap();
+        assert_eq!(paths.len(), 2);
+        assert!(paths.iter().all(|paths| paths.common_dir == common));
+        assert!(paths.iter().any(|paths| {
+            paths.worktree == linked
+                && paths.git_dir.starts_with(common.join("worktrees"))
+                && paths.git_dir != common
+        }));
     }
 
     #[test]
