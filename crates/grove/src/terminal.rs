@@ -157,6 +157,22 @@ fn install_signal_handlers() {
 #[cfg(not(unix))]
 fn install_signal_handlers() {}
 
+/// `RAW` is one flag for the whole process and the test harness runs tests in
+/// parallel, so every test that sets or reads it holds this first — without
+/// it one test's `store(true)` lands between another's restore and its
+/// assert, about once in a hundred and fifty runs.
+#[cfg(test)]
+static RAW_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+fn raw_tests() -> std::sync::MutexGuard<'static, ()> {
+    // A test that panics while holding it poisons it; the flag is reset by
+    // each test, so the data behind the poison is fine to reuse.
+    RAW_TESTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,6 +191,7 @@ mod tests {
 
     #[test]
     fn restore_is_idempotent() {
+        let _raw = raw_tests();
         // Several paths can fire — Drop, the panic hook, a signal — and more
         // than one may fire for a single exit. Running twice must be harmless.
         RAW.store(true, Ordering::SeqCst);
@@ -186,6 +203,7 @@ mod tests {
 
     #[test]
     fn restore_is_a_noop_when_not_raw() {
+        let _raw = raw_tests();
         // A restore that runs without raw mode having been entered must not
         // emit escape sequences into a terminal grove never took over — this is
         // the case when the daemon connection fails before setup.
@@ -197,6 +215,7 @@ mod tests {
 
 #[test]
 fn a_failure_after_entering_raw_mode_still_restores() {
+    let _raw = raw_tests();
     // The guard must exist before anything that can fail, or an early `?`
     // returns with the terminal raw and nothing left to restore it. This
     // asserts the ordering property directly: dropping a guard clears the
@@ -217,6 +236,7 @@ mod panic_tests {
 
     #[test]
     fn a_panic_restores_before_unwinding() {
+        let _raw = raw_tests();
         // The hook must run restore() before the default hook prints, or the
         // panic message lands on a raw-mode screen and stair-steps across it.
         RAW.store(true, Ordering::SeqCst);
