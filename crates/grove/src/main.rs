@@ -1785,6 +1785,35 @@ fn handle_input(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
     match input {
         Input::Terminal(TermEvent::Key(key)) => {
             let routed = ui.router.route(ui.screen, ui.focus, key);
+            // Help covers the screen, so the screen under it takes nothing:
+            // a key that opened the palette there would type into a box
+            // nobody can see. Only help's own keys act — put it away, scroll
+            // it, or quit.
+            if ui.helping.is_some() {
+                match routed {
+                    Routed::PrefixPending => return Flow::Continue { redraw: true },
+                    Routed::Act(
+                        Action::Help | Action::Quit | Action::ScrollUp | Action::ScrollDown,
+                    ) => {}
+                    _ if key.code == KeyCode::Esc => {
+                        return press(KeyCode::Char('?'), true, state, ui);
+                    }
+                    Routed::Act(Action::MoveUp)
+                    | Routed::ToPty(KeyEvent {
+                        code: KeyCode::Up, ..
+                    }) => {
+                        return press(KeyCode::Up, true, state, ui);
+                    }
+                    Routed::Act(Action::MoveDown)
+                    | Routed::ToPty(KeyEvent {
+                        code: KeyCode::Down,
+                        ..
+                    }) => {
+                        return press(KeyCode::Down, true, state, ui);
+                    }
+                    _ => return Flow::Continue { redraw: false },
+                }
+            }
             // A user binding is consulted before grove's own handling, which
             // is what "merges over" means — and only for keys the router has
             // not already claimed as text or pty input.
@@ -6113,6 +6142,33 @@ mod tests {
             1,
             "only the one this session owns"
         );
+    }
+
+    #[test]
+    fn keys_under_help_do_not_reach_the_screen_it_covers() {
+        // Found by hand: with help open over the dash, `^g /` opened the
+        // palette underneath and the typing went into it unseen, and esc did
+        // not put help away.
+        let (mut s, mut theirs) = wired();
+        let mut ui = Ui::new();
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('?')), &mut s, &mut ui);
+        assert!(ui.helping.is_some());
+
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('/')), &mut s, &mut ui);
+        handle(key(KeyCode::Char('x')), &mut s, &mut ui);
+        handle(key(KeyCode::Enter), &mut s, &mut ui);
+        assert_eq!(ui.screen, Screen::Dash, "nothing opens under help");
+        assert!(ui.helping.is_some(), "and help stays up");
+        assert!(
+            sent(&mut theirs).is_empty(),
+            "nothing is sent from under it"
+        );
+
+        handle(key(KeyCode::Esc), &mut s, &mut ui);
+        assert!(ui.helping.is_none(), "esc puts help away");
+        assert_eq!(ui.screen, Screen::Dash);
     }
 
     #[test]
