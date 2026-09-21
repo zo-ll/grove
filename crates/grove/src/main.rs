@@ -5733,10 +5733,24 @@ mod tests {
         /// An executable that runs `body`, standing in for the daemon.
         fn fake_daemon(&self, body: &str) -> PathBuf {
             let path = self.0.join("fake-groved");
-            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("the fake daemon");
-            let mut perms = std::fs::metadata(&path).expect("metadata").permissions();
-            std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
-            std::fs::set_permissions(&path, perms).expect("chmod");
+            // Written by a child process, never by this one. The tests run on
+            // parallel threads, and a thread that forks while this process
+            // holds the script open for writing hands that write handle to its
+            // child until the child execs. Executing a file something still
+            // has open for writing is ETXTBSY — "Text file busy" — and that
+            // failed one run in thirty. A file this process never opens for
+            // writing has no handle here to leak.
+            let status = std::process::Command::new("sh")
+                .args([
+                    "-c",
+                    r#"printf '%s\n' '#!/bin/sh' "$1" > "$2" && chmod 755 "$2""#,
+                    "sh",
+                    body,
+                ])
+                .arg(&path)
+                .status()
+                .expect("sh to write the fake daemon");
+            assert!(status.success(), "the fake daemon could not be written");
             path
         }
 
