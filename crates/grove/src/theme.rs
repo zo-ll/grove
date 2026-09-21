@@ -820,6 +820,7 @@ mod tests {
         ("start.rs", include_str!("start.rs")),
         ("sessions.rs", include_str!("sessions.rs")),
         ("statusbar.rs", include_str!("statusbar.rs")),
+        ("uninstall.rs", include_str!("uninstall.rs")),
         ("terminal.rs", include_str!("terminal.rs")),
         ("terminals.rs", include_str!("terminals.rs")),
         ("text.rs", include_str!("text.rs")),

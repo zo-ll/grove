@@ -32,6 +32,7 @@ mod terminal;
 mod terminals;
 mod text;
 mod theme;
+mod uninstall;
 mod userkeys;
 mod worktrees;
 
@@ -466,6 +467,10 @@ enum Invocation {
     Run(Option<PathBuf>),
     Help,
     Version,
+    /// Take grove off this machine; `yes` skips the question, for scripts.
+    Uninstall {
+        yes: bool,
+    },
     /// Something that is neither a flag grove knows nor a path. Said, with
     /// the usage, rather than taken as a workspace called `-x`.
     Bad(String),
@@ -485,6 +490,15 @@ fn parse_args(mut args: impl Iterator<Item = std::ffi::OsString>) -> Invocation 
     let invocation = match first.to_str() {
         Some("-h" | "--help") => Invocation::Help,
         Some("-V" | "--version") => Invocation::Version,
+        Some("--uninstall") => {
+            return match extra.as_deref().map(|arg| arg.to_str()) {
+                None => Invocation::Uninstall { yes: false },
+                Some(Some("-y" | "--yes")) if args.next().is_none() => {
+                    Invocation::Uninstall { yes: true }
+                }
+                _ => Invocation::Bad("--uninstall takes only --yes".into()),
+            };
+        }
         Some("--") => match extra {
             Some(path) => return Invocation::Run(Some(PathBuf::from(path))),
             None => Invocation::Bad("`--` needs a workspace path after it".into()),
@@ -510,11 +524,57 @@ beside it; the daemon keeps your terminals running after grove exits.
 
   -h, --help        this
   -V, --version     print the version
+  --uninstall       stop grove's daemons and delete grove, groved, the
+                    config and saved sessions (asks first; --yes skips it).
+                    Worktrees are never touched.
 
   GROVE_NO_AUTOSTART=1   do not start a daemon
   GROVE_DAEMON=path      start this daemon binary instead
 
 Inside grove, ^g ? lists the keys for the screen you are on.";
+
+/// `grove --uninstall`: show the plan, ask, carry it out, say what happened.
+fn uninstall(yes: bool) -> ExitCode {
+    use std::io::{BufRead, IsTerminal, Write};
+    use std::os::unix::fs::MetadataExt;
+
+    let proc_root = Path::new("/proc");
+    let uid = std::fs::metadata("/proc/self").map_or(u32::MAX, |meta| meta.uid());
+    let plan = uninstall::plan(&uninstall::Env::from_process(), proc_root, uid);
+    if plan.is_empty() {
+        println!("grove is not installed here: nothing to remove.");
+        return ExitCode::SUCCESS;
+    }
+    println!(
+        "grove --uninstall will:\n{}\n\n{}\n",
+        plan.describe(),
+        uninstall::WORKTREES_STAY
+    );
+    if !yes {
+        if !std::io::stdin().is_terminal() {
+            eprintln!("grove: not asking without a terminal; run `grove --uninstall --yes`");
+            return ExitCode::from(2);
+        }
+        print!("Remove all of this? [y/N] ");
+        let _ = std::io::stdout().flush();
+        let mut answer = String::new();
+        let _ = std::io::stdin().lock().read_line(&mut answer);
+        if !matches!(answer.trim().to_lowercase().as_str(), "y" | "yes") {
+            println!("Nothing removed.");
+            return ExitCode::SUCCESS;
+        }
+    }
+    let failed = uninstall::execute(&plan, proc_root);
+    if failed.is_empty() {
+        println!("grove is uninstalled.");
+        ExitCode::SUCCESS
+    } else {
+        for failure in &failed {
+            eprintln!("grove: {failure}");
+        }
+        ExitCode::FAILURE
+    }
+}
 
 fn main() -> ExitCode {
     let workspace = match parse_args(std::env::args_os().skip(1)) {
@@ -526,6 +586,7 @@ fn main() -> ExitCode {
             println!("grove {}", env!("CARGO_PKG_VERSION"));
             return ExitCode::SUCCESS;
         }
+        Invocation::Uninstall { yes } => return uninstall(yes),
         Invocation::Bad(why) => {
             eprintln!("grove: {why}\n\n{USAGE}");
             return ExitCode::from(2);
@@ -5014,6 +5075,31 @@ mod tests {
         assert_eq!(parsed(&["-V"]), Invocation::Version);
         assert_eq!(parsed(&["--help"]), Invocation::Help);
         assert_eq!(parsed(&["-h"]), Invocation::Help);
+    }
+
+    #[test]
+    fn uninstall_is_a_command_and_yes_is_its_only_option() {
+        assert_eq!(
+            parsed(&["--uninstall"]),
+            Invocation::Uninstall { yes: false }
+        );
+        assert_eq!(
+            parsed(&["--uninstall", "--yes"]),
+            Invocation::Uninstall { yes: true }
+        );
+        assert_eq!(
+            parsed(&["--uninstall", "-y"]),
+            Invocation::Uninstall { yes: true }
+        );
+        for bad in [
+            &["--uninstall", "now"][..],
+            &["--uninstall", "--yes", "extra"][..],
+        ] {
+            assert!(
+                matches!(parsed(bad), Invocation::Bad(_)),
+                "{bad:?} must not uninstall"
+            );
+        }
     }
 
     #[test]
