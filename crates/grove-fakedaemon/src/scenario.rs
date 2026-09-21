@@ -323,10 +323,10 @@ pub fn invoice_split() -> Scenario {
         ],
         diff_hunks: vec![
             DiffLine::Header("@@ -198,12 +198,26 @@ export function split(".into()),
-            DiffLine::Context("   const items = invoice.lineItems;".into()),
-            DiffLine::Removed("-  return items.map(toLine);".into()),
-            DiffLine::Added("+  const boundary = cycleBoundary(invoice);".into()),
-            DiffLine::Added("+  return [...before.map(toLine)];".into()),
+            DiffLine::Context("  const items = invoice.lineItems;".into()),
+            DiffLine::Removed("  return items.map(toLine);".into()),
+            DiffLine::Added("  const boundary = cycleBoundary(invoice);".into()),
+            DiffLine::Added("  return [...before.map(toLine)];".into()),
         ],
     }
 }

@@ -233,13 +233,28 @@ impl Diff {
             }
             spans.push(Span::styled(" │ ", theme.ink_style(Ink::Divider)));
             if let Some(line) = patch.get(index) {
-                let (text, role) = match line {
-                    DiffLine::Header(text) => (text, Role::Accent),
-                    DiffLine::Context(text) => (text, Role::Muted),
-                    DiffLine::Added(text) => (text, Role::Clean),
-                    DiffLine::Removed(text) => (text, Role::Error),
+                // The daemon sends a line's text without its marker — the
+                // variant is the marker — so the marker is drawn here. Without
+                // it an added line and a context line differ only by colour,
+                // which is no difference at all on a terminal that has fewer
+                // of them, and no patch at all once copied.
+                let (marker, text, role, ground) = match line {
+                    DiffLine::Header(text) => ("", text, Role::Accent, None),
+                    DiffLine::Context(text) => (" ", text, Role::Muted, None),
+                    DiffLine::Added(text) => ("+", text, Role::Clean, Some(Ink::AddedGround)),
+                    DiffLine::Removed(text) => ("-", text, Role::Error, Some(Ink::RemovedGround)),
                 };
-                spans.push(Span::styled(text.clone(), theme.style(role)));
+                let mut style = theme.style(role);
+                let mut shown = format!("{marker}{text}");
+                if let Some(ground) = ground {
+                    // Tinted across the whole row, as the mock tints it, so a
+                    // run of changes reads as a block rather than as words.
+                    style = style.bg(theme.ink(ground));
+                    let room = usize::from(body.width.saturating_sub(left + 3));
+                    let used = shown.width();
+                    shown.push_str(&" ".repeat(room.saturating_sub(used)));
+                }
+                spans.push(Span::styled(shown, style));
             }
             lines.push(Line::from(spans));
         }
@@ -519,6 +534,38 @@ mod tests {
         for verb in ["stage", "commit", "discard", "revert", "session diff"] {
             assert!(!screen.contains(verb), "{verb} in:\n{screen}");
         }
+    }
+
+    #[test]
+    fn each_patch_line_carries_its_marker() {
+        // The daemon sends a line's text without its `+`/`-`/` ` — the variant
+        // says which it is — and the screen showed the text alone, so an
+        // added line and a context line differed only by colour. The mock
+        // writes the marker in, and a patch without them is not one.
+        let mut diff = Diff::default();
+        diff.set(Incoming {
+            repo: "billing-service".into(),
+            branch: "feat/x".into(),
+            base: "origin/main".into(),
+            files: vec![file("src/main.rs", 'M', 1, 1)],
+            selected: Some("src/main.rs".into()),
+            hunks: vec![
+                DiffLine::Header("@@ -1 +1,2 @@".into()),
+                DiffLine::Context("fn main() {}".into()),
+                DiffLine::Removed("fn old() {}".into()),
+                DiffLine::Added("fn split() {}".into()),
+            ],
+            added: 1,
+            removed: 1,
+        });
+        let screen = painted(&diff);
+        assert!(screen.contains(" fn main() {}"), "{screen}");
+        assert!(screen.contains("-fn old() {}"), "{screen}");
+        assert!(screen.contains("+fn split() {}"), "{screen}");
+        assert!(
+            screen.contains("@@ -1 +1,2 @@"),
+            "a header has no marker: {screen}"
+        );
     }
 
     #[test]
