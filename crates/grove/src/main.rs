@@ -3162,12 +3162,21 @@ fn draw_dash(f: &mut ratatui::Frame, body_area: Rect, ui: &Ui) {
         }
     }
     if let Some(area) = inner.terminal {
-        let has_terminal = ui
-            .worktrees
-            .selected()
-            .is_some_and(|row| row.terminal.is_some());
-        ui.terminals
-            .render(f.buffer_mut(), area, &ui.theme, has_terminal);
+        let row_terminal = ui.worktrees.selected().and_then(|row| row.terminal);
+        // Behind a shell the pty being shown is the shell's; this pane is
+        // still the worktree's, so it draws the worktree's own grid.
+        let terminal = if ui.screen == Screen::Shell {
+            row_terminal
+        } else {
+            ui.terminals.showing()
+        };
+        ui.terminals.render_one(
+            terminal,
+            f.buffer_mut(),
+            area,
+            &ui.theme,
+            row_terminal.is_some(),
+        );
     }
 }
 
@@ -4959,6 +4968,31 @@ mod tests {
         assert!(
             screen.contains("^g c close"),
             "its footer names its way out: {screen}"
+        );
+    }
+
+    #[test]
+    fn the_dash_behind_a_shell_does_not_show_the_shells_output() {
+        // Found by hand: with ^g c open, the dash's terminal pane peeking out
+        // beside the box drew the session shell's grid under the worktree's
+        // header — the same typing twice, one copy labelled as another place.
+        let (mut s, _theirs, mut ui) = a_dash_to_click();
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('c')), &mut s, &mut ui);
+        session_shell_spawned(&mut s, &mut ui, 11);
+        handle(
+            Input::Daemon(DaemonEvent::TerminalOutput {
+                terminal: grove_proto::TerminalId(11),
+                bytes: b"SHELLTEXT".to_vec(),
+            }),
+            &mut s,
+            &mut ui,
+        );
+        let screen = painted_dash(&s, &ui, 160, 40).join("\n");
+        assert_eq!(
+            screen.matches("SHELLTEXT").count(),
+            1,
+            "the shell's output belongs in its box only:\n{screen}"
         );
     }
 

@@ -336,10 +336,24 @@ impl Terminals {
 
     /// Draw the pane's contents into `area`, already inside the border.
     pub fn render(&self, buf: &mut Buffer, area: Rect, theme: &Theme, has_terminal: bool) {
+        self.render_one(self.showing, buf, area, theme, has_terminal);
+    }
+
+    /// Draw a given terminal's grid rather than the one being shown — for the
+    /// dash behind a shell, whose pane is still the worktree's while the
+    /// shell has the keyboard. Its last grid, kept from when it was shown.
+    pub fn render_one(
+        &self,
+        terminal: Option<TerminalId>,
+        buf: &mut Buffer,
+        area: Rect,
+        theme: &Theme,
+        has_terminal: bool,
+    ) {
         if area.width == 0 || area.height == 0 {
             return;
         }
-        let Some(pty) = self.showing.and_then(|id| self.ptys.get(&id)) else {
+        let Some(pty) = terminal.and_then(|id| self.ptys.get(&id)) else {
             // Nothing attached. A worktree can legitimately have no pty — an
             // adopted one, or any of them after the daemon restarted — so the
             // pane says how to get one rather than sitting blank.
