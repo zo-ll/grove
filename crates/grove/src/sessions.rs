@@ -183,7 +183,13 @@ impl Sessions {
         crate::overlay::header(
             "session ❯",
             "",
-            &format!("{} sessions · {open} open", self.rows.len()),
+            &format!(
+                "{} · {open} open",
+                match self.rows.len() {
+                    1 => "1 session".to_string(),
+                    n => format!("{n} sessions"),
+                }
+            ),
             header.width,
             theme,
         )
@@ -274,7 +280,11 @@ fn age(seconds: u64) -> String {
     const HOUR: u64 = 3600;
     const DAY: u64 = 24 * HOUR;
     match seconds {
-        s if s < HOUR => format!("{}m", (s / 60).max(1)),
+        // Under a minute is `now`, as a worktree's age says it. `max(1)` made
+        // it "1m", which with the daemon sending 0 meant every detached
+        // session claimed to have been detached a minute ago.
+        s if s < 60 => "now".into(),
+        s if s < HOUR => format!("{}m", s / 60),
         s if s < DAY => format!("{}h", s / HOUR),
         s => format!("{}d", s / DAY),
     }
@@ -342,6 +352,24 @@ mod tests {
             .join("\n")
     }
 
+    #[test]
+    fn under_a_minute_is_now_not_a_minute() {
+        assert_eq!(age(0), "now");
+        assert_eq!(age(59), "now");
+        assert_eq!(age(60), "1m");
+        assert_eq!(age(3 * 3600), "3h");
+    }
+    #[test]
+    fn one_session_is_one_session() {
+        // The picker's header read "1 sessions · 1 open".
+        let mut sessions = Sessions::default();
+        let mut only = listing();
+        only.truncate(1);
+        sessions.set(only);
+        let screen = painted(&sessions);
+        assert!(screen.contains("1 session ·"), "{screen}");
+        assert!(!screen.contains("1 sessions"), "{screen}");
+    }
     #[test]
     fn the_three_states_render_distinctly() {
         // Acceptance: three states, three glyphs, and the affordances that go
