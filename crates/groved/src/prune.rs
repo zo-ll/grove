@@ -57,7 +57,7 @@ pub struct PruneBatch {
 
 #[derive(Debug, Error)]
 pub enum PruneError {
-    #[error("could not list worktrees for {repo:?}: {source}")]
+    #[error("could not list worktrees for {repo}: {source}")]
     Worktrees {
         repo: RepoId,
         source: grove_git::Error,

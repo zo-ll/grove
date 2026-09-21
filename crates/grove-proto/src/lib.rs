@@ -141,6 +141,12 @@ pub struct WorktreeRef {
     pub branch: String,
 }
 
+impl std::fmt::Display for WorktreeRef {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}@{}", self.repo, self.branch)
+    }
+}
+
 /// A live terminal, for reattaching to one the client did not spawn itself.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminalRow {
@@ -173,6 +179,12 @@ pub enum TerminalTarget {
 /// current ids.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct TerminalId(pub u64);
+
+impl std::fmt::Display for TerminalId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
 
 /// How much history a client wants when it attaches to a terminal.
 ///
@@ -874,6 +886,19 @@ pub fn accept_hello(request: &Request) -> Handshake {
 mod tests {
     use super::*;
     use grove_domain::SessionState;
+
+    #[test]
+    fn wire_identifiers_display_without_rust_newtype_syntax() {
+        assert_eq!(TerminalId(42).to_string(), "42");
+        assert_eq!(
+            WorktreeRef {
+                repo: RepoId("web-app".into()),
+                branch: "invoice-split".into(),
+            }
+            .to_string(),
+            "web-app@invoice-split"
+        );
+    }
 
     #[test]
     fn requests_identify_rather_than_assert() {

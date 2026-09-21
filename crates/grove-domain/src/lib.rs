@@ -13,10 +13,22 @@ pub struct WorkspaceId(pub String);
 #[serde(transparent)]
 pub struct RepoId(pub String);
 
+impl std::fmt::Display for RepoId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
 /// Identifies a stored session even when the session is later renamed.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SessionId(pub String);
+
+impl std::fmt::Display for SessionId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
 
 /// Describes a repository discovered beneath the current workspace.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -198,5 +210,14 @@ mod tests {
             foreground: Some("cargo test".into()),
             alive: true,
         });
+    }
+
+    #[test]
+    fn identifiers_display_as_bare_values() {
+        assert_eq!(RepoId("web-app".into()).to_string(), "web-app");
+        assert_eq!(
+            SessionId("invoice-split".into()).to_string(),
+            "invoice-split"
+        );
     }
 }
