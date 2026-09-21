@@ -101,6 +101,17 @@ impl Repos {
     /// Clamped rather than wrapping: this list sits beside another one, and a
     /// cursor that silently returns to the top makes "hold the down arrow"
     /// change the WORKTREES pane to something the user has already passed.
+    /// Put the cursor on a row, for a click. Returns whether it moved, so a
+    /// click on the row already selected does not re-ask the daemon for
+    /// anything.
+    pub fn select(&mut self, index: usize) -> bool {
+        if index >= self.rows.len() || index == self.cursor {
+            return false;
+        }
+        self.cursor = index;
+        true
+    }
+
     pub fn move_down(&mut self) -> bool {
         let last = self.rows.len().saturating_sub(1);
         if self.rows.is_empty() || self.cursor >= last {

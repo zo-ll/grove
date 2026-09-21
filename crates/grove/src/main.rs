@@ -17,6 +17,7 @@ mod endsession;
 mod events;
 mod help;
 mod keymap;
+mod mouse;
 mod overlay;
 mod palette;
 mod prune;
@@ -54,6 +55,7 @@ use prune::Prune;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::Event as TermEvent;
+use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
@@ -137,24 +139,57 @@ impl Ui {
     /// size, and one that swings with visibility would reflow the program
     /// inside it every time the pane is toggled.
     fn terminal_pane_size(&self) -> (u16, u16) {
-        let body = Rect {
-            x: 0,
-            y: 0,
-            width: self.width,
-            height: self.height.saturating_sub(1),
-        };
-        match dash::split(body, self.panes).terminal {
-            // Two columns and two rows of border.
-            Some(rect) => (
-                rect.height.saturating_sub(2).max(1),
-                rect.width.saturating_sub(2).max(1),
-            ),
+        // The area the rows are painted in, from the geometry the pane is
+        // drawn with. This used to be its own arithmetic — a border and
+        // nothing else, under a one-row bar — and when the dash grew a header
+        // row, a blank line and padding, the pty stayed two rows taller and
+        // two columns wider than the pane showing it.
+        match dash::layout(self.body_area(), self.panes, &self.theme)
+            .1
+            .terminal
+        {
+            Some(rect) => (rect.height.max(1), rect.width.max(1)),
             // Hidden. The pty keeps the size it had rather than taking the
             // whole body: a program inside it would otherwise reflow twice
             // around a `^g 3` to glance at something else, and vim redrawing
             // itself at two different widths is a worse cost than a grid that
             // is briefly the wrong size for a pane nobody is looking at.
             None => self.last_pane_size,
+        }
+    }
+
+    /// The area the dash is drawn in: all of it but the status bar and the
+    /// blank row above it. `draw` lays the frame out the same way.
+    fn body_area(&self) -> Rect {
+        Rect {
+            x: 0,
+            y: 0,
+            width: self.width,
+            height: self.height.saturating_sub(2),
+        }
+    }
+
+    /// The status bar's row.
+    fn bar_area(&self) -> Rect {
+        Rect {
+            x: 0,
+            y: self.height.saturating_sub(1),
+            width: self.width,
+            height: 1,
+        }
+    }
+
+    /// The panes as they are drawn, which is not always as they were asked
+    /// for: §4.1's empty state draws two, so the guidance has the width.
+    fn drawn_panes(&self) -> Panes {
+        let empty = empty::Empty::of(
+            self.repos.workspace_count(),
+            self.repos.member_count(),
+            self.session.is_some(),
+        );
+        match empty {
+            Some(_) => self.panes.for_guidance(),
+            None => self.panes,
         }
     }
 
@@ -170,17 +205,11 @@ impl Ui {
     /// Record the terminal pane's size while it is on screen, for the times
     /// it is not.
     fn remember_pane_size(&mut self) {
-        let body = Rect {
-            x: 0,
-            y: 0,
-            width: self.width,
-            height: self.height.saturating_sub(1),
-        };
-        if let Some(rect) = dash::split(body, self.panes).terminal {
-            self.last_pane_size = (
-                rect.height.saturating_sub(2).max(1),
-                rect.width.saturating_sub(2).max(1),
-            );
+        if let Some(rect) = dash::layout(self.body_area(), self.panes, &self.theme)
+            .1
+            .terminal
+        {
+            self.last_pane_size = (rect.height.max(1), rect.width.max(1));
         }
     }
 
@@ -346,6 +375,10 @@ fn run(workspace: PathBuf) -> std::io::Result<()> {
     // rather than assuming the default until the first resize.
     if let Ok(size) = term.size() {
         ui.width = size.width;
+        // And the height: the mouse resolves clicks against the layout, and a
+        // layout sized by the default 24 rows would put every click on the
+        // wrong row until the terminal happened to be resized.
+        ui.height = size.height;
         ui.focus = ui.panes.drawable(size.width).refocus(ui.focus);
     }
 
@@ -516,6 +549,106 @@ fn act_on_session(intent: Option<sessions::Intent>, state: &mut State, ui: &mut 
         let _ = send(state, &Request::ListRepos);
     }
     true
+}
+
+/// Open the session picker, from `^g s` or a click on the bar's session name.
+fn open_picker(state: &mut State, ui: &mut Ui) -> bool {
+    // Ask before showing: a list of sessions that fills in underneath someone
+    // already pressing `X` is the worst possible version of this screen.
+    if let Err(e) = send(state, &Request::ListSessions) {
+        ui.note = Some(format!("could not reach the daemon: {e}"));
+    }
+    ui.screen = Screen::Picker;
+    true
+}
+
+/// The mouse on the dash (#111).
+///
+/// Everything here resolves against [`dash::layout`], the geometry the dash
+/// was drawn with, so a click means whatever is painted under the pointer.
+/// Only the dash for now: while an overlay is open the dash underneath is not
+/// what anyone is pointing at, and the overlays' own clicks are the next piece.
+fn on_mouse(event: MouseEvent, state: &mut State, ui: &mut Ui) -> bool {
+    if !matches!(state, State::Connected { .. })
+        || ui.screen != Screen::Dash
+        || ui.helping.is_some()
+    {
+        return false;
+    }
+    let (column, row) = (event.column, event.row);
+    let (frames, rows) = dash::layout(ui.body_area(), ui.drawn_panes(), &ui.theme);
+    let under = mouse::hit(&frames, &rows, column, row);
+
+    match event.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            if mouse::on_session_name(ui.bar_area(), &ui.session_name(), column, row) {
+                return open_picker(state, ui);
+            }
+            match under {
+                mouse::Hit::Row(Focus::Repos, index) => {
+                    ui.focus = Focus::Repos;
+                    if ui.repos.select(index) {
+                        request_worktrees(state, ui);
+                    }
+                    true
+                }
+                mouse::Hit::Row(Focus::Worktrees, index) => {
+                    ui.focus = Focus::Worktrees;
+                    if ui.worktrees.select(index) {
+                        follow_selection(state, ui);
+                    }
+                    true
+                }
+                mouse::Hit::Row(pane, _) | mouse::Hit::Pane(pane) => {
+                    let moved = ui.focus != pane;
+                    ui.focus = pane;
+                    moved
+                }
+                // A click on nothing does nothing: no focus change, no jump.
+                mouse::Hit::Nothing => false,
+            }
+        }
+        // The wheel scrolls whatever is under the pointer, focused or not —
+        // it is pointing, not typing, and pointing does not need focus first.
+        kind @ (MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) => {
+            let up = kind == MouseEventKind::ScrollUp;
+            let pane = match under {
+                mouse::Hit::Row(pane, _) | mouse::Hit::Pane(pane) => pane,
+                mouse::Hit::Nothing => return false,
+            };
+            match pane {
+                Focus::Repos => {
+                    let moved = if up {
+                        ui.repos.move_up()
+                    } else {
+                        ui.repos.move_down()
+                    };
+                    if moved {
+                        request_worktrees(state, ui);
+                    }
+                    moved
+                }
+                Focus::Worktrees => {
+                    let moved = if up {
+                        ui.worktrees.move_up()
+                    } else {
+                        ui.worktrees.move_down()
+                    };
+                    if moved {
+                        follow_selection(state, ui);
+                    }
+                    moved
+                }
+                // grove's scrollback, as `^g ↑` and `^g ↓` scroll it.
+                Focus::Terminal => ui.terminals.scroll(if up {
+                    terminals::SCROLL_STEP
+                } else {
+                    -terminals::SCROLL_STEP
+                }),
+            }
+        }
+        _ => false,
+    }
 }
 
 /// Carry out a command that has its argument.
@@ -1191,16 +1324,9 @@ fn handle(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
                     }
                     Flow::Continue { redraw: true }
                 }
-                Routed::Act(Action::OpenPicker) => {
-                    // Ask before showing: a list of sessions that fills in
-                    // underneath someone already pressing `X` is the worst
-                    // possible version of this screen.
-                    if let Err(e) = send(state, &Request::ListSessions) {
-                        ui.note = Some(format!("could not reach the daemon: {e}"));
-                    }
-                    ui.screen = Screen::Picker;
-                    Flow::Continue { redraw: true }
-                }
+                Routed::Act(Action::OpenPicker) => Flow::Continue {
+                    redraw: open_picker(state, ui),
+                },
                 Routed::Act(Action::MoveDown) if ui.screen == Screen::Picker => Flow::Continue {
                     redraw: ui.sessions.move_down(),
                 },
@@ -1386,6 +1512,9 @@ fn handle(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
         Input::Terminal(TermEvent::FocusGained | TermEvent::FocusLost) => {
             Flow::Continue { redraw: false }
         }
+        Input::Terminal(TermEvent::Mouse(event)) => Flow::Continue {
+            redraw: on_mouse(event, state, ui),
+        },
         Input::Terminal(_) => Flow::Continue { redraw: false },
 
         // The REPOS pane's data. Kept ahead of the catch-all below because
@@ -2160,11 +2289,9 @@ fn draw_dash(f: &mut ratatui::Frame, body_area: Rect, ui: &Ui) {
     // §4.1's empty state draws two panes, not three: nothing is selected,
     // so there is no terminal to show, and the guidance needs the width
     // more than an empty box does. The user's own toggles are untouched —
-    // this is what is drawn, not what they asked for.
-    let panes = match empty {
-        Some(_) => ui.panes.for_guidance(),
-        None => ui.panes,
-    };
+    // this is what is drawn, not what they asked for. The mouse asks the same
+    // question, so the answer lives on `Ui`.
+    let panes = ui.drawn_panes();
     let selection = ui.selection();
     let inner = dash::render(
         f.buffer_mut(),
@@ -3148,6 +3275,218 @@ mod tests {
     }
 
     /// What the dash paints, row by row, at a given size.
+    /// A dash with one repo and three worktrees, sized like a real terminal,
+    /// with a session open so it is not the empty state.
+    fn a_dash_to_click() -> (State, UnixStream, Ui) {
+        let (mut s, theirs) = wired();
+        let mut ui = Ui::new();
+        handle(Input::Terminal(TermEvent::Resize(160, 40)), &mut s, &mut ui);
+        handle(
+            Input::Daemon(DaemonEvent::SessionChanged(grove_proto::SessionRow {
+                id: grove_domain::SessionId("s1".into()),
+                name: "invoice split".into(),
+                members: vec!["repo".into()],
+                state: grove_domain::SessionState::Attached,
+                terminals: 0,
+                since: 0,
+                size: 0,
+            })),
+            &mut s,
+            &mut ui,
+        );
+        handle(
+            Input::Daemon(DaemonEvent::Repos(vec![repo_row("repo", 3)])),
+            &mut s,
+            &mut ui,
+        );
+        handle(
+            Input::Daemon(DaemonEvent::Worktrees {
+                repo: grove_domain::RepoId("repo".into()),
+                rows: vec![
+                    worktree_row("feat/first", grove_domain::Ownership::Unowned),
+                    worktree_row("feat/second", grove_domain::Ownership::Unowned),
+                    worktree_row("feat/third", grove_domain::Ownership::Unowned),
+                ],
+            }),
+            &mut s,
+            &mut ui,
+        );
+        (s, theirs, ui)
+    }
+
+    /// Where `text` is painted, as a terminal would report a click on it.
+    fn where_painted(s: &State, ui: &Ui, text: &str) -> (u16, u16) {
+        let screen = painted_dash(s, ui, 160, 40);
+        for (row, line) in screen.iter().enumerate() {
+            if let Some(byte) = line.find(text) {
+                let column = line[..byte].chars().count();
+                return (column as u16, row as u16);
+            }
+        }
+        panic!("{text} is not on screen:\n{}", screen.join("\n"));
+    }
+
+    fn click(column: u16, row: u16) -> Input {
+        Input::Terminal(TermEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }))
+    }
+
+    fn wheel(kind: MouseEventKind, column: u16, row: u16) -> Input {
+        Input::Terminal(TermEvent::Mouse(MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }))
+    }
+
+    #[test]
+    fn clicking_a_worktree_selects_the_row_painted_under_the_pointer() {
+        // The acceptance that matters: not "a click selects a row" but "a
+        // click selects the row you can see under the pointer". The position
+        // comes from the painted screen, so any disagreement between the
+        // geometry the mouse uses and the one the dash draws with fails here.
+        let (mut s, _theirs, mut ui) = a_dash_to_click();
+        ui.focus = Focus::Repos;
+        let (column, row) = where_painted(&s, &ui, "feat/third");
+        handle(click(column, row), &mut s, &mut ui);
+        assert_eq!(
+            ui.worktrees
+                .selected()
+                .map(|row| row.worktree.branch.as_str()),
+            Some("feat/third")
+        );
+        assert_eq!(ui.focus, Focus::Worktrees, "and the pane takes focus");
+    }
+
+    #[test]
+    fn clicking_a_pane_header_focuses_it_without_selecting_a_row() {
+        let (mut s, _theirs, mut ui) = a_dash_to_click();
+        ui.focus = Focus::Repos;
+        let (column, row) = where_painted(&s, &ui, "WORKTREES");
+        handle(click(column, row), &mut s, &mut ui);
+        assert_eq!(ui.focus, Focus::Worktrees);
+        assert_eq!(
+            ui.worktrees
+                .selected()
+                .map(|row| row.worktree.branch.as_str()),
+            Some("feat/first"),
+            "a header is not a row"
+        );
+    }
+
+    #[test]
+    fn clicking_the_terminal_pane_gives_it_the_keyboard() {
+        let (mut s, _theirs, mut ui) = a_dash_to_click();
+        ui.focus = Focus::Worktrees;
+        // The terminal pane's header is the selection: `repo · branch`.
+        let (column, row) = where_painted(&s, &ui, "repo · feat/first");
+        handle(click(column, row), &mut s, &mut ui);
+        assert_eq!(ui.focus, Focus::Terminal);
+    }
+
+    #[test]
+    fn a_click_in_the_gap_between_panes_does_nothing() {
+        // Acceptance: a click that lands on nothing does nothing.
+        let (mut s, _theirs, mut ui) = a_dash_to_click();
+        ui.focus = Focus::Worktrees;
+        let (frames, _) = dash::layout(ui.body_area(), ui.drawn_panes(), &ui.theme);
+        let gap = frames.repos.expect("repos is drawn").right();
+        let flow = handle(click(gap, 5), &mut s, &mut ui);
+        assert!(matches!(flow, Flow::Continue { redraw: false }));
+        assert_eq!(ui.focus, Focus::Worktrees);
+    }
+
+    #[test]
+    fn the_wheel_moves_the_list_under_the_pointer_without_taking_focus() {
+        // Pointing, not typing: the wheel acts where it is, and the keyboard
+        // stays where it was.
+        let (mut s, _theirs, mut ui) = a_dash_to_click();
+        ui.focus = Focus::Terminal;
+        // A row other than the selected one: the selected branch is also in
+        // the terminal pane's header, which the wheel would scroll instead.
+        let (column, row) = where_painted(&s, &ui, "feat/second");
+        handle(
+            wheel(MouseEventKind::ScrollDown, column, row),
+            &mut s,
+            &mut ui,
+        );
+        assert_eq!(
+            ui.worktrees
+                .selected()
+                .map(|row| row.worktree.branch.as_str()),
+            Some("feat/second")
+        );
+        assert_eq!(ui.focus, Focus::Terminal, "focus stays put");
+    }
+
+    #[test]
+    fn clicking_the_session_name_opens_the_picker() {
+        // The mock draws it as a control. It is the terminal's version.
+        let (mut s, mut theirs, mut ui) = a_dash_to_click();
+        let (column, row) = where_painted(&s, &ui, "session: invoice split");
+        handle(click(column + 3, row), &mut s, &mut ui);
+        assert_eq!(ui.screen, Screen::Picker);
+        assert!(
+            sent(&mut theirs)
+                .iter()
+                .any(|request| matches!(request, Request::ListSessions)),
+            "and asks for the sessions, as ^g s does"
+        );
+    }
+
+    #[test]
+    fn the_dash_under_an_overlay_does_not_take_clicks() {
+        // Acceptance: mouse events never reach a pane that is not on screen.
+        // Under the palette the dash is washed out, and a click aimed at the
+        // palette must not select a worktree that happens to be beneath it.
+        let (mut s, _theirs, mut ui) = a_dash_to_click();
+        let (column, row) = where_painted(&s, &ui, "feat/third");
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('/')), &mut s, &mut ui);
+        handle(click(column, row), &mut s, &mut ui);
+        assert_eq!(
+            ui.worktrees
+                .selected()
+                .map(|row| row.worktree.branch.as_str()),
+            Some("feat/first")
+        );
+    }
+
+    #[test]
+    fn the_pty_is_the_size_of_the_pane_that_draws_it() {
+        // Since the dash grew a header row, a blank line and padding (#96),
+        // the pty was sized by the old arithmetic — a border and nothing
+        // else, under a one-row bar — so it was two rows taller and two
+        // columns wider than the area it is drawn into. A shell prompt at the
+        // top hides that; vim loses its last lines and its right edge.
+        let mut ui = Ui::new();
+        handle(
+            Input::Terminal(TermEvent::Resize(160, 40)),
+            &mut connected(),
+            &mut ui,
+        );
+        let body = Rect {
+            x: 0,
+            y: 0,
+            width: 160,
+            height: 38,
+        };
+        let drawn = dash::layout(body, ui.panes, &ui.theme)
+            .1
+            .terminal
+            .expect("the terminal pane is on screen at 160 columns");
+        assert_eq!(
+            ui.terminal_pane_size(),
+            (drawn.height, drawn.width),
+            "rows and columns of the pty must be the rows and columns painted"
+        );
+    }
+
     fn painted_dash(state: &State, ui: &Ui, width: u16, height: u16) -> Vec<String> {
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
