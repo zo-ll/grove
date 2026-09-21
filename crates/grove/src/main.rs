@@ -1773,6 +1773,11 @@ fn handle(input: Input, state: &mut State, ui: &mut Ui) -> Flow {
         input,
         Input::Terminal(TermEvent::Key(_) | TermEvent::Resize(..))
     ) && ui.selection.take().is_some();
+    // A note answers the key before it — or a reply that arrived since — and
+    // the next key is the user moving on. Kept longer, a refusal sits on the
+    // bar crowding out the hints until something unrelated succeeds.
+    let noted = matches!(input, Input::Terminal(TermEvent::Key(_))) && ui.note.take().is_some();
+    let cleared = cleared || noted;
     match handle_input(input, state, ui) {
         Flow::Continue { redraw } => Flow::Continue {
             redraw: redraw || cleared,
@@ -3494,7 +3499,9 @@ mod tests {
 
     #[test]
     fn an_arrow_at_the_end_of_the_list_costs_no_frame() {
-        let mut s = connected();
+        // Wired, so the rows' arrival can ask for worktrees without leaving a
+        // "could not reach the daemon" note for the arrow to clear.
+        let (mut s, _theirs) = wired();
         let mut ui = Ui::new();
         handle(
             Input::Daemon(DaemonEvent::Repos(vec![repo_row("only", 1)])),
@@ -3579,6 +3586,27 @@ mod tests {
             screen.contains("already held by session s-1"),
             "the refusal must be on screen:\n{screen}"
         );
+    }
+
+    #[test]
+    fn a_note_lasts_until_the_next_key() {
+        // Found by hand: a refused `session new` stayed on the bar through
+        // every key after it, crowding out the hints, until some unrelated
+        // command happened to succeed.
+        let mut s = connected();
+        let mut ui = Ui::new();
+        handle(
+            Input::Daemon(DaemonEvent::Failed {
+                context: "session new".into(),
+                message: "taken".into(),
+            }),
+            &mut s,
+            &mut ui,
+        );
+        assert!(ui.note.is_some());
+        handle(prefix(), &mut s, &mut ui);
+        handle(key(KeyCode::Char('n')), &mut s, &mut ui);
+        assert_eq!(ui.note, None, "the next key moves on from it");
     }
 
     #[test]
