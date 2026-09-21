@@ -364,12 +364,81 @@ enum State {
     Disconnected { workspace: PathBuf, reason: String },
 }
 
+/// What the command line asked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Invocation {
+    /// Open the TUI on this workspace, or the current directory.
+    Run(Option<PathBuf>),
+    Help,
+    Version,
+    /// Something that is neither a flag grove knows nor a path. Said, with
+    /// the usage, rather than taken as a workspace called `-x`.
+    Bad(String),
+}
+
+/// Read the arguments, without touching the daemon or the terminal.
+///
+/// Flags are answered before anything else happens. `grove --version` used
+/// to take `--version` as the workspace path and start a daemon for it;
+/// that is the first thing a new user types, so it has to be the first thing
+/// that works. A path that really starts with `-` goes after `--`.
+fn parse_args(mut args: impl Iterator<Item = std::ffi::OsString>) -> Invocation {
+    let Some(first) = args.next() else {
+        return Invocation::Run(None);
+    };
+    let extra = args.next();
+    let invocation = match first.to_str() {
+        Some("-h" | "--help") => Invocation::Help,
+        Some("-V" | "--version") => Invocation::Version,
+        Some("--") => match extra {
+            Some(path) => return Invocation::Run(Some(PathBuf::from(path))),
+            None => Invocation::Bad("`--` needs a workspace path after it".into()),
+        },
+        Some(flag) if flag.starts_with('-') => Invocation::Bad(format!("unknown option {flag}")),
+        _ => Invocation::Run(Some(PathBuf::from(first))),
+    };
+    match (invocation, extra) {
+        (Invocation::Bad(why), _) => Invocation::Bad(why),
+        (_, Some(extra)) => {
+            Invocation::Bad(format!("unexpected argument {}", extra.to_string_lossy()))
+        }
+        (invocation, None) => invocation,
+    }
+}
+
+const USAGE: &str = "\
+usage: grove [workspace]
+
+Open grove on a directory of git clones (the current directory by default).
+If no daemon is serving that workspace, grove starts the groved installed
+beside it; the daemon keeps your terminals running after grove exits.
+
+  -h, --help        this
+  -V, --version     print the version
+
+  GROVE_NO_AUTOSTART=1   do not start a daemon
+  GROVE_DAEMON=path      start this daemon binary instead
+
+Inside grove, ^g ? lists the keys for the screen you are on.";
+
 fn main() -> ExitCode {
-    let workspace = std::env::args()
-        .nth(1)
-        .map(PathBuf::from)
-        .or_else(|| std::env::current_dir().ok())
-        .unwrap_or_else(|| PathBuf::from("."));
+    let workspace = match parse_args(std::env::args_os().skip(1)) {
+        Invocation::Help => {
+            println!("{USAGE}");
+            return ExitCode::SUCCESS;
+        }
+        Invocation::Version => {
+            println!("grove {}", env!("CARGO_PKG_VERSION"));
+            return ExitCode::SUCCESS;
+        }
+        Invocation::Bad(why) => {
+            eprintln!("grove: {why}\n\n{USAGE}");
+            return ExitCode::from(2);
+        }
+        Invocation::Run(path) => path
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from(".")),
+    };
 
     match run(workspace) {
         Ok(()) => ExitCode::SUCCESS,
@@ -4290,6 +4359,44 @@ mod tests {
             "the press reached it: {asked:?}"
         );
         assert!(reached(b"\x1b[<0;", b'm'), "and the release: {asked:?}");
+    }
+
+    fn parsed(args: &[&str]) -> Invocation {
+        parse_args(args.iter().map(std::ffi::OsString::from))
+    }
+
+    #[test]
+    fn flags_are_answered_not_taken_as_a_workspace() {
+        // `grove --version` used to start a daemon for a workspace called
+        // `--version`.
+        assert_eq!(parsed(&["--version"]), Invocation::Version);
+        assert_eq!(parsed(&["-V"]), Invocation::Version);
+        assert_eq!(parsed(&["--help"]), Invocation::Help);
+        assert_eq!(parsed(&["-h"]), Invocation::Help);
+    }
+
+    #[test]
+    fn a_path_is_a_workspace_and_none_means_here() {
+        assert_eq!(parsed(&[]), Invocation::Run(None));
+        assert_eq!(
+            parsed(&["~/code"]),
+            Invocation::Run(Some(PathBuf::from("~/code")))
+        );
+    }
+
+    #[test]
+    fn an_unknown_flag_is_refused_rather_than_becoming_a_path() {
+        assert!(matches!(parsed(&["-x"]), Invocation::Bad(why) if why.contains("-x")));
+        assert!(matches!(parsed(&["a", "b"]), Invocation::Bad(why) if why.contains('b')));
+    }
+
+    #[test]
+    fn a_path_that_starts_with_a_dash_goes_after_two_dashes() {
+        assert_eq!(
+            parsed(&["--", "-odd"]),
+            Invocation::Run(Some(PathBuf::from("-odd")))
+        );
+        assert!(matches!(parsed(&["--"]), Invocation::Bad(_)));
     }
 
     #[test]
