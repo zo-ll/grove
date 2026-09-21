@@ -503,13 +503,28 @@ impl Palette {
             let mut lines = Vec::new();
             // The base is `new`'s alone: it is the branch the worktrees are
             // cut from, and nothing else here cuts one.
+            // The base each repo would be cut from, as the daemon reports it
+            // — this used to be the literal `origin/main`, whatever the repos
+            // were really based on. One line when they agree; when they do
+            // not, each row says its own.
+            let bases = distinct_bases(select);
             if self.list_offset() > 0 {
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        format!("{:<24}", "base: origin/main"),
-                        theme.ink_style(Ink::Subtext),
+                let (base, whence) = match bases.as_slice() {
+                    [] => ("base: none".to_string(), String::new()),
+                    [(base, origin)] => (
+                        format!("base: {base}"),
+                        if *origin {
+                            "from origin/HEAD"
+                        } else {
+                            "configured"
+                        }
+                        .to_string(),
                     ),
-                    Span::styled("from origin/HEAD", theme.ink_style(Ink::Faint)),
+                    _ => ("base: per repo".to_string(), String::new()),
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{base:<24}"), theme.ink_style(Ink::Subtext)),
+                    Span::styled(whence, theme.ink_style(Ink::Faint)),
                 ]));
                 lines.push(Line::styled(
                     "─".repeat(body.width as usize),
@@ -525,21 +540,34 @@ impl Palette {
             let room = usize::from(body.height).saturating_sub(lines.len());
             for (index, row) in select.rows().iter().take(room).enumerate() {
                 let here = index == select.cursor();
-                lines.push(Line::from(crate::overlay::row(
-                    here,
-                    vec![
-                        (
-                            if row.checked { "[x]" } else { "[ ]" }.to_string(),
-                            Ink::Text,
-                        ),
-                        (format!("{:<22}", truncate(&row.name, 22)), Ink::Text),
-                        (
-                            if row.member { "member" } else { "workspace" }.to_string(),
-                            Ink::Subtext,
-                        ),
-                    ],
-                    theme,
-                )));
+                let membership = if row.member { "member" } else { "workspace" };
+                let note = if bases.len() > 1 && !row.base.is_empty() {
+                    format!("{membership} · {}", row.base)
+                } else {
+                    membership.to_string()
+                };
+                let mut cells = vec![
+                    (
+                        if row.checked { "[x]" } else { "[ ]" }.to_string(),
+                        Ink::Text,
+                    ),
+                    (format!("{:<22}", truncate(&row.name, 22)), Ink::Text),
+                    (format!("{note:<30}"), Ink::Subtext),
+                ];
+                // Said before enter, not after: `new` in a repo with no base
+                // fails with "has no base branch" once it has been asked.
+                let baseless = self.list_offset() > 0 && row.base.is_empty();
+                if baseless {
+                    cells.push(("no base branch".to_string(), Ink::Subtext));
+                }
+                let mut spans = crate::overlay::row(here, cells, theme);
+                if baseless
+                    && !here
+                    && let Some(last) = spans.last_mut()
+                {
+                    *last = Span::styled("no base branch", theme.style(crate::theme::Role::Dirty));
+                }
+                lines.push(Line::from(spans));
             }
             Paragraph::new(lines).render(body, buf);
             return;
@@ -586,6 +614,25 @@ impl Palette {
         }
         Paragraph::new(lines).render(body, buf);
     }
+}
+
+/// The distinct non-empty bases among the rows `new` would branch — the
+/// ticked ones, or all of them before any are ticked — with whether each came
+/// from `origin/HEAD`.
+fn distinct_bases(select: &crate::select::Select) -> Vec<(String, bool)> {
+    let ticked: Vec<&crate::select::Row> = select.checked();
+    let rows: Vec<&crate::select::Row> = if ticked.is_empty() {
+        select.rows().iter().collect()
+    } else {
+        ticked
+    };
+    let mut bases: Vec<(String, bool)> = Vec::new();
+    for row in rows {
+        if !row.base.is_empty() && !bases.iter().any(|(base, _)| *base == row.base) {
+            bases.push((row.base.clone(), row.from_origin_head));
+        }
+    }
+    bases
 }
 
 /// How well `query` matches `name`, or `None` if it does not.
@@ -842,6 +889,63 @@ mod tests {
         let mut palette = Palette::default();
         palette.argue(chosen, repos);
         palette
+    }
+
+    fn based(name: &str, base: &str) -> grove_proto::RepoRow {
+        grove_proto::RepoRow {
+            base_branch: base.into(),
+            ..repo(name, true)
+        }
+    }
+
+    fn painted_palette(palette: &Palette) -> String {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 90,
+            height: 12,
+        };
+        let mut buf = Buffer::empty(area);
+        palette.render(&mut buf, crate::overlay::Parts::of(area), &theme());
+        (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn new_names_the_base_the_repos_really_have() {
+        // It always said `base: origin/main  from origin/HEAD`, whatever the
+        // repos were based on — a literal, not the daemon's answer.
+        let palette = arguing("new", &[based("api", "develop"), based("web", "develop")]);
+        let screen = painted_palette(&palette);
+        assert!(screen.contains("base: develop"), "{screen}");
+        assert!(!screen.contains("origin/main"), "{screen}");
+    }
+
+    #[test]
+    fn new_says_when_the_repos_disagree_about_the_base() {
+        let palette = arguing("new", &[based("api", "develop"), based("web", "main")]);
+        let screen = painted_palette(&palette);
+        assert!(screen.contains("base: per repo"), "{screen}");
+        assert!(
+            screen.contains("develop") && screen.contains("main"),
+            "{screen}"
+        );
+    }
+
+    #[test]
+    fn a_repo_with_no_base_is_flagged_before_enter() {
+        // A repo with no origin has no base branch, and `new` in it fails
+        // with "has no base branch" — after the user has pressed enter. The
+        // picker knows before then.
+        let palette = arguing("new", &[based("api", "main"), based("scratchpad", "")]);
+        let screen = painted_palette(&palette);
+        assert!(screen.contains("no base branch"), "{screen}");
     }
 
     #[test]
