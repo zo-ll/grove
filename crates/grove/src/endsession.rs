@@ -167,8 +167,12 @@ impl EndSession {
         }
 
         let mut lines = Vec::new();
-        // Per repo first: what is about to happen to each, in its own words.
-        let room = usize::from(body.height).saturating_sub(3);
+        // Per worktree first: what is about to happen to each, in its own
+        // words. Room is left for the blank line and the summary, and for the
+        // loss line only when there is a loss — reserving it always cut the
+        // last worktree off a confirm that had nothing to lose.
+        let loss_line = usize::from(totals.dirty_files > 0);
+        let room = usize::from(body.height).saturating_sub(2 + loss_line);
         for row in self.rows.iter().take(room) {
             let (glyph, role) = if row.dirty_files > 0 {
                 ("◆", Role::Dirty)
@@ -179,7 +183,12 @@ impl EndSession {
             };
             let mut detail = String::new();
             if row.ahead > 0 {
-                detail.push_str(&format!("↑{} pushed · ", row.ahead));
+                // Ahead of its upstream: commits the upstream does not have.
+                // That is not "pushed" — it was shown as `↑1 pushed` on a
+                // commit that had never left the machine. Nothing is lost by
+                // it either way: ending removes worktrees, and the branch and
+                // its commits stay.
+                detail.push_str(&format!("↑{} ahead · ", row.ahead));
             }
             detail.push_str(&if row.dirty_files > 0 {
                 format!("{} files uncommitted", row.dirty_files)
@@ -198,12 +207,19 @@ impl EndSession {
             } else {
                 ""
             };
-            let detail_room = usize::from(body.width).saturating_sub(20 + 4 + warning.len() + 2);
+            // Repo and branch: a repo with two worktrees in the session read
+            // as the same row twice when only the repo was named.
+            let detail_room =
+                usize::from(body.width).saturating_sub(18 + 1 + 26 + 4 + warning.len() + 2);
             lines.push(Line::from(vec![
                 Span::styled(format!("{glyph} "), theme.style(role)),
                 Span::styled(
-                    format!("{:<20}", truncate(&row.worktree.repo.0, 20)),
+                    format!("{:<18} ", truncate(&row.worktree.repo.0, 18)),
                     theme.ink_style(Ink::Text),
+                ),
+                Span::styled(
+                    format!("{:<26}", truncate(&row.worktree.branch, 25)),
+                    theme.ink_style(Ink::Subtext),
                 ),
                 Span::styled(
                     format!("{:<detail_room$}", truncate(&detail, detail_room)),
@@ -217,7 +233,7 @@ impl EndSession {
         // Then the aggregate, in one sentence.
         lines.push(Line::styled(
             format!(
-                "closes {} and removes all {} · {} reclaimed",
+                "closes {} and removes all {} (branches are kept) · {} reclaimed",
                 plural(totals.terminals, "terminal"),
                 plural(totals.worktrees, "worktree"),
                 bytes(totals.bytes)
@@ -323,6 +339,84 @@ mod tests {
 
     fn ours() -> SessionId {
         SessionId("invoice split".into())
+    }
+
+    /// A confirm counting two worktrees in each of three repos, as the demo
+    /// workspace had — `feat/…` one commit ahead, `fix/…` clean.
+    fn six_worktrees() -> EndSession {
+        let mut end = EndSession::default();
+        let repos = ["billing-service", "sdk-js", "web-app"];
+        end.begin(
+            ours(),
+            "invoice split".into(),
+            repos.iter().map(|r| RepoId((*r).into())).collect(),
+        );
+        for repo in repos {
+            let mut feat = row(repo, Ownership::Ours);
+            feat.worktree.branch = "feat/ABC-4471-invoice-split".into();
+            feat.ahead = 1;
+            let mut fix = row(repo, Ownership::Ours);
+            fix.worktree.branch = "fix/rounding".into();
+            fix.ahead = 0;
+            end.take(&RepoId(repo.into()), &[feat, fix], Some(&ours()));
+        }
+        end
+    }
+
+    /// Painted at exactly the height the overlay would give it.
+    fn painted_as_sized(end: &EndSession) -> String {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 110,
+            height: end.height() + 2,
+        };
+        let mut buf = Buffer::empty(area);
+        end.render(&mut buf, crate::overlay::Parts::of(area), &theme());
+        (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn commits_ahead_are_not_called_pushed() {
+        // `↑1 pushed` on a commit that had never been pushed: `ahead` counts
+        // commits the upstream does not have — the opposite of pushed — and
+        // this is the screen someone reads before removing work.
+        let screen = painted_as_sized(&six_worktrees());
+        assert!(!screen.contains("pushed"), "{screen}");
+        assert!(screen.contains("↑1 ahead"), "{screen}");
+    }
+
+    #[test]
+    fn each_row_names_its_worktree_not_just_its_repo() {
+        // Two worktrees in one repo read as the same row twice.
+        let screen = painted_as_sized(&six_worktrees());
+        assert!(screen.contains("feat/ABC-4471"), "{screen}");
+        assert!(screen.contains("fix/rounding"), "{screen}");
+    }
+
+    #[test]
+    fn every_worktree_it_will_remove_gets_a_row() {
+        // Six worktrees, and the last row was cut: the rows were given room
+        // for a warning line that is only there when something will be lost.
+        let screen = painted_as_sized(&six_worktrees());
+        let rows = screen.matches("fix/rounding").count() + screen.matches("feat/ABC-4471").count();
+        assert_eq!(rows, 6, "{screen}");
+    }
+
+    #[test]
+    fn it_says_the_branches_are_kept() {
+        // Ending removes worktrees, not branches — nothing here deletes a
+        // branch — so a commit on one survives. On the screen that removes
+        // things, that is the sentence that stops someone panicking.
+        let screen = painted_as_sized(&six_worktrees());
+        assert!(screen.contains("branches are kept"), "{screen}");
     }
 
     fn painted(end: &EndSession) -> String {
