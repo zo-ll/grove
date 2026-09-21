@@ -467,7 +467,7 @@ enum Invocation {
     Run(Option<PathBuf>),
     Help,
     Version,
-    /// Take grove off this machine; `yes` skips the question, for scripts.
+    /// Take grove off this machine; `--y` skips the question, for scripts.
     Uninstall {
         yes: bool,
     },
@@ -493,10 +493,8 @@ fn parse_args(mut args: impl Iterator<Item = std::ffi::OsString>) -> Invocation 
         Some("--uninstall") => {
             return match extra.as_deref().map(|arg| arg.to_str()) {
                 None => Invocation::Uninstall { yes: false },
-                Some(Some("-y" | "--yes")) if args.next().is_none() => {
-                    Invocation::Uninstall { yes: true }
-                }
-                _ => Invocation::Bad("--uninstall takes only --yes".into()),
+                Some(Some("--y")) if args.next().is_none() => Invocation::Uninstall { yes: true },
+                _ => Invocation::Bad("--uninstall takes only --y".into()),
             };
         }
         Some("--") => match extra {
@@ -525,7 +523,7 @@ beside it; the daemon keeps your terminals running after grove exits.
   -h, --help        this
   -V, --version     print the version
   --uninstall       stop grove's daemons and delete grove, groved, the
-                    config and saved sessions (asks first; --yes skips it).
+                    config and saved sessions (asks first; --y skips it).
                     Worktrees are never touched.
 
   GROVE_NO_AUTOSTART=1   do not start a daemon
@@ -552,7 +550,7 @@ fn uninstall(yes: bool) -> ExitCode {
     );
     if !yes {
         if !std::io::stdin().is_terminal() {
-            eprintln!("grove: not asking without a terminal; run `grove --uninstall --yes`");
+            eprintln!("grove: not asking without a terminal; run `grove --uninstall --y`");
             return ExitCode::from(2);
         }
         print!("Remove all of this? [y/N] ");
@@ -5078,22 +5076,21 @@ mod tests {
     }
 
     #[test]
-    fn uninstall_is_a_command_and_yes_is_its_only_option() {
+    fn uninstall_is_a_command_and_dash_dash_y_is_its_only_option() {
         assert_eq!(
             parsed(&["--uninstall"]),
             Invocation::Uninstall { yes: false }
         );
+        // `--y`, and only that: asked for by name, over `--yes` and `-y`.
         assert_eq!(
-            parsed(&["--uninstall", "--yes"]),
-            Invocation::Uninstall { yes: true }
-        );
-        assert_eq!(
-            parsed(&["--uninstall", "-y"]),
+            parsed(&["--uninstall", "--y"]),
             Invocation::Uninstall { yes: true }
         );
         for bad in [
             &["--uninstall", "now"][..],
-            &["--uninstall", "--yes", "extra"][..],
+            &["--uninstall", "--yes"][..],
+            &["--uninstall", "-y"][..],
+            &["--uninstall", "--y", "extra"][..],
         ] {
             assert!(
                 matches!(parsed(bad), Invocation::Bad(_)),
