@@ -93,6 +93,11 @@ impl Diff {
         self.offset = 0;
     }
 
+    /// Where the cursor is and how many files there are, for the mouse.
+    pub fn cursor(&self) -> (usize, usize) {
+        (self.cursor, self.files.len())
+    }
+
     pub fn selected(&self) -> Option<&DiffFile> {
         self.files.get(self.cursor)
     }
@@ -181,7 +186,7 @@ impl Diff {
         .render(header, buf);
 
         // Left: the file list, the mock's 34 columns. Right: the patch.
-        let left = 34u16.min(body.width / 2);
+        let left = list_width(body.width);
         let mut lines = Vec::new();
         let room = usize::from(body.height);
         let patch: Vec<&DiffLine> = self.hunks.iter().skip(self.offset).take(room).collect();
@@ -240,6 +245,14 @@ impl Diff {
         }
         Paragraph::new(lines).render(body, buf);
     }
+}
+
+/// How many columns the file list takes: the mock's 34, or half the box on a
+/// narrow screen. Public because the mouse has to know where the list ends
+/// and the patch begins — a wheel over one moves the cursor, over the other
+/// scrolls the patch.
+pub fn list_width(body_width: u16) -> u16 {
+    34u16.min(body_width / 2)
 }
 
 /// `M`, `A`, `D` and `?` read differently — the colour carries what the letter

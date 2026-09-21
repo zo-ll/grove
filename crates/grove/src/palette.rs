@@ -370,6 +370,22 @@ impl Palette {
     }
 
     /// The command `enter` would run.
+    /// Lines above the first repo in the argument view: `new`'s base branch
+    /// and the rule under it, or nothing. The mouse counts rows from here, so
+    /// this is the one place that knows it.
+    pub fn list_offset(&self) -> u16 {
+        match &self.mode {
+            Mode::Arguing { command, .. } if command.name == "new" => 2,
+            _ => 0,
+        }
+    }
+
+    /// Where the cursor is in the command list and how many commands match,
+    /// for the mouse.
+    pub fn cursor(&self) -> (usize, usize) {
+        (self.selected, self.matches().len())
+    }
+
     pub fn selected(&self) -> Option<Entry> {
         self.matches().get(self.selected).cloned()
     }
@@ -487,7 +503,7 @@ impl Palette {
             let mut lines = Vec::new();
             // The base is `new`'s alone: it is the branch the worktrees are
             // cut from, and nothing else here cuts one.
-            if command.name == "new" {
+            if self.list_offset() > 0 {
                 lines.push(Line::from(vec![
                     Span::styled(
                         format!("{:<24}", "base: origin/main"),

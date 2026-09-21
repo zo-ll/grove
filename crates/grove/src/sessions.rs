@@ -82,6 +82,12 @@ impl Sessions {
         self.rows.iter().find(|row| row.name == name)
     }
 
+    /// Where the cursor is and how many rows there are, for the mouse to
+    /// work out how many arrow presses a click stands for.
+    pub fn cursor(&self) -> (usize, usize) {
+        (self.cursor, self.rows.len())
+    }
+
     pub fn selected(&self) -> Option<&SessionRow> {
         self.rows.get(self.cursor)
     }

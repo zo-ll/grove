@@ -54,6 +54,68 @@ impl Parts {
     }
 }
 
+/// Where everything in an overlay is, without drawing it.
+///
+/// [`render`] draws from this, and the mouse resolves clicks against it, so
+/// a click on `enter resume` is a click on the columns `enter resume` was
+/// painted in — not on a second guess at where they probably are.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Layout {
+    /// The box, border included. A click outside it closes the overlay.
+    pub frame: Rect,
+    pub parts: Parts,
+    /// Each footer hint and the columns it was drawn in, left to right, with
+    /// `esc` last because it is drawn at the right.
+    pub buttons: Vec<(Rect, statusbar::Hint)>,
+}
+
+/// Lay an overlay out: a box of at most [`IDEAL`] columns, centred, as tall as
+/// `rows` of content need.
+pub fn layout(area: Rect, rows: u16, hints: Vec<statusbar::Hint>) -> Layout {
+    // Two borders, the header and the blank under it, and the footer with
+    // its own blank line above: six rows that are not content.
+    let wanted = rows.saturating_add(6);
+    let height = wanted.min(area.height);
+    let width = IDEAL.min(area.width);
+    let frame = Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    let within = Block::default().borders(Borders::ALL).inner(frame);
+    let inner = Rect {
+        x: within.x + PAD,
+        y: within.y,
+        width: within.width.saturating_sub(PAD * 2),
+        height: within.height,
+    };
+    if inner.width == 0 || inner.height == 0 {
+        return Layout {
+            frame,
+            parts: Parts {
+                header: inner,
+                body: inner,
+            },
+            buttons: Vec::new(),
+        };
+    }
+    Layout {
+        frame,
+        parts: Parts {
+            header: Rect { height: 1, ..inner },
+            // The header, the blank line under it, and the footer with its
+            // own blank line above are all spoken for.
+            body: Rect {
+                y: inner.y + 2,
+                height: inner.height.saturating_sub(4),
+                ..inner
+            },
+        },
+        buttons: buttons(inner, hints),
+    }
+}
+
 /// Draw the chrome and return the areas inside it.
 ///
 /// `rows` is how many lines of content the screen has to show. The box is
@@ -69,52 +131,21 @@ pub fn render(
     theme: &Theme,
 ) -> Parts {
     dim_behind(buf, area, theme);
-
-    // header + rows + a blank + footer, inside two border rows.
-    // Two borders, the header and the blank under it, and the footer with
-    // its own blank line above: six rows that are not content.
-    let wanted = rows.saturating_add(6);
-    let height = wanted.min(area.height);
-    let width = IDEAL.min(area.width);
-    let box_ = Rect {
-        x: area.x + (area.width - width) / 2,
-        y: area.y + (area.height.saturating_sub(height)) / 2,
-        width,
-        height,
-    };
-
-    Clear.render(box_, buf);
-    let block = Block::default()
+    let laid = layout(area, rows, hints);
+    Clear.render(laid.frame, buf);
+    Block::default()
         .borders(Borders::ALL)
         .border_type(theme.border())
-        .border_style(border);
-    let within = block.inner(box_);
-    block.render(box_, buf);
-
-    let inner = Rect {
-        x: within.x + PAD,
-        y: within.y,
-        width: within.width.saturating_sub(PAD * 2),
-        height: within.height,
-    };
-    if inner.width == 0 || inner.height == 0 {
-        return Parts {
-            header: inner,
-            body: inner,
-        };
+        .border_style(border)
+        .render(laid.frame, buf);
+    for (at, hint) in &laid.buttons {
+        Paragraph::new(Line::from(vec![
+            Span::styled(hint.keys.clone(), theme.style(crate::theme::Role::Accent)),
+            Span::styled(format!(" {}", hint.label), theme.ink_style(Ink::Subtext)),
+        ]))
+        .render(*at, buf);
     }
-
-    footer(buf, inner, hints, theme);
-    Parts {
-        header: Rect { height: 1, ..inner },
-        // The header, the blank line under it, and the footer with its own
-        // blank line above are all spoken for.
-        body: Rect {
-            y: inner.y + 2,
-            height: inner.height.saturating_sub(4),
-            ..inner
-        },
-    }
+    laid.parts
 }
 
 /// Dim whatever the overlay is covering.
@@ -136,53 +167,53 @@ fn dim_behind(buf: &mut Buffer, area: Rect, theme: &Theme) {
     }
 }
 
-/// The keys that work on this screen, along the bottom of the box.
+/// Where each footer hint goes along the bottom of the box.
 ///
 /// Taken from the keymap by way of the status bar, so an overlay's footer and
 /// the bar under it can never disagree about what `enter` does. `esc` goes to
-/// the right, on its own, as the mock puts it.
-fn footer(buf: &mut Buffer, inner: Rect, hints: Vec<statusbar::Hint>, theme: &Theme) {
+/// the right, on its own, as the mock puts it. Hints that do not fit are left
+/// off rather than clipped: half a hint is a key with no verb.
+fn buttons(inner: Rect, hints: Vec<statusbar::Hint>) -> Vec<(Rect, statusbar::Hint)> {
     if inner.height < 2 {
-        return;
+        return Vec::new();
     }
+    let row = inner.y + inner.height - 1;
     let (escape, rest): (Vec<_>, Vec<_>) = hints.into_iter().partition(|h| h.keys == "esc");
+    let escape_width = escape.first().map_or(0, statusbar::Hint::width);
+    let room = usize::from(inner.width).saturating_sub(escape_width);
 
-    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut out = Vec::new();
     let mut spent = 0usize;
     for hint in rest {
-        let width = hint.width() + 2;
-        if spent + width > inner.width as usize {
+        let width = hint.width();
+        if spent + width > room {
             break;
         }
-        spent += width;
-        spans.push(Span::styled(
-            hint.keys,
-            theme.style(crate::theme::Role::Accent),
+        out.push((
+            Rect {
+                x: inner.x + spent as u16,
+                y: row,
+                width: width as u16,
+                height: 1,
+            },
+            hint,
         ));
-        spans.push(Span::styled(
-            format!(" {}  ", hint.label),
-            theme.ink_style(Ink::Subtext),
+        // Two columns between hints, as the mock spaces them.
+        spent += width + 2;
+    }
+    if let Some(escape) = escape.into_iter().next() {
+        let width = escape.width() as u16;
+        out.push((
+            Rect {
+                x: inner.right().saturating_sub(width),
+                y: row,
+                width,
+                height: 1,
+            },
+            escape,
         ));
     }
-    if let Some(escape) = escape.first() {
-        let width = escape.width();
-        let gap = (inner.width as usize).saturating_sub(spent + width);
-        spans.push(Span::raw(" ".repeat(gap)));
-        spans.push(Span::styled(
-            escape.keys.clone(),
-            theme.style(crate::theme::Role::Accent),
-        ));
-        spans.push(Span::styled(
-            format!(" {}", escape.label),
-            theme.ink_style(Ink::Subtext),
-        ));
-    }
-    let at = Rect {
-        y: inner.y + inner.height - 1,
-        height: 1,
-        ..inner
-    };
-    Paragraph::new(Line::from(spans)).render(at, buf);
+    out
 }
 
 /// The title line every overlay opens with: `❯ ` and what is being typed.
