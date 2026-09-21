@@ -307,6 +307,11 @@ pub enum Ink {
     /// `blue`. Another session's claim on a worktree — the one ownership
     /// state that is neither yours nor free, and so has a colour of its own.
     Other,
+    /// The ground under an added line in a patch: the mock's green at 10%
+    /// over the panel it sits on.
+    AddedGround,
+    /// The ground under a removed line: the mock's red, likewise.
+    RemovedGround,
 }
 
 impl Ink {
@@ -319,6 +324,9 @@ impl Ink {
             Self::Subtext => (0xa6, 0xad, 0xc8),
             Self::Faint => (0x6c, 0x70, 0x86),
             Self::Other => (0x89, 0xb4, 0xfa),
+            // 0.9 x #1e1e2e + 0.1 x #a6e3a1, and the same over #f38ba8.
+            Self::AddedGround => (0x2c, 0x32, 0x3a),
+            Self::RemovedGround => (0x33, 0x29, 0x3a),
         }
     }
 }

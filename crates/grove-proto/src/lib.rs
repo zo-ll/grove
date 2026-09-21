@@ -302,6 +302,12 @@ pub struct DiffFile {
 }
 
 /// One line of a unified hunk, pre-classified so the client does not parse.
+///
+/// The text is the line's content **without** its unified-diff marker: the
+/// variant is the marker, and the client draws `+`, `-` or a space from it.
+/// `groved` has always sent it that way; the fake daemon and the example
+/// below used to include the marker, which is how the TUI came to be
+/// written against text that the real daemon never sends.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DiffLine {
     Header(String),
@@ -1074,9 +1080,9 @@ mod tests {
                 selected: Some("src/invoice/split.ts".into()),
                 hunks: vec![
                     DiffLine::Header("@@ -198,12 +198,26 @@".into()),
-                    DiffLine::Context(" const items = invoice.lineItems;".into()),
-                    DiffLine::Removed("-  return items.map(toLine);".into()),
-                    DiffLine::Added("+  const boundary = cycleBoundary(invoice);".into()),
+                    DiffLine::Context("const items = invoice.lineItems;".into()),
+                    DiffLine::Removed("  return items.map(toLine);".into()),
+                    DiffLine::Added("  const boundary = cycleBoundary(invoice);".into()),
                 ],
                 added: 412,
                 removed: 137,
