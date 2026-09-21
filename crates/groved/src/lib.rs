@@ -975,6 +975,12 @@ mod tests {
         };
         assert_eq!(pushed, RepoId("repo".into()));
         assert_eq!(rows[0].dirty_files, 1);
+        // #157: the REPOS pane's dot is the repo row's `dirty`, so the repo
+        // rows are pushed too, once per flush, after the worktree rows.
+        let Event::Repos(repos) = read_frame(&mut client).unwrap() else {
+            panic!("expected a pushed Repos event after the Worktrees one")
+        };
+        assert!(repos[0].dirty, "the edit makes the repo read dirty");
 
         git(&repo, &["add", "tracked"]);
         git(&repo, &["commit", "-qm", "next"]);
@@ -983,6 +989,10 @@ mod tests {
         };
         assert_eq!(rows[0].dirty_files, 0);
         assert_eq!(rows[0].ahead, 1);
+        let Event::Repos(repos) = read_frame(&mut client).unwrap() else {
+            panic!("expected a pushed Repos event after the commit")
+        };
+        assert!(!repos[0].dirty, "and the commit makes it clean again");
 
         client
             .set_read_timeout(Some(Duration::from_millis(500)))
