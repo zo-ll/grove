@@ -58,8 +58,6 @@ pub enum LifecycleError {
     Spawn { path: PathBuf, source: io::Error },
     #[error("groved did not become ready within {0:?}")]
     StartupTimeout(Duration),
-    #[error("could not watch worktrees: {0}")]
-    Watch(String),
 }
 
 pub enum BindOutcome {
@@ -165,8 +163,10 @@ impl DaemonSocket {
     pub fn run(self, service: session::SessionOrchestrator) -> Result<(), LifecycleError> {
         let service = Arc::new(Mutex::new(service));
         let updates = watch::Broadcaster::default();
-        let _watcher = watch::WorktreeWatcher::start(Arc::clone(&service), updates.clone())
-            .map_err(|error| LifecycleError::Watch(error.to_string()))?;
+        let _watcher = watch::tolerate_start(watch::WorktreeWatcher::start(
+            Arc::clone(&service),
+            updates.clone(),
+        ));
         loop {
             match self.listener.accept() {
                 Ok((stream, _)) => {
@@ -905,11 +905,13 @@ mod tests {
         git(&repo, &["config", "user.name", "Grove Test"]);
         git(&repo, &["config", "user.email", "grove@example.test"]);
         fs::write(repo.join("tracked"), "clean\n").unwrap();
-        git(&repo, &["add", "tracked"]);
+        fs::write(repo.join(".gitignore"), "target/\n").unwrap();
+        git(&repo, &["add", "tracked", ".gitignore"]);
         git(&repo, &["commit", "-qm", "base"]);
         git(&repo, &["remote", "add", "origin", "."]);
         git(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
         git(&repo, &["branch", "--set-upstream-to=origin/main", "main"]);
+        fs::create_dir(repo.join("target")).unwrap();
 
         let runtime = grove_lua::DaemonRuntime::load(temp.0.join("missing.lua")).runtime;
         let fetch = fetch::FetchPolicy::from_config(2, runtime.config()).unwrap();
@@ -954,6 +956,14 @@ mod tests {
         assert!(
             read_frame::<_, Event>(&mut client).is_err(),
             "an idle workspace must not push a repaint"
+        );
+
+        for index in 0..20 {
+            fs::write(repo.join("target/build.log"), format!("step {index}\n")).unwrap();
+        }
+        assert!(
+            read_frame::<_, Event>(&mut client).is_err(),
+            "activity under a gitignored build directory must not push an update"
         );
 
         client

@@ -13,11 +13,13 @@
 //! itself is pruned from the walk.
 
 use grove_domain::RepoId;
+use ignore::WalkBuilder;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs;
 use std::io;
+use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -76,6 +78,9 @@ pub struct Worktree {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GitWatchPaths {
     pub worktree: PathBuf,
+    /// Non-ignored directories to watch non-recursively. This keeps native
+    /// watchers out of large build trees while still seeing their creation.
+    pub worktree_dirs: Vec<PathBuf>,
     pub git_dir: PathBuf,
     pub common_dir: PathBuf,
 }
@@ -312,12 +317,53 @@ pub fn watch_paths(repo: &Path) -> Result<Vec<GitWatchPaths>, Error> {
                 }
             };
             Ok(GitWatchPaths {
+                worktree_dirs: watch_directories(&worktree.path)?,
                 worktree: worktree.path,
                 git_dir,
                 common_dir,
             })
         })
         .collect()
+}
+
+fn watch_directories(worktree: &Path) -> Result<Vec<PathBuf>, Error> {
+    let root = worktree.to_owned();
+    let mut builder = WalkBuilder::new(worktree);
+    builder
+        // Hidden source files are Git state too; only the administrative
+        // directory is excluded explicitly below.
+        .hidden(false)
+        // Grove follows Git's ignores, not ripgrep's additional .ignore files.
+        .ignore(false)
+        .filter_entry(move |entry| entry.path() == root || entry.file_name() != OsStr::new(".git"));
+    let mut directories: HashSet<PathBuf> = builder
+        .build()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_some_and(|kind| kind.is_dir()))
+        .map(|entry| entry.into_path())
+        .collect();
+
+    // Ignore rules do not apply to files Git already tracks. Put every
+    // tracked file's ancestor back so a later ignore rule cannot make edits
+    // to that file invisible to the daemon.
+    let tracked = git_success(worktree, "tracked files", &["ls-files", "-z"])?;
+    for name in tracked
+        .split(|byte| *byte == 0)
+        .filter(|name| !name.is_empty())
+    {
+        let path = worktree.join(std::ffi::OsString::from_vec(name.to_vec()));
+        let mut parent = path.parent();
+        while let Some(directory) = parent.filter(|directory| directory.starts_with(worktree)) {
+            directories.insert(directory.to_owned());
+            if directory == worktree {
+                break;
+            }
+            parent = directory.parent();
+        }
+    }
+    let mut directories: Vec<_> = directories.into_iter().collect();
+    directories.sort();
+    Ok(directories)
 }
 
 fn parse_worktrees(repo: &Path, bytes: &[u8]) -> Result<Vec<Worktree>, Error> {
@@ -1146,6 +1192,31 @@ mod tests {
                 && paths.git_dir.starts_with(common.join("worktrees"))
                 && paths.git_dir != common
         }));
+    }
+
+    #[test]
+    fn watch_paths_exclude_gitignored_build_directories() {
+        let temp = TempDir::new("watch-ignores");
+        repo(&temp.0);
+        fs::write(temp.0.join(".gitignore"), "target/\nnode_modules/\n").unwrap();
+        fs::create_dir_all(temp.0.join("target/deep")).unwrap();
+        fs::write(temp.0.join("target/tracked"), "keep watching me\n").unwrap();
+        git(&temp.0, &["add", "-f", "target/tracked"]);
+        git(&temp.0, &["commit", "-qm", "track ignored file"]);
+        fs::create_dir_all(temp.0.join("node_modules/package")).unwrap();
+        fs::create_dir_all(temp.0.join("src/nested")).unwrap();
+
+        let paths = watch_paths(&temp.0).unwrap();
+        assert_eq!(paths.len(), 1);
+        assert!(paths[0].worktree_dirs.contains(&temp.0));
+        assert!(paths[0].worktree_dirs.contains(&temp.0.join("src/nested")));
+        assert!(paths[0].worktree_dirs.contains(&temp.0.join("target")));
+        assert!(
+            paths[0]
+                .worktree_dirs
+                .iter()
+                .all(|path| !path.starts_with(temp.0.join("node_modules")))
+        );
     }
 
     #[test]
