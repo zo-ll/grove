@@ -279,6 +279,20 @@ impl Terminals {
     }
 
     /// Scroll grove's view of the history. Returns whether anything moved.
+    /// How the program in the terminal on screen wants the mouse, if it does.
+    ///
+    /// The program decides, by sending `\e[?1000h` and friends, and the parser
+    /// remembers — so this is the program's own answer, not a guess about
+    /// which programs are mouse-aware. `None` means grove keeps the mouse:
+    /// the wheel scrolls grove's scrollback rather than the program.
+    pub fn wants_mouse(&self) -> Option<(vt100::MouseProtocolMode, vt100::MouseProtocolEncoding)> {
+        let screen = self.ptys.get(&self.showing?)?.parser.screen();
+        match screen.mouse_protocol_mode() {
+            vt100::MouseProtocolMode::None => None,
+            mode => Some((mode, screen.mouse_protocol_encoding())),
+        }
+    }
+
     pub fn scroll(&mut self, lines: isize) -> bool {
         let Some(pty) = self.showing.and_then(|id| self.ptys.get_mut(&id)) else {
             return false;
@@ -558,9 +572,211 @@ impl Style {
     }
 }
 
+/// Encode a mouse event the way the program in a pty asked for it.
+///
+/// `column` and `row` are the pty's own, counted from 0 at its top-left.
+/// `None` when the program's mode does not report this kind of event — a
+/// release under X10, a drag under VT200, a bare move under anything short of
+/// any-motion — or when the position cannot be written in its encoding.
+///
+/// xterm's rules, which are what every mouse-aware program expects: buttons 0
+/// to 2, 3 for a release in the byte encodings, 64 and up for the wheel, +32
+/// for motion, and +4, +8 and +16 for shift, alt and control.
+pub fn encode_mouse(
+    event: &ratatui::crossterm::event::MouseEvent,
+    column: u16,
+    row: u16,
+    mode: vt100::MouseProtocolMode,
+    encoding: vt100::MouseProtocolEncoding,
+) -> Option<Vec<u8>> {
+    use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
+    use vt100::{MouseProtocolEncoding as Encoding, MouseProtocolMode as Mode};
+
+    let button = |b: MouseButton| match b {
+        MouseButton::Left => 0u16,
+        MouseButton::Middle => 1,
+        MouseButton::Right => 2,
+    };
+    // (code, released) — the code before modifiers.
+    let (code, released) = match event.kind {
+        MouseEventKind::Down(b) => (button(b), false),
+        MouseEventKind::Up(b) => {
+            if mode == Mode::Press {
+                return None;
+            }
+            (button(b), true)
+        }
+        MouseEventKind::Drag(b) => {
+            if !matches!(mode, Mode::ButtonMotion | Mode::AnyMotion) {
+                return None;
+            }
+            (button(b) + 32, false)
+        }
+        MouseEventKind::Moved => {
+            if mode != Mode::AnyMotion {
+                return None;
+            }
+            // No button held: xterm reports "release" plus motion.
+            (3 + 32, false)
+        }
+        MouseEventKind::ScrollUp => (64, false),
+        MouseEventKind::ScrollDown => (65, false),
+        MouseEventKind::ScrollLeft => (66, false),
+        MouseEventKind::ScrollRight => (67, false),
+    };
+    // X10 predates modifiers.
+    let modifiers = if mode == Mode::Press {
+        0
+    } else {
+        let m = event.modifiers;
+        (if m.contains(KeyModifiers::SHIFT) {
+            4
+        } else {
+            0
+        }) + (if m.contains(KeyModifiers::ALT) { 8 } else { 0 })
+            + (if m.contains(KeyModifiers::CONTROL) {
+                16
+            } else {
+                0
+            })
+    };
+    let x = u32::from(column) + 1;
+    let y = u32::from(row) + 1;
+
+    match encoding {
+        Encoding::Sgr => {
+            // SGR names the button on release too, and says "release" with
+            // the final byte instead.
+            let cb = u32::from(code) + modifiers;
+            let end = if released { 'm' } else { 'M' };
+            Some(format!("\x1b[<{cb};{x};{y}{end}").into_bytes())
+        }
+        Encoding::Default | Encoding::Utf8 => {
+            // The byte encodings cannot say which button was released.
+            let code = if released { 3 } else { code };
+            let values = [u32::from(code) + modifiers + 32, x + 32, y + 32];
+            let mut out = b"\x1b[M".to_vec();
+            for value in values {
+                if encoding == Encoding::Default {
+                    // One byte each: a position past 223 is not expressible,
+                    // and sending a truncated one would click somewhere else.
+                    out.push(u8::try_from(value).ok()?);
+                } else {
+                    let c = char::from_u32(value)?;
+                    let mut utf8 = [0u8; 4];
+                    out.extend_from_slice(c.encode_utf8(&mut utf8).as_bytes());
+                }
+            }
+            Some(out)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod mouse {
+        use super::super::encode_mouse;
+        use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        use vt100::{MouseProtocolEncoding as Encoding, MouseProtocolMode as Mode};
+
+        fn event(kind: MouseEventKind, modifiers: KeyModifiers) -> MouseEvent {
+            MouseEvent {
+                kind,
+                column: 0,
+                row: 0,
+                modifiers,
+            }
+        }
+
+        fn press() -> MouseEvent {
+            event(MouseEventKind::Down(MouseButton::Left), KeyModifiers::NONE)
+        }
+
+        #[test]
+        fn sgr_names_the_button_and_says_release_with_its_last_byte() {
+            // 1-based positions: the pty's top-left cell is 1;1.
+            assert_eq!(
+                encode_mouse(&press(), 3, 2, Mode::PressRelease, Encoding::Sgr),
+                Some(b"\x1b[<0;4;3M".to_vec())
+            );
+            let up = event(MouseEventKind::Up(MouseButton::Left), KeyModifiers::NONE);
+            assert_eq!(
+                encode_mouse(&up, 3, 2, Mode::PressRelease, Encoding::Sgr),
+                Some(b"\x1b[<0;4;3m".to_vec())
+            );
+        }
+
+        #[test]
+        fn the_wheel_and_the_modifiers_are_xterms_numbers() {
+            let wheel = event(MouseEventKind::ScrollDown, KeyModifiers::CONTROL);
+            // 65 for wheel-down, +16 for control.
+            assert_eq!(
+                encode_mouse(&wheel, 0, 0, Mode::PressRelease, Encoding::Sgr),
+                Some(b"\x1b[<81;1;1M".to_vec())
+            );
+        }
+
+        #[test]
+        fn the_byte_encoding_offsets_by_32_and_cannot_name_a_release() {
+            assert_eq!(
+                encode_mouse(&press(), 0, 0, Mode::PressRelease, Encoding::Default),
+                Some(vec![0x1b, b'[', b'M', 32, 33, 33])
+            );
+            let up = event(MouseEventKind::Up(MouseButton::Right), KeyModifiers::NONE);
+            assert_eq!(
+                encode_mouse(&up, 0, 0, Mode::PressRelease, Encoding::Default),
+                Some(vec![0x1b, b'[', b'M', 35, 33, 33]),
+                "every release is button 3 in the byte encoding"
+            );
+        }
+
+        #[test]
+        fn a_position_the_encoding_cannot_hold_is_not_sent_at_all() {
+            // One byte cannot say column 300. Truncating would click somewhere
+            // the user did not.
+            assert_eq!(
+                encode_mouse(&press(), 300, 0, Mode::PressRelease, Encoding::Default),
+                None
+            );
+            // UTF-8 can.
+            assert!(encode_mouse(&press(), 300, 0, Mode::PressRelease, Encoding::Utf8).is_some());
+        }
+
+        #[test]
+        fn each_mode_reports_only_what_it_asked_for() {
+            let up = event(MouseEventKind::Up(MouseButton::Left), KeyModifiers::NONE);
+            let drag = event(MouseEventKind::Drag(MouseButton::Left), KeyModifiers::NONE);
+            let moved = event(MouseEventKind::Moved, KeyModifiers::NONE);
+            assert!(encode_mouse(&up, 0, 0, Mode::Press, Encoding::Sgr).is_none());
+            assert!(encode_mouse(&drag, 0, 0, Mode::PressRelease, Encoding::Sgr).is_none());
+            assert!(encode_mouse(&moved, 0, 0, Mode::ButtonMotion, Encoding::Sgr).is_none());
+            assert_eq!(
+                encode_mouse(&drag, 0, 0, Mode::ButtonMotion, Encoding::Sgr),
+                Some(b"\x1b[<32;1;1M".to_vec()),
+                "a drag is its button plus 32"
+            );
+            assert_eq!(
+                encode_mouse(&moved, 0, 0, Mode::AnyMotion, Encoding::Sgr),
+                Some(b"\x1b[<35;1;1M".to_vec()),
+                "a bare move is 3 plus 32"
+            );
+        }
+
+        #[test]
+        fn x10_mode_reports_no_modifiers() {
+            let shifted = event(MouseEventKind::Down(MouseButton::Left), KeyModifiers::SHIFT);
+            assert_eq!(
+                encode_mouse(&shifted, 0, 0, Mode::Press, Encoding::Sgr),
+                Some(b"\x1b[<0;1;1M".to_vec())
+            );
+            assert_eq!(
+                encode_mouse(&shifted, 0, 0, Mode::PressRelease, Encoding::Sgr),
+                Some(b"\x1b[<4;1;1M".to_vec())
+            );
+        }
+    }
     use grove_proto::{Attrs, Color};
 
     fn id(n: u64) -> TerminalId {

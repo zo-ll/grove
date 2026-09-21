@@ -606,6 +606,19 @@ fn on_dash_mouse(event: MouseEvent, state: &mut State, ui: &mut Ui) -> bool {
     let (frames, rows) = dash::layout(ui.body_area(), ui.drawn_panes(), &ui.theme);
     let under = mouse::hit(&frames, &rows, column, row);
 
+    // A program in the terminal pane that asked for the mouse gets it — a
+    // click positions vim's cursor, the wheel scrolls htop — and a click
+    // still gives the pane the keyboard, as it would anywhere else.
+    if let Some(pty) = rows.terminal
+        && to_pty(&event, pty, state, ui)
+    {
+        if matches!(event.kind, MouseEventKind::Down(_)) && ui.focus != Focus::Terminal {
+            ui.focus = Focus::Terminal;
+            return true;
+        }
+        return false;
+    }
+
     match event.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             if mouse::on_session_name(ui.bar_area(), &ui.session_name(), column, row) {
@@ -676,6 +689,44 @@ fn on_dash_mouse(event: MouseEvent, state: &mut State, ui: &mut Ui) -> bool {
         }
         _ => false,
     }
+}
+
+/// Where the scratch shell's pty is drawn inside its overlay: the body, less
+/// the note under it that says `^g` is the way out. The mouse forwards clicks
+/// relative to this, so it is the one place that knows it.
+fn shell_pty_area(body: Rect) -> Rect {
+    Rect {
+        height: body.height.saturating_sub(2),
+        ..body
+    }
+}
+
+/// Hand a mouse event to the program in the pty drawn at `area`, if the
+/// pointer is over it and the program asked for the mouse.
+///
+/// Returns whether the program has the mouse there — in which case grove does
+/// nothing else with the event, even one the program's mode does not report,
+/// since two things answering one click is how a click in vim also scrolls
+/// grove. The program asks with `\e[?1000h` and its relatives; the parser
+/// remembers; [`terminals::encode_mouse`] speaks whichever encoding it chose.
+fn to_pty(event: &MouseEvent, area: Rect, state: &mut State, ui: &mut Ui) -> bool {
+    let at = ratatui::layout::Position {
+        x: event.column,
+        y: event.row,
+    };
+    if !area.contains(at) {
+        return false;
+    }
+    let Some((mode, encoding)) = ui.terminals.wants_mouse() else {
+        return false;
+    };
+    let encoded = terminals::encode_mouse(event, at.x - area.x, at.y - area.y, mode, encoding);
+    if let Some(request) = encoded.and_then(|bytes| ui.terminals.input(bytes))
+        && let Err(e) = send(state, &request)
+    {
+        ui.note = Some(format!("could not reach the daemon: {e}"));
+    }
+    true
 }
 
 /// Press a key as if it had been typed, prefix and all.
@@ -820,6 +871,9 @@ fn on_overlay_mouse(event: MouseEvent, state: &mut State, ui: &mut Ui) -> Flow {
         x: event.column,
         y: event.row,
     };
+    if ui.screen == Screen::Shell && to_pty(&event, shell_pty_area(laid.parts.body), state, ui) {
+        return quiet;
+    }
 
     match event.kind {
         MouseEventKind::Down(MouseButton::Left) => {
@@ -853,8 +907,16 @@ fn on_overlay_mouse(event: MouseEvent, state: &mut State, ui: &mut Ui) -> Flow {
                 KeyCode::Down
             };
             match ui.screen {
-                // The shell's wheel belongs to the pty; that is the next part.
-                Screen::Shell => quiet,
+                // Its program did not ask for the mouse (that was handled
+                // above), so the wheel scrolls grove's scrollback, as it does
+                // over the dash's terminal pane.
+                Screen::Shell => Flow::Continue {
+                    redraw: ui.terminals.scroll(if key == KeyCode::Up {
+                        terminals::SCROLL_STEP
+                    } else {
+                        -terminals::SCROLL_STEP
+                    }),
+                },
                 // Over the patch, scroll the patch (`^g ↑`/`^g ↓`); over the
                 // file list, move between files.
                 Screen::Diff
@@ -2343,10 +2405,7 @@ fn draw(f: &mut ratatui::Frame, state: &State, ui: &Ui) {
         );
         ui.terminals.render(
             f.buffer_mut(),
-            Rect {
-                height: parts.body.height.saturating_sub(2),
-                ..parts.body
-            },
+            shell_pty_area(parts.body),
             &ui.theme,
             ui.scratch.is_some(),
         );
@@ -3850,6 +3909,114 @@ mod tests {
         assert_eq!(ui.screen, Screen::Shell);
         handle(click(1, 1), &mut s, &mut ui);
         assert_eq!(ui.screen, Screen::Dash);
+    }
+
+    /// A dash at 160x40 with worktree `a`'s terminal on screen, optionally
+    /// with its program having asked for the mouse in SGR.
+    fn a_terminal_to_click(mouse: bool) -> (State, UnixStream, Ui) {
+        let (mut s, mut theirs) = wired();
+        let mut ui = Ui::new();
+        handle(Input::Terminal(TermEvent::Resize(160, 40)), &mut s, &mut ui);
+        // An open session, or the dash is the first-run guidance and draws no
+        // terminal pane at all.
+        handle(
+            Input::Daemon(DaemonEvent::SessionChanged(grove_proto::SessionRow {
+                id: grove_domain::SessionId("s1".into()),
+                name: "one".into(),
+                members: vec!["repo".into()],
+                state: grove_domain::SessionState::Attached,
+                terminals: 1,
+                since: 0,
+                size: 0,
+            })),
+            &mut s,
+            &mut ui,
+        );
+        dashed(&mut s, &mut ui);
+        assert!(
+            empty::Empty::of(ui.repos.workspace_count(), ui.repos.member_count(), true).is_none(),
+            "the fixture must be a real dash, not the guidance"
+        );
+        if mouse {
+            handle(
+                Input::Daemon(DaemonEvent::TerminalOutput {
+                    terminal: grove_proto::TerminalId(1),
+                    bytes: b"\x1b[?1000h\x1b[?1006h".to_vec(),
+                }),
+                &mut s,
+                &mut ui,
+            );
+        }
+        let _ = sent(&mut theirs);
+        (s, theirs, ui)
+    }
+
+    fn terminal_rows(ui: &Ui) -> Rect {
+        dash::layout(ui.body_area(), ui.drawn_panes(), &ui.theme)
+            .1
+            .terminal
+            .expect("the terminal pane is on screen")
+    }
+
+    #[test]
+    fn a_program_that_asked_for_the_mouse_gets_the_click_where_it_landed() {
+        // vim with `set mouse=a`: the click must arrive at the cell under the
+        // pointer, counted from the pty's own top-left, in the encoding the
+        // program chose — and the pane takes the keyboard as a click on it
+        // would anywhere.
+        let (mut s, mut theirs, mut ui) = a_terminal_to_click(true);
+        ui.focus = Focus::Worktrees;
+        let pty = terminal_rows(&ui);
+        handle(click(pty.x + 3, pty.y + 2), &mut s, &mut ui);
+        assert!(
+            sent(&mut theirs).contains(&Request::Input {
+                terminal: grove_proto::TerminalId(1),
+                bytes: b"\x1b[<0;4;3M".to_vec(),
+            }),
+            "the program must receive the click at 4;3"
+        );
+        assert_eq!(ui.focus, Focus::Terminal);
+    }
+
+    #[test]
+    fn a_program_that_did_not_ask_leaves_the_mouse_with_grove() {
+        // A plain shell never asked. The wheel over it is grove's scrollback,
+        // and nothing is typed into the program.
+        let (mut s, mut theirs, mut ui) = a_terminal_to_click(false);
+        let pty = terminal_rows(&ui);
+        handle(
+            wheel(MouseEventKind::ScrollUp, pty.x + 3, pty.y + 2),
+            &mut s,
+            &mut ui,
+        );
+        assert!(
+            !sent(&mut theirs)
+                .iter()
+                .any(|request| matches!(request, Request::Input { .. })),
+            "nothing may reach a program that did not ask"
+        );
+    }
+
+    #[test]
+    fn the_program_only_has_the_mouse_over_its_own_pane() {
+        // vim having the mouse must not steal a click on the WORKTREES list.
+        let (mut s, mut theirs, mut ui) = a_terminal_to_click(true);
+        let (frames, rows) = dash::layout(ui.body_area(), ui.drawn_panes(), &ui.theme);
+        let list = rows.worktrees.expect("worktrees on screen");
+        let _ = frames;
+        handle(click(list.x + 1, list.y + 1), &mut s, &mut ui);
+        assert!(
+            !sent(&mut theirs)
+                .iter()
+                .any(|request| matches!(request, Request::Input { .. })),
+        );
+        assert_eq!(
+            ui.worktrees
+                .selected()
+                .map(|row| row.worktree.branch.as_str()),
+            Some("b"),
+            "the list took the click"
+        );
     }
 
     #[test]
